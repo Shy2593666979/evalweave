@@ -1,0 +1,52 @@
+application:
+  name: EvalWeave Test
+  version: 0.1.0
+  debug: true
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  reload: false
+
+database:
+  url: "sqlite:///./data/evalweave-auth-test.db"
+  echo: false
+  pool_size: 5
+  max_overflow: 10
+  pool_recycle: 3600
+
+redis:
+  url: "redis://127.0.0.1:6379/10"
+
+celery:
+  broker_url: "redis://127.0.0.1:6379/11"
+  result_backend: "redis://127.0.0.1:6379/12"
+  timezone: Asia/Shanghai
+  task_time_limit: 60
+  worker_concurrency: 1
+
+storage:
+  type: local
+  local_directory: ./data/test-uploads
+
+logging:
+  level: DEBUG
+  format: console
+  directory: ./logs
+
+evaluation:
+  default_timeout_seconds: 10
+  default_concurrency: 1
+  max_file_size_mb: 5
+  allowed_extensions: [json, jsonl, csv, xlsx]
+
+auth:
+  jwt_secret: "test-secret-that-is-long-enough-for-jwt-signing"
+  token_expire_minutes: 60
+  cookie_name: evalweave_session
+  cookie_secure: false
+  allow_registration: true
+  bootstrap_admin:
+    enabled: true
+    username: admin
+    password: test-admin-password

@@ -1,0 +1,44 @@
+name: evalweave
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: evalweave-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: evalweave
+      MYSQL_USER: evalweave
+      MYSQL_PASSWORD: evalweave
+      MYSQL_ROOT_PASSWORD: evalweave-root
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - evalweave_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pevalweave-root"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: evalweave-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - evalweave_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  evalweave_mysql:
+  evalweave_redis:
