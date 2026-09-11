@@ -7,6 +7,8 @@ export const useAuthStore = defineStore('auth', () => {
   const user = ref<User | null>(null)
   const initialized = ref(false)
   const isAdmin = computed(() => user.value?.system_role === 'admin')
+  const hasPermission = (permission: string) =>
+    isAdmin.value || Boolean(user.value?.permissions.includes(permission))
 
   async function loadCurrentUser() {
     try {
@@ -28,5 +30,5 @@ export const useAuthStore = defineStore('auth', () => {
     user.value = null
   }
 
-  return { user, initialized, isAdmin, loadCurrentUser, login, logout }
+  return { user, initialized, isAdmin, hasPermission, loadCurrentUser, login, logout }
 })

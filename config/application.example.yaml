@@ -27,7 +27,7 @@ celery:
 
 storage:
   type: local
-  local_directory: ./data/uploads
+  local_directory: ./data/storage
 
 logging:
   level: INFO
@@ -43,6 +43,36 @@ evaluation:
     - jsonl
     - csv
     - xlsx
+
+agent:
+  enabled: false
+  api_mode: responses
+  base_url: "https://api.openai.com/v1"
+  api_key: ""
+  model: ""
+  timeout_seconds: 120
+  max_repair_attempts: 3
+  dry_run_cases: 5
+  require_approval: true
+  allowed_target_hosts: []
+  target_headers: {}
+
+notifications:
+  platform_base_url: "http://127.0.0.1:5173"
+  wecom:
+    enabled: false
+    webhook_url: ""
+    timeout_seconds: 10
+  email:
+    enabled: false
+    host: ""
+    port: 465
+    username: ""
+    password: ""
+    from_address: ""
+    use_ssl: true
+    starttls: false
+    timeout_seconds: 10
 
 auth:
   jwt_secret: "replace-with-a-random-secret-at-least-32-characters"

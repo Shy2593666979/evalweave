@@ -19,6 +19,9 @@ EvalWeave 是一个面向 AI 应用的开源评测与执行追踪平台。它计
 - Admin 自定义用户类型及其权限
 - 注册时选择 Admin 设置为“注册可选”的用户类型
 - 默认用户类型：产品同学、用研同学、研发同学、测试同学
+- 项目文件上传、列表、下载和删除，本地文件内容与数据库元数据分离存储
+- 评测 Agent 自动探查 JSON、JSONL、CSV、Excel，生成受限 EvalSpec 并通过 Celery 执行
+- 人工审批任务及企业微信群机器人、SMTP 邮件通知
 
 本地配置首次启动会创建一个 Admin：
 
@@ -102,6 +105,18 @@ pnpm build
 ```powershell
 uv run alembic revision --autogenerate -m "describe the change"
 ```
+
+## 评测 Agent 与通知
+
+Agent 默认关闭。请在 `config/application.yaml` 中配置 OpenAI Python SDK 使用的模型接口；
+`agent.api_mode` 默认使用 Responses API，兼容服务仅实现 Chat Completions 时可改为
+`chat_completions`；
+目标模型的主机必须加入 `agent.allowed_target_hosts`，请求头只允许放在服务端 YAML 的
+`agent.target_headers` 中，不接受任务提交者传入密钥。
+
+企业微信首版使用群机器人 Webhook，邮件使用 SMTP。通知内容包含平台人工任务链接，
+批准或拒绝操作统一在平台内完成并留存审计记录。完整配置字段见
+`config/application.example.yaml`。
 
 ## 许可证
 

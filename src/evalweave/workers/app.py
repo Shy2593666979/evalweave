@@ -2,36 +2,32 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
-from celery import Celery
+from uuid import UUID
 
 from evalweave.core.config import get_settings, set_config_path
-
-
-def create_celery_app() -> Celery:
-    settings = get_settings()
-    application = Celery(
-        "evalweave",
-        broker=settings.celery.broker_url,
-        backend=settings.celery.result_backend,
-    )
-    application.conf.update(
-        task_serializer="json",
-        result_serializer="json",
-        accept_content=["json"],
-        timezone=settings.celery.timezone,
-        task_time_limit=settings.celery.task_time_limit,
-        task_track_started=True,
-    )
-    return application
+from evalweave.workers.factory import create_celery_app
 
 
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def run_agent_job_task(job_id: str) -> None:
+    from evalweave.agents.workflow import plan_agent_job
+
+    plan_agent_job(UUID(job_id))
+
+
+def resume_agent_job_task(job_id: str) -> None:
+    from evalweave.agents.workflow import execute_agent_job
+
+    execute_agent_job(UUID(job_id))
+
+
 celery_app = create_celery_app()
 celery_app.task(name="evalweave.healthcheck")(healthcheck)
+celery_app.task(name="evalweave.agent.plan")(run_agent_job_task)
+celery_app.task(name="evalweave.agent.execute")(resume_agent_job_task)
 
 
 def worker_main() -> None:
@@ -43,6 +39,8 @@ def worker_main() -> None:
     settings = get_settings()
     application = create_celery_app()
     application.task(name="evalweave.healthcheck")(healthcheck)
+    application.task(name="evalweave.agent.plan")(run_agent_job_task)
+    application.task(name="evalweave.agent.execute")(resume_agent_job_task)
     application.worker_main(
         [
             "worker",

@@ -40,6 +40,22 @@ evaluation:
   max_file_size_mb: 5
   allowed_extensions: [json, jsonl, csv, xlsx]
 
+agent:
+  enabled: false
+  api_mode: responses
+  max_repair_attempts: 2
+  dry_run_cases: 3
+  require_approval: true
+  allowed_target_hosts: []
+  target_headers: {}
+
+notifications:
+  platform_base_url: "http://testserver"
+  wecom:
+    enabled: false
+  email:
+    enabled: false
+
 auth:
   jwt_secret: "test-secret-that-is-long-enough-for-jwt-signing"
   token_expire_minutes: 60

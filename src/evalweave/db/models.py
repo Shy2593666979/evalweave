@@ -26,6 +26,38 @@ class SystemRole(StrEnum):
     USER = "user"
 
 
+class AgentJobStatus(StrEnum):
+    PENDING = "pending"
+    DISCOVERING = "discovering"
+    PLANNING = "planning"
+    WAITING_HUMAN = "waiting_human"
+    RUNNING = "running"
+    ANALYZING = "analyzing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class StepStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class HumanTaskStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class DeliveryStatus(StrEnum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+
+
 class TimestampMixin(SQLModel):
     created_at: datetime = Field(default_factory=utc_now, nullable=False)
     updated_at: datetime = Field(default_factory=utc_now, nullable=False)
@@ -61,6 +93,88 @@ class Project(TimestampMixin, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str = Field(index=True, max_length=128)
     description: str | None = Field(default=None, sa_column=Column(Text))
+
+
+class FileObject(TimestampMixin, table=True):
+    __tablename__ = "file_objects"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    project_id: UUID = Field(foreign_key="projects.id", index=True)
+    created_by: UUID = Field(foreign_key="users.id", index=True)
+    category: str = Field(index=True, max_length=32)
+    original_name: str = Field(max_length=255)
+    storage_key: str = Field(sa_column=Column(String(512), unique=True, nullable=False))
+    content_type: str | None = Field(default=None, max_length=255)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(index=True, min_length=64, max_length=64)
+
+
+class AgentJob(TimestampMixin, table=True):
+    __tablename__ = "agent_jobs"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    project_id: UUID = Field(foreign_key="projects.id", index=True)
+    created_by: UUID = Field(foreign_key="users.id", index=True)
+    source_file_id: UUID | None = Field(default=None, foreign_key="file_objects.id", index=True)
+    result_file_id: UUID | None = Field(default=None, foreign_key="file_objects.id", index=True)
+    title: str = Field(max_length=128)
+    goal: str = Field(sa_column=Column(Text, nullable=False))
+    status: AgentJobStatus = Field(default=AgentJobStatus.PENDING, index=True)
+    input_config: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    eval_spec: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    result: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    error: str | None = Field(default=None, sa_column=Column(Text))
+    repair_attempts: int = Field(default=0, ge=0)
+    max_repair_attempts: int = Field(default=3, ge=0)
+    requires_approval: bool = Field(default=True, nullable=False)
+
+
+class AgentStep(TimestampMixin, table=True):
+    __tablename__ = "agent_steps"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    job_id: UUID = Field(foreign_key="agent_jobs.id", index=True)
+    name: str = Field(index=True, max_length=64)
+    status: StepStatus = Field(default=StepStatus.PENDING, index=True)
+    attempt: int = Field(default=1, ge=1)
+    input_data: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    output_data: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    error: str | None = Field(default=None, sa_column=Column(Text))
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class HumanTask(TimestampMixin, table=True):
+    __tablename__ = "human_tasks"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    job_id: UUID = Field(foreign_key="agent_jobs.id", index=True)
+    title: str = Field(max_length=128)
+    instructions: str = Field(sa_column=Column(Text, nullable=False))
+    status: HumanTaskStatus = Field(default=HumanTaskStatus.PENDING, index=True)
+    notification_targets: list[dict[str, str]] = Field(
+        default_factory=list, sa_column=Column(JSON, nullable=False)
+    )
+    decision_reason: str | None = Field(default=None, sa_column=Column(Text))
+    resolved_by: UUID | None = Field(default=None, foreign_key="users.id", index=True)
+    resolved_at: datetime | None = None
+
+
+class NotificationDelivery(TimestampMixin, table=True):
+    __tablename__ = "notification_deliveries"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    human_task_id: UUID = Field(foreign_key="human_tasks.id", index=True)
+    channel: str = Field(index=True, max_length=32)
+    recipient: str = Field(max_length=255)
+    status: DeliveryStatus = Field(default=DeliveryStatus.PENDING, index=True)
+    provider_message_id: str | None = Field(default=None, max_length=255)
+    error: str | None = Field(default=None, sa_column=Column(Text))
+    sent_at: datetime | None = None
 
 
 class Dataset(TimestampMixin, table=True):

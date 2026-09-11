@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { DataAnalysis, Files, Histogram, Setting, User, UserFilled } from '@element-plus/icons-vue'
+import { Bell, DataAnalysis, Files, Histogram, Setting, User, UserFilled } from '@element-plus/icons-vue'
 import { ElAside, ElContainer, ElDropdown, ElDropdownItem, ElDropdownMenu, ElIcon, ElMain, ElMenu, ElMenuItem } from 'element-plus'
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -25,6 +25,11 @@ async function logout() {
         <el-menu-item index="dashboard" route="/"><el-icon><DataAnalysis /></el-icon>概览</el-menu-item>
         <el-menu-item index="datasets" disabled><el-icon><Files /></el-icon>数据集</el-menu-item>
         <el-menu-item index="experiments" disabled><el-icon><Histogram /></el-icon>实验</el-menu-item>
+        <el-menu-item
+          v-if="auth.hasPermission('evaluation:review')"
+          index="human-tasks"
+          route="/human-tasks"
+        ><el-icon><Bell /></el-icon>人工任务</el-menu-item>
         <template v-if="auth.isAdmin">
           <div class="nav-label">系统管理</div>
           <el-menu-item index="admin-users" route="/admin/users"><el-icon><User /></el-icon>用户管理</el-menu-item>

@@ -62,6 +62,44 @@ class EvaluationConfig(StrictModel):
     allowed_extensions: list[str] = Field(default_factory=lambda: ["json", "jsonl", "csv", "xlsx"])
 
 
+class AgentConfig(StrictModel):
+    enabled: bool = False
+    api_mode: Literal["responses", "chat_completions"] = "responses"
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: int = Field(default=120, ge=1)
+    max_repair_attempts: int = Field(default=3, ge=0, le=10)
+    dry_run_cases: int = Field(default=5, ge=1, le=100)
+    require_approval: bool = True
+    allowed_target_hosts: list[str] = Field(default_factory=list)
+    target_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class WeComNotificationConfig(StrictModel):
+    enabled: bool = False
+    webhook_url: str = ""
+    timeout_seconds: int = Field(default=10, ge=1)
+
+
+class EmailNotificationConfig(StrictModel):
+    enabled: bool = False
+    host: str = ""
+    port: int = Field(default=465, ge=1, le=65535)
+    username: str = ""
+    password: str = ""
+    from_address: str = ""
+    use_ssl: bool = True
+    starttls: bool = False
+    timeout_seconds: int = Field(default=10, ge=1)
+
+
+class NotificationConfig(StrictModel):
+    platform_base_url: str = "http://127.0.0.1:5173"
+    wecom: WeComNotificationConfig = Field(default_factory=WeComNotificationConfig)
+    email: EmailNotificationConfig = Field(default_factory=EmailNotificationConfig)
+
+
 class BootstrapAdminConfig(StrictModel):
     enabled: bool = True
     username: str = "admin"
@@ -86,6 +124,8 @@ class Settings(StrictModel):
     storage: StorageConfig
     logging: LoggingConfig
     evaluation: EvaluationConfig
+    agent: AgentConfig = Field(default_factory=AgentConfig)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
     auth: AuthConfig
 
 
