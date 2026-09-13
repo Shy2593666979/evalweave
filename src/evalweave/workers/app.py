@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from uuid import UUID
 
@@ -24,10 +25,17 @@ def resume_agent_job_task(job_id: str) -> None:
     execute_agent_job(UUID(job_id))
 
 
+def finalize_human_review_task(campaign_id: str) -> None:
+    from evalweave.human_reviews import finalize_campaign
+
+    finalize_campaign(UUID(campaign_id))
+
+
 celery_app = create_celery_app()
 celery_app.task(name="evalweave.healthcheck")(healthcheck)
 celery_app.task(name="evalweave.agent.plan")(run_agent_job_task)
 celery_app.task(name="evalweave.agent.execute")(resume_agent_job_task)
+celery_app.task(name="evalweave.human_reviews.finalize")(finalize_human_review_task)
 
 
 def worker_main() -> None:
@@ -41,10 +49,10 @@ def worker_main() -> None:
     application.task(name="evalweave.healthcheck")(healthcheck)
     application.task(name="evalweave.agent.plan")(run_agent_job_task)
     application.task(name="evalweave.agent.execute")(resume_agent_job_task)
-    application.worker_main(
-        [
-            "worker",
-            f"--loglevel={args.loglevel}",
-            f"--concurrency={settings.celery.worker_concurrency}",
-        ]
-    )
+    application.task(name="evalweave.human_reviews.finalize")(finalize_human_review_task)
+    worker_args = ["worker", f"--loglevel={args.loglevel}"]
+    if sys.platform == "win32":
+        worker_args.extend(["--pool=solo", "--concurrency=1"])
+    else:
+        worker_args.append(f"--concurrency={settings.celery.worker_concurrency}")
+    application.worker_main(worker_args)

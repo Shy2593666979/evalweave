@@ -1,0 +1,620 @@
+<script setup lang="ts">
+import {
+  CircleCheck,
+  Clock,
+  Document,
+  Download,
+  FolderAdd,
+  Plus,
+  Refresh,
+  UploadFilled,
+  VideoPlay,
+  WarningFilled,
+} from '@element-plus/icons-vue'
+import {
+  ElButton,
+  ElDialog,
+  ElEmpty,
+  ElForm,
+  ElFormItem,
+  ElIcon,
+  ElInput,
+  ElInputNumber,
+  ElMessage,
+  ElOption,
+  ElProgress,
+  ElRadioButton,
+  ElRadioGroup,
+  ElSelect,
+  ElSwitch,
+  ElTag,
+  ElUpload,
+} from 'element-plus'
+import type { UploadRequestOptions } from 'element-plus'
+import DOMPurify from 'dompurify'
+import { marked } from 'marked'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { api, errorMessage } from '../api/client'
+import { useAuthStore } from '../stores/auth'
+import type { AgentJob, AgentRuntime, AgentStep, EvaluationModelOption, FileObject, Project } from '../types/agent'
+import { formatBeijingDateTime } from '../utils/datetime'
+
+const route = useRoute()
+const router = useRouter()
+const auth = useAuthStore()
+const loading = ref(false)
+const detailLoading = ref(false)
+const uploading = ref(false)
+const starting = ref(false)
+const projects = ref<Project[]>([])
+const selectedProjectId = ref('')
+const files = ref<FileObject[]>([])
+const jobs = ref<AgentJob[]>([])
+const selectedJob = ref<AgentJob | null>(null)
+const steps = ref<AgentStep[]>([])
+const runtime = ref<AgentRuntime | null>(null)
+const evaluationModels = ref<EvaluationModelOption[]>([])
+const createProjectVisible = ref(false)
+const createJobVisible = ref(false)
+const projectForm = reactive({ name: '', description: '' })
+const jobForm = reactive({
+  title: '',
+  goal: '',
+  source_file_id: '',
+  requires_approval: true,
+  target_url: '',
+  response_path: '',
+  max_cases: 100,
+  output_format: 'xlsx' as 'xlsx' | 'jsonl' | 'markdown' | 'text',
+  evaluation_model_id: '',
+})
+let pollTimer: ReturnType<typeof setInterval> | undefined
+let pollInFlight = false
+let viewActive = false
+
+function jobRenderKey(job: AgentJob | null) {
+  if (!job) return ''
+  const { updated_at: _updatedAt, ...visibleData } = job
+  return JSON.stringify(visibleData)
+}
+
+function stepsRenderKey(items: AgentStep[]) {
+  return JSON.stringify(items)
+}
+
+const canCreateProject = computed(() => auth.hasPermission('project:write'))
+const canUpload = computed(() => auth.hasPermission('dataset:write'))
+const canRun = computed(() => auth.hasPermission('experiment:run'))
+const selectedFile = computed(() => files.value.find((item) => item.id === selectedJob.value?.source_file_id))
+const currentSteps = computed(() => {
+  const latest = new Map<string, AgentStep>()
+  for (const step of steps.value) latest.set(step.name, step)
+  return [...latest.values()]
+})
+const isActive = (status: AgentJob['status']) =>
+  ['pending', 'discovering', 'planning', 'running', 'analyzing'].includes(status)
+const progress = computed(() => {
+  if (!selectedJob.value) return 0
+  return {
+    pending: 8,
+    discovering: 22,
+    planning: 42,
+    waiting_human: 58,
+    running: 72,
+    analyzing: 88,
+    completed: 100,
+    failed: 100,
+    cancelled: 100,
+  }[selectedJob.value.status]
+})
+
+const statusLabels: Record<AgentJob['status'], string> = {
+  pending: '等待开始',
+  discovering: '读取数据',
+  planning: '生成方案',
+  waiting_human: '等待审核',
+  running: '执行评测',
+  analyzing: '整理结果',
+  completed: '已完成',
+  failed: '运行失败',
+  cancelled: '已取消',
+}
+
+const stepLabels: Record<string, string> = {
+  discover_source: '解析评测数据',
+  generate_eval_spec: '生成评测方案',
+  generate_test_cases: '生成测试用例',
+  validate_target: '预检目标接口',
+  execute_eval_spec: '执行评测任务',
+  summarize: '整理评测结果',
+}
+const outputLabels = { xlsx: 'Excel', jsonl: 'JSONL', markdown: 'Markdown', text: '纯文本' }
+const operationLabels: Record<string, string> = {
+  normalize: '整理与标准化数据',
+  data_analysis: '分析数据特征',
+  data_transform: '转换和补充字段',
+  format_convert: '生成交付文件',
+  ranking: '计算排名',
+  aggregate: '汇总统计指标',
+  target_call: '调用目标接口',
+  multi_target_call: '对比多个接口',
+  conversation_eval: '评估对话质量',
+  tool_eval: '评估工具调用',
+  latency_eval: '评估响应速度',
+  safety_eval: '检查安全风险',
+  human_review: '提交人工审核',
+  summarize: '总结评测结果',
+  convert: '转换文件格式',
+  model_map: '使用模型逐行处理',
+  http_map: '逐行调用接口',
+}
+
+function readableValue(value: unknown) {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map(String).join('、')
+  if (!value || typeof value !== 'object') return ''
+  const record = value as Record<string, unknown>
+  const format = record.format ? `${String(record.format).toUpperCase()} 文件` : ''
+  const fields = Array.isArray(record.fields) && record.fields.length
+    ? `包含字段：${record.fields.map(String).join('、')}`
+    : ''
+  return [format, fields].filter(Boolean).join('，') || JSON.stringify(value, null, 2)
+}
+
+function renderMarkdown(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) return ''
+  return DOMPurify.sanitize(marked.parse(value, {
+    async: false,
+    breaks: true,
+    gfm: true,
+  }) as string)
+}
+
+const readablePlan = computed(() => {
+  const spec = selectedJob.value?.eval_spec ?? {}
+  const operations = Array.isArray(spec.operations)
+    ? spec.operations.map(String)
+    : []
+  const program = spec.data_program && typeof spec.data_program === 'object'
+    ? spec.data_program as Record<string, unknown>
+    : {}
+  const programSteps = Array.isArray(program.steps)
+    ? program.steps.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+    : []
+  const steps = programSteps.length
+    ? programSteps.map((step, index) => {
+      const type = String(step.type ?? step.action ?? step.tool ?? '')
+      const columns = Array.isArray(step.output_columns)
+        ? step.output_columns
+          .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+          .map((item) => String(item.name ?? ''))
+          .filter(Boolean)
+        : []
+      return {
+        key: `${type}-${index}`,
+        title: operationLabels[type] ?? `执行步骤 ${index + 1}`,
+        description: String(step.instruction ?? step.note ?? '按照任务配置完成本步骤。'),
+        detail: columns.length ? `输出字段：${columns.join('、')}` : '',
+      }
+    })
+    : operations.map((operation, index) => ({
+      key: `${operation}-${index}`,
+      title: operationLabels[operation] ?? operation,
+      description: '按照评测目标执行并记录可审计结果。',
+      detail: '',
+    }))
+  return {
+    source: readableValue(spec.source || spec.discovery),
+    output: readableValue(spec.output_spec),
+    operations: operations.map((operation) => operationLabels[operation] ?? operation),
+    steps,
+  }
+})
+
+function statusType(status: AgentJob['status']) {
+  if (status === 'completed') return 'success'
+  if (status === 'failed' || status === 'cancelled') return 'danger'
+  if (status === 'waiting_human') return 'warning'
+  return 'primary'
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+function pretty(value: unknown) {
+  return JSON.stringify(value, null, 2)
+}
+
+async function loadProjects() {
+  projects.value = (await api.get<Project[]>('/projects')).data
+  const remembered = localStorage.getItem('evalweave-project')
+  if (!selectedProjectId.value) {
+    selectedProjectId.value = projects.value.some((item) => item.id === remembered)
+      ? String(remembered)
+      : projects.value[0]?.id ?? ''
+  }
+}
+
+async function loadProjectData(quiet = false) {
+  if (!selectedProjectId.value) {
+    files.value = []
+    jobs.value = []
+    selectedJob.value = null
+    return
+  }
+  if (!quiet) loading.value = true
+  try {
+    const [fileResponse, jobResponse] = await Promise.all([
+      api.get<FileObject[]>(`/projects/${selectedProjectId.value}/files`, { params: { category: 'dataset_source' } }),
+      api.get<AgentJob[]>(`/projects/${selectedProjectId.value}/agent-jobs`),
+    ])
+    files.value = fileResponse.data
+    jobs.value = jobResponse.data
+    const routeJobId = String(route.params.jobId ?? '')
+    const currentId = routeJobId || selectedJob.value?.id
+    const next = jobs.value.find((item) => item.id === currentId) ?? jobs.value[0] ?? null
+    if (next) await selectJob(next, true)
+    else {
+      selectedJob.value = null
+      steps.value = []
+    }
+  } catch (error) {
+    if (!quiet) ElMessage.error(errorMessage(error))
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadJobDetail(jobId: string, quiet = false) {
+  if (!quiet) detailLoading.value = true
+  try {
+    const [jobResponse, stepResponse] = await Promise.all([
+      api.get<AgentJob>(`/agent-jobs/${jobId}`),
+      api.get<AgentStep[]>(`/agent-jobs/${jobId}/steps`),
+    ])
+    const jobChanged = jobRenderKey(selectedJob.value) !== jobRenderKey(jobResponse.data)
+    const stepsChanged = stepsRenderKey(steps.value) !== stepsRenderKey(stepResponse.data)
+    if (jobChanged) selectedJob.value = jobResponse.data
+    if (stepsChanged) steps.value = stepResponse.data
+    const index = jobs.value.findIndex((item) => item.id === jobId)
+    if (index >= 0 && jobRenderKey(jobs.value[index] ?? null) !== jobRenderKey(jobResponse.data)) {
+      jobs.value[index] = jobResponse.data
+    }
+  } catch (error) {
+    if (!quiet) ElMessage.error(errorMessage(error))
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+async function selectJob(job: AgentJob, quiet = false) {
+  selectedJob.value = job
+  if (
+    viewActive
+    && route.name === 'evaluations'
+    && String(route.params.jobId ?? '') !== job.id
+  ) {
+    await router.replace({ name: 'evaluations', params: { jobId: job.id } })
+  }
+  await loadJobDetail(job.id, quiet)
+}
+
+async function changeProject() {
+  localStorage.setItem('evalweave-project', selectedProjectId.value)
+  await router.replace({ name: 'evaluations' })
+  selectedJob.value = null
+  await loadProjectData()
+}
+
+async function createProject() {
+  if (!projectForm.name.trim()) return ElMessage.warning('请输入项目名称')
+  try {
+    const project = (await api.post<Project>('/projects', {
+      name: projectForm.name.trim(),
+      description: projectForm.description.trim() || null,
+    })).data
+    projects.value.unshift(project)
+    selectedProjectId.value = project.id
+    projectForm.name = ''
+    projectForm.description = ''
+    createProjectVisible.value = false
+    ElMessage.success('项目已创建')
+    await changeProject()
+  } catch (error) {
+    ElMessage.error(errorMessage(error))
+  }
+}
+
+async function uploadDataset(options: UploadRequestOptions) {
+  if (!selectedProjectId.value) return
+  uploading.value = true
+  const form = new FormData()
+  form.append('file', options.file)
+  form.append('category', 'dataset_source')
+  try {
+    await api.post(`/projects/${selectedProjectId.value}/files`, form)
+    ElMessage.success('数据文件已上传')
+    options.onSuccess({})
+    await loadProjectData()
+  } catch (error) {
+    ElMessage.error(errorMessage(error))
+  } finally {
+    uploading.value = false
+  }
+}
+
+function openCreateJob() {
+  if (!files.value.length) return ElMessage.warning('请先上传评测数据')
+  jobForm.title = ''
+  jobForm.goal = ''
+  jobForm.source_file_id = files.value[0]?.id ?? ''
+  jobForm.requires_approval = runtime.value?.require_approval ?? true
+  jobForm.target_url = ''
+  jobForm.response_path = ''
+  jobForm.max_cases = 100
+  jobForm.output_format = 'xlsx'
+  jobForm.evaluation_model_id = evaluationModels.value[0]?.id ?? ''
+  createJobVisible.value = true
+}
+
+async function createAndStartJob() {
+  if (!jobForm.title.trim() || !jobForm.goal.trim() || !jobForm.source_file_id) {
+    return ElMessage.warning('请填写任务名称、评测目标并选择数据文件')
+  }
+  starting.value = true
+  try {
+    const inputConfig: Record<string, unknown> = { max_cases: jobForm.max_cases }
+    if (jobForm.target_url.trim()) {
+      inputConfig.target = {
+        url: jobForm.target_url.trim(),
+        body: '{{row}}',
+        response_path: jobForm.response_path.trim(),
+      }
+    }
+    const job = (await api.post<AgentJob>(`/projects/${selectedProjectId.value}/agent-jobs`, {
+      title: jobForm.title.trim(),
+      goal: jobForm.goal.trim(),
+      source_file_id: jobForm.source_file_id,
+      requires_approval: jobForm.requires_approval,
+      output_format: jobForm.output_format,
+      evaluation_model_id: jobForm.evaluation_model_id || null,
+      input_config: inputConfig,
+    })).data
+    await api.post(`/agent-jobs/${job.id}/start`)
+    createJobVisible.value = false
+    ElMessage.success('评测任务已启动')
+    await loadProjectData()
+    await selectJob(job)
+  } catch (error) {
+    ElMessage.error(errorMessage(error))
+  } finally {
+    starting.value = false
+  }
+}
+
+async function restartJob() {
+  if (!selectedJob.value) return
+  try {
+    await api.post(`/agent-jobs/${selectedJob.value.id}/start`)
+    ElMessage.success('任务已重新启动')
+    await loadJobDetail(selectedJob.value.id)
+  } catch (error) {
+    ElMessage.error(errorMessage(error))
+  }
+}
+
+async function refresh() {
+  await loadProjectData()
+}
+
+function downloadResult() {
+  if (selectedJob.value?.result_file_id) {
+    window.open(`/api/files/${selectedJob.value.result_file_id}/content`, '_blank')
+  }
+}
+
+watch(selectedProjectId, (value) => {
+  if (value) localStorage.setItem('evalweave-project', value)
+})
+
+onMounted(async () => {
+  viewActive = true
+  try {
+    const [, runtimeResponse, modelResponse] = await Promise.all([
+      loadProjects(),
+      api.get<AgentRuntime>('/agent/runtime'),
+      api.get<EvaluationModelOption[]>('/evaluation-models'),
+    ])
+    if (!viewActive) return
+    runtime.value = runtimeResponse.data
+    evaluationModels.value = modelResponse.data
+    jobForm.evaluation_model_id = evaluationModels.value[0]?.id ?? ''
+    await loadProjectData()
+  } catch (error) {
+    if (viewActive) ElMessage.error(errorMessage(error))
+  }
+  if (!viewActive) return
+  pollTimer = setInterval(async () => {
+    if (pollInFlight || !selectedJob.value || !isActive(selectedJob.value.status)) return
+    pollInFlight = true
+    try {
+      await loadJobDetail(selectedJob.value.id, true)
+      if (!isActive(selectedJob.value.status)) await loadProjectData(true)
+    } finally {
+      pollInFlight = false
+    }
+  }, 2500)
+})
+
+onBeforeUnmount(() => {
+  viewActive = false
+  clearInterval(pollTimer)
+})
+</script>
+
+<template>
+  <header class="page-header agent-page-header">
+    <div>
+      <p class="eyebrow">评测工作台</p>
+      <h1>评测任务</h1>
+      <p>从数据准备到结果检查，完整跟踪每一次智能评测。</p>
+    </div>
+    <div class="page-actions">
+      <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
+      <el-button v-if="canRun" type="primary" :icon="Plus" :disabled="!selectedProjectId" @click="openCreateJob">新建评测</el-button>
+    </div>
+  </header>
+
+  <div v-if="runtime && !runtime.enabled" class="agent-notice">
+    <el-icon><WarningFilled /></el-icon>
+    <div><strong>当前使用基础规划模式</strong><span>模型规划尚未启用，任务仍可运行，但只会生成默认评测方案。</span></div>
+  </div>
+  <div v-if="runtime && !runtime.worker_available" class="agent-notice worker-notice">
+    <el-icon><WarningFilled /></el-icon>
+    <div><strong>任务执行进程未连接</strong><span>请启动 Celery Worker；否则新任务会停留在等待开始状态。</span></div>
+  </div>
+
+  <section class="project-bar">
+    <div class="data-actions">
+      <span v-if="files.length">{{ files.length }} 个数据文件</span>
+      <el-upload
+        v-if="canUpload"
+        :show-file-list="false"
+        :http-request="uploadDataset"
+        :disabled="!selectedProjectId || uploading"
+        accept=".json,.jsonl,.csv,.xlsx"
+      >
+        <el-button :icon="UploadFilled" :loading="uploading">上传数据</el-button>
+      </el-upload>
+    </div>
+  </section>
+
+  <div v-if="!projects.length && !loading" class="agent-empty surface">
+    <el-icon><FolderAdd /></el-icon>
+    <h2>初始化工作项目</h2>
+    <p>首次使用需要建立唯一的工作项目，后续数据和评测任务都会归档在这里。</p>
+    <el-button v-if="canCreateProject" type="primary" @click="createProjectVisible = true">初始化项目</el-button>
+  </div>
+
+  <section v-else class="agent-workspace" v-loading="loading">
+    <aside class="job-list surface">
+      <div class="job-list-head"><strong>任务记录</strong><span>{{ jobs.length }}</span></div>
+      <button
+        v-for="job in jobs"
+        :key="job.id"
+        class="job-item"
+        :class="{ active: selectedJob?.id === job.id }"
+        type="button"
+        @click="selectJob(job)"
+      >
+        <span class="job-item-title">{{ job.title }}</span>
+        <span class="job-item-meta"><el-tag size="small" :type="statusType(job.status)">{{ statusLabels[job.status] }}</el-tag>{{ formatBeijingDateTime(job.updated_at) }}</span>
+      </button>
+      <el-empty v-if="!jobs.length" :image-size="58" description="还没有评测任务" />
+    </aside>
+
+    <main class="job-detail surface" v-loading="detailLoading">
+      <template v-if="selectedJob">
+        <div class="job-detail-head">
+          <div><span class="job-id">任务 {{ selectedJob.id.slice(0, 8) }}</span><h2>{{ selectedJob.title }}</h2><p>{{ selectedJob.goal }}</p></div>
+          <div class="job-head-actions"><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
+        </div>
+
+        <div class="job-progress">
+          <el-progress :percentage="progress" :status="selectedJob.status === 'failed' ? 'exception' : selectedJob.status === 'completed' ? 'success' : undefined" :stroke-width="8" :show-text="false" />
+          <div><span>已上传数据</span><span>生成方案</span><span>执行评测</span><span>整理结果</span></div>
+        </div>
+
+        <div v-if="selectedJob.status === 'waiting_human'" class="decision-callout">
+          <div><strong>评测方案等待确认</strong><p>审核方案后，Agent 才会继续执行目标接口。</p></div>
+          <router-link :to="`/human-tasks`"><el-button type="primary">前往审核</el-button></router-link>
+        </div>
+        <div v-if="selectedJob.error" class="error-callout"><el-icon><WarningFilled /></el-icon><div><strong>任务执行失败</strong><p>{{ selectedJob.error }}</p></div><el-button v-if="canRun" @click="restartJob">重新运行</el-button></div>
+
+        <div class="job-facts">
+          <div><span>数据文件</span><strong>{{ selectedFile?.original_name ?? '未选择' }}</strong></div>
+          <div><span>创建时间（北京时间）</span><strong>{{ formatBeijingDateTime(selectedJob.created_at) }}</strong></div>
+          <div><span>人工审核</span><strong>{{ selectedJob.requires_approval ? '需要' : '不需要' }}</strong></div>
+          <div><span>结果格式</span><strong>{{ outputLabels[String(selectedJob.input_config.output_format ?? 'xlsx') as keyof typeof outputLabels] ?? 'Excel' }}</strong></div>
+        </div>
+
+        <div class="job-section">
+          <div class="section-heading"><h2>运行步骤</h2><span>自动刷新</span></div>
+          <div v-if="currentSteps.length" class="step-list">
+            <div v-for="step in currentSteps" :key="step.id" class="step-row">
+              <span class="step-icon" :class="step.status"><el-icon><CircleCheck v-if="step.status === 'completed'" /><WarningFilled v-else-if="step.status === 'failed'" /><Clock v-else /></el-icon></span>
+              <div><strong>{{ stepLabels[step.name] ?? step.name }}</strong><span>第 {{ step.attempt }} 次 · {{ formatBeijingDateTime(step.started_at) }}</span><p v-if="step.error">{{ step.error }}</p></div>
+              <el-tag size="small" :type="step.status === 'completed' ? 'success' : step.status === 'failed' ? 'danger' : 'primary'">{{ step.status === 'completed' ? '完成' : step.status === 'failed' ? '失败' : '进行中' }}</el-tag>
+            </div>
+          </div>
+          <p v-else class="section-empty">任务启动后，这里会显示每一步的执行状态。</p>
+        </div>
+
+        <div v-if="Object.keys(selectedJob.eval_spec).length" class="job-section">
+          <div class="section-heading"><h2>评测方案</h2><span>Agent 生成</span></div>
+          <div class="plan-readable">
+            <div class="plan-intro"><strong>方案目标</strong><div class="markdown-body" v-html="renderMarkdown(selectedJob.goal)"></div></div>
+            <div v-if="readablePlan.source || readablePlan.output" class="plan-context-grid">
+              <div v-if="readablePlan.source"><span>数据来源</span><div class="markdown-body" v-html="renderMarkdown(readablePlan.source)"></div></div>
+              <div v-if="readablePlan.output"><span>交付方式</span><div class="markdown-body" v-html="renderMarkdown(readablePlan.output)"></div></div>
+            </div>
+            <div v-if="readablePlan.operations.length" class="plan-operation-tags">
+              <span v-for="operation in readablePlan.operations" :key="operation">{{ operation }}</span>
+            </div>
+            <ol v-if="readablePlan.steps.length" class="plan-step-list">
+              <li v-for="(step, index) in readablePlan.steps" :key="step.key">
+                <i>{{ index + 1 }}</i>
+                <div><strong>{{ step.title }}</strong><div class="markdown-body" v-html="renderMarkdown(step.description)"></div><div v-if="step.detail" class="markdown-body plan-step-detail" v-html="renderMarkdown(step.detail)"></div></div>
+              </li>
+            </ol>
+          </div>
+          <details class="raw-data-details"><summary>查看原始方案数据</summary><pre class="json-panel">{{ pretty(selectedJob.eval_spec) }}</pre></details>
+        </div>
+
+        <div v-if="Object.keys(selectedJob.result).length" class="job-section result-section">
+          <div class="section-heading"><h2>评测结果</h2><el-button v-if="selectedJob.result_file_id" :icon="Download" @click="downloadResult">下载逐条结果</el-button></div>
+          <div v-if="typeof selectedJob.result.summary === 'string'" class="result-summary markdown-body" v-html="renderMarkdown(selectedJob.result.summary)"></div>
+          <details class="raw-data-details"><summary>查看原始结果数据</summary><pre class="json-panel">{{ pretty(selectedJob.result) }}</pre></details>
+        </div>
+      </template>
+      <div v-else class="detail-empty"><el-icon><Document /></el-icon><h2>选择一个评测任务</h2><p>任务的运行步骤、方案和结果会显示在这里。</p></div>
+    </main>
+
+  </section>
+
+  <el-dialog v-model="createProjectVisible" title="初始化工作项目" width="480px">
+    <el-form label-position="top">
+      <el-form-item label="项目名称"><el-input v-model="projectForm.name" maxlength="128" placeholder="例如：客服助手质量评测" /></el-form-item>
+      <el-form-item label="项目说明"><el-input v-model="projectForm.description" type="textarea" :rows="3" placeholder="可选" /></el-form-item>
+    </el-form>
+    <template #footer><el-button @click="createProjectVisible = false">取消</el-button><el-button type="primary" @click="createProject">完成初始化</el-button></template>
+  </el-dialog>
+
+  <el-dialog v-model="createJobVisible" title="新建评测任务" width="min(840px, 94vw)" class="agent-dialog">
+    <el-form label-position="top">
+      <div class="form-grid">
+        <el-form-item label="任务名称"><el-input v-model="jobForm.title" maxlength="128" placeholder="例如：多轮对话质量检查" /></el-form-item>
+        <el-form-item label="数据文件"><el-select v-model="jobForm.source_file_id" placeholder="选择已上传的数据"><el-option v-for="file in files" :key="file.id" :label="`${file.original_name} · ${formatBytes(file.size_bytes)}`" :value="file.id" /></el-select></el-form-item>
+      </div>
+      <div class="form-grid">
+        <el-form-item label="评测模型"><el-select v-model="jobForm.evaluation_model_id" placeholder="使用系统默认模型"><el-option label="系统默认模型" value="" /><el-option v-for="model in evaluationModels" :key="model.id" :label="`${model.name} · ${model.model_name}`" :value="model.id" /></el-select></el-form-item>
+        <el-form-item label="结果输出"><el-radio-group v-model="jobForm.output_format"><el-radio-button value="xlsx">Excel</el-radio-button><el-radio-button value="jsonl">JSONL</el-radio-button><el-radio-button value="markdown">Markdown</el-radio-button><el-radio-button value="text">纯文本</el-radio-button></el-radio-group></el-form-item>
+      </div>
+      <el-form-item label="评测目标"><el-input v-model="jobForm.goal" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="说明希望检查的能力、质量标准和重点风险" /></el-form-item>
+      <div class="form-grid">
+        <el-form-item label="目标接口地址"><el-input v-model="jobForm.target_url" placeholder="可选，例如 https://model.example/chat" /></el-form-item>
+        <el-form-item label="响应内容路径"><el-input v-model="jobForm.response_path" placeholder="可选，例如 data.reply" /></el-form-item>
+      </div>
+      <div class="form-grid compact">
+        <el-form-item label="最多执行条数"><el-input-number v-model="jobForm.max_cases" :min="1" :max="10000" controls-position="right" /></el-form-item>
+        <el-form-item label="执行前人工确认"><el-switch v-model="jobForm.requires_approval" inline-prompt active-text="需要" inactive-text="跳过" /></el-form-item>
+      </div>
+      <p class="form-hint">目标接口的域名需要由管理员加入服务端允许名单；请求体默认使用数据文件中的每一行。</p>
+    </el-form>
+    <template #footer><el-button @click="createJobVisible = false">取消</el-button><el-button type="primary" :icon="VideoPlay" :loading="starting" @click="createAndStartJob">创建并启动</el-button></template>
+  </el-dialog>
+</template>

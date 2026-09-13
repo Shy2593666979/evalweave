@@ -48,30 +48,39 @@ def inspect_source(path: Path, original_name: str, sample_size: int) -> dict[str
                 "csv", rows, sample_size, fields=reader.fieldnames or [], sampled_only=True
             )
     if extension == ".xlsx":
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        try:
-            sheet = workbook.active
-            iterator = sheet.iter_rows(values_only=True)
-            headers = [
-                str(value or f"column_{index + 1}")
-                for index, value in enumerate(next(iterator, []))
-            ]
-            rows = []
-            for values in iterator:
-                rows.append(dict(zip(headers, values, strict=False)))
-                if len(rows) >= sample_size:
-                    break
-            result = summarize_rows(
-                "xlsx", rows, sample_size, fields=headers, sampled_only=True
-            )
-            result["sheet"] = sheet.title
-            return result
-        finally:
-            workbook.close()
+        with path.open("rb") as source:
+            workbook = load_workbook(source, read_only=True, data_only=True)
+            try:
+                sheet = workbook.active
+                iterator = sheet.iter_rows(values_only=True)
+                headers = [
+                    str(value or f"column_{index + 1}")
+                    for index, value in enumerate(next(iterator, []))
+                ]
+                rows = []
+                for values in iterator:
+                    rows.append(dict(zip(headers, values, strict=False)))
+                    if len(rows) >= sample_size:
+                        break
+                result = summarize_rows(
+                    "xlsx", rows, sample_size, fields=headers, sampled_only=True
+                )
+                result["sheet"] = sheet.title
+                return result
+            finally:
+                workbook.close()
     raise ValueError(f"Unsupported source format: {extension or '(none)'}")
 
 
-def load_source_rows(path: Path, original_name: str, max_cases: int) -> list[dict[str, Any]]:
+def load_source_rows(
+    path: Path,
+    original_name: str,
+    max_cases: int,
+    *,
+    header_row: int = 1,
+    data_start_row: int | None = None,
+    field_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
     extension = Path(original_name).suffix.lower()
     rows: list[Any]
     if extension == ".json":
@@ -89,21 +98,49 @@ def load_source_rows(path: Path, original_name: str, max_cases: int) -> list[dic
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))[:max_cases]
     elif extension == ".xlsx":
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        try:
-            sheet = workbook.active
-            iterator = sheet.iter_rows(values_only=True)
-            headers = [
-                str(value or f"column_{index + 1}")
-                for index, value in enumerate(next(iterator, []))
-            ]
-            rows = []
-            for values in iterator:
-                rows.append(dict(zip(headers, values, strict=False)))
-                if len(rows) >= max_cases:
-                    break
-        finally:
-            workbook.close()
+        with path.open("rb") as source:
+            workbook = load_workbook(source, read_only=True, data_only=True)
+            try:
+                sheet = workbook.active
+                raw_rows = list(
+                    sheet.iter_rows(max_row=max_cases * 10 + 100, values_only=True)
+                )
+                header_index = min(max(header_row - 1, 0), max(len(raw_rows) - 1, 0))
+                if field_names and raw_rows:
+                    scan_limit = min(len(raw_rows), max(header_index + 4, 10))
+
+                    def text_cell_count(values: tuple[Any, ...]) -> int:
+                        return sum(
+                            isinstance(value, str) and bool(value.strip()) for value in values
+                        )
+
+                    detected_index = max(
+                        range(scan_limit), key=lambda index: text_cell_count(raw_rows[index])
+                    )
+                    if text_cell_count(raw_rows[detected_index]) >= (
+                        text_cell_count(raw_rows[header_index]) + 2
+                    ):
+                        header_index = detected_index
+                raw_headers = raw_rows[header_index] if raw_rows else []
+                headers = field_names or [
+                    str(value or f"column_{index + 1}")
+                    for index, value in enumerate(raw_headers)
+                ]
+                requested_data_index = (data_start_row - 1) if data_start_row else header_index + 1
+                first_data_index = max(requested_data_index, header_index + 1)
+                rows = []
+                for values in raw_rows[first_data_index:]:
+                    if not any(
+                        value is not None
+                        and (not isinstance(value, str) or bool(value.strip()))
+                        for value in values
+                    ):
+                        continue
+                    rows.append(dict(zip(headers, values, strict=False)))
+                    if len(rows) >= max_cases:
+                        break
+            finally:
+                workbook.close()
     else:
         raise ValueError(f"Unsupported source format: {extension or '(none)'}")
     normalized = []

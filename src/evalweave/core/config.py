@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -62,6 +62,14 @@ class EvaluationConfig(StrictModel):
     allowed_extensions: list[str] = Field(default_factory=lambda: ["json", "jsonl", "csv", "xlsx"])
 
 
+class TargetAuthFlowConfig(StrictModel):
+    login_url: str
+    body: dict[str, Any] = Field(default_factory=dict)
+    token_path: str = ""
+    header_name: str = "Authorization"
+    header_prefix: str = "Bearer "
+
+
 class AgentConfig(StrictModel):
     enabled: bool = False
     api_mode: Literal["responses", "chat_completions"] = "responses"
@@ -74,6 +82,7 @@ class AgentConfig(StrictModel):
     require_approval: bool = True
     allowed_target_hosts: list[str] = Field(default_factory=list)
     target_headers: dict[str, str] = Field(default_factory=dict)
+    target_auth_flows: dict[str, TargetAuthFlowConfig] = Field(default_factory=dict)
 
 
 class WeComNotificationConfig(StrictModel):

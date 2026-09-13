@@ -3,6 +3,7 @@ import { ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElMessage, ElOption, E
 import { onMounted, reactive, ref } from 'vue'
 import { api, errorMessage } from '../../api/client'
 import type { SystemRole, User, UserType } from '../../types/auth'
+import { formatBeijingDateTime } from '../../utils/datetime'
 
 const users = ref<User[]>([])
 const userTypes = ref<UserType[]>([])
@@ -65,14 +66,15 @@ onMounted(load)
 </script>
 
 <template>
-  <header class="page-header"><div><p class="eyebrow">ADMINISTRATION</p><h1>用户管理</h1><p>创建账号、分配用户类型和控制登录状态。</p></div><el-button type="primary" @click="dialogVisible = true">添加用户</el-button></header>
+  <header class="page-header"><div><p class="eyebrow">访问控制</p><h1>用户管理</h1><p>管理工作区成员、系统角色和账号可用状态。</p></div><div class="page-actions"><el-button type="primary" @click="dialogVisible = true">添加用户</el-button></div></header>
   <section class="table-panel">
-    <el-table :data="users" v-loading="loading">
+    <div class="table-toolbar"><strong>工作区成员</strong><span>共 {{ users.length }} 个账号</span></div>
+    <el-table :data="users" v-loading="loading" empty-text="还没有用户">
       <el-table-column prop="username" label="用户名" min-width="180" />
-      <el-table-column label="系统角色" width="130"><template #default="scope"><el-tag :type="scope.row.system_role === 'admin' ? 'danger' : 'info'">{{ scope.row.system_role === 'admin' ? 'Admin' : '普通用户' }}</el-tag></template></el-table-column>
+      <el-table-column label="系统角色" width="130"><template #default="scope"><el-tag :type="scope.row.system_role === 'admin' ? 'primary' : 'info'">{{ scope.row.system_role === 'admin' ? '管理员' : '普通用户' }}</el-tag></template></el-table-column>
       <el-table-column prop="user_type_name" label="用户类型" min-width="180"><template #default="scope"><el-select v-if="scope.row.system_role === 'user'" v-model="scope.row.user_type_id" size="small" @change="setUserType(scope.row, String($event))"><el-option v-for="item in userTypes" :key="item.id" :label="item.name" :value="item.id" /></el-select><span v-else>—</span></template></el-table-column>
       <el-table-column label="权限数量" width="110"><template #default="scope">{{ scope.row.permissions.length }}</template></el-table-column>
-      <el-table-column prop="created_at" label="创建时间" min-width="190" />
+      <el-table-column label="创建时间（北京时间）" min-width="210"><template #default="scope">{{ formatBeijingDateTime(scope.row.created_at, true) }}</template></el-table-column>
       <el-table-column label="启用" width="100"><template #default="scope"><el-switch v-model="scope.row.is_active" @change="setActive(scope.row, Boolean($event))" /></template></el-table-column>
     </el-table>
   </section>
@@ -81,7 +83,7 @@ onMounted(load)
     <el-form label-position="top">
       <el-form-item label="用户名"><el-input v-model="form.username" /></el-form-item>
       <el-form-item label="初始密码"><el-input v-model="form.password" type="password" show-password /></el-form-item>
-      <el-form-item label="系统角色"><el-select v-model="form.system_role" class="full-button"><el-option label="普通用户" value="user" /><el-option label="Admin" value="admin" /></el-select></el-form-item>
+      <el-form-item label="系统角色"><el-select v-model="form.system_role" class="full-button"><el-option label="普通用户" value="user" /><el-option label="管理员" value="admin" /></el-select></el-form-item>
       <el-form-item v-if="form.system_role === 'user'" label="用户类型"><el-select v-model="form.user_type_id" class="full-button"><el-option v-for="item in userTypes" :key="item.id" :label="item.name" :value="item.id" /></el-select></el-form-item>
     </el-form>
     <template #footer><el-button @click="dialogVisible = false">取消</el-button><el-button type="primary" @click="createUser">创建</el-button></template>

@@ -1,9 +1,12 @@
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import select
 
+from evalweave.agents.model_config import encrypt_api_key
 from evalweave.auth.dependencies import AdminUser, SessionDependency
 from evalweave.auth.permissions import permission_catalog
 from evalweave.auth.schemas import (
@@ -21,14 +24,102 @@ from evalweave.auth.service import (
     user_to_read,
     validate_permissions,
 )
-from evalweave.db.models import SystemRole, User, UserType
+from evalweave.db.models import EvaluationModel, SystemRole, User, UserType
 
 router = APIRouter(prefix="/admin", tags=["administration"])
+
+
+class EvaluationModelCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    base_url: str = Field(min_length=1, max_length=512)
+    model_name: str = Field(min_length=1, max_length=128)
+    api_mode: Literal["responses", "chat_completions"] = "responses"
+    api_key: str = Field(min_length=1, max_length=4096)
+    is_active: bool = True
+
+
+class EvaluationModelUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    base_url: str | None = Field(default=None, min_length=1, max_length=512)
+    model_name: str | None = Field(default=None, min_length=1, max_length=128)
+    api_mode: Literal["responses", "chat_completions"] | None = None
+    api_key: str | None = Field(default=None, min_length=1, max_length=4096)
+    is_active: bool | None = None
+
+
+class EvaluationModelRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    base_url: str
+    model_name: str
+    api_mode: str
+    is_active: bool
+    api_key_configured: bool = True
+    created_at: datetime
+    updated_at: datetime
 
 
 @router.get("/permissions")
 def list_permissions(_: AdminUser) -> list[dict[str, str]]:
     return permission_catalog()
+
+
+@router.get("/evaluation-models", response_model=list[EvaluationModelRead])
+def list_evaluation_models(
+    _: AdminUser, session: SessionDependency
+) -> list[EvaluationModelRead]:
+    models = session.exec(select(EvaluationModel).order_by(EvaluationModel.created_at.desc())).all()
+    return [EvaluationModelRead.model_validate(model) for model in models]
+
+
+@router.post(
+    "/evaluation-models",
+    response_model=EvaluationModelRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_evaluation_model(
+    payload: EvaluationModelCreate, _: AdminUser, session: SessionDependency
+) -> EvaluationModel:
+    model = EvaluationModel(
+        name=payload.name.strip(),
+        base_url=payload.base_url.strip().rstrip("/"),
+        model_name=payload.model_name.strip(),
+        api_mode=payload.api_mode,
+        api_key_encrypted=encrypt_api_key(payload.api_key),
+        is_active=payload.is_active,
+    )
+    session.add(model)
+    commit_or_conflict(session, "评测模型名称已存在")
+    session.refresh(model)
+    return model
+
+
+@router.patch("/evaluation-models/{model_id}", response_model=EvaluationModelRead)
+def update_evaluation_model(
+    model_id: UUID,
+    payload: EvaluationModelUpdate,
+    _: AdminUser,
+    session: SessionDependency,
+) -> EvaluationModel:
+    model = session.get(EvaluationModel, model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="评测模型不存在")
+    changes = payload.model_dump(exclude_unset=True)
+    if api_key := changes.pop("api_key", None):
+        model.api_key_encrypted = encrypt_api_key(api_key)
+    for key, value in changes.items():
+        if isinstance(value, str):
+            value = value.strip()
+        if key == "base_url" and isinstance(value, str):
+            value = value.rstrip("/")
+        setattr(model, key, value)
+    model.updated_at = datetime.now(UTC)
+    session.add(model)
+    commit_or_conflict(session, "评测模型名称已存在")
+    session.refresh(model)
+    return model
 
 
 @router.get("/user-types", response_model=list[UserTypeRead])

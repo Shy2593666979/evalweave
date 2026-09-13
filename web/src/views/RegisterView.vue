@@ -35,16 +35,27 @@ async function submit() {
 </script>
 
 <template>
-  <main class="auth-page"><section class="auth-card">
-    <div class="auth-brand"><div class="brand-mark">EW</div><strong>EvalWeave</strong></div>
-    <p class="eyebrow">CREATE ACCOUNT</p><h1>注册账号</h1><p class="auth-subtitle">选择你的团队身份</p>
-    <el-form label-position="top">
-      <el-form-item label="用户名"><el-input v-model="form.username" size="large" /></el-form-item>
-      <el-form-item label="用户类型"><el-select v-model="form.user_type_id" size="large" class="full-button" placeholder="请选择"><el-option v-for="item in userTypes" :key="item.id" :label="item.name" :value="item.id" /></el-select></el-form-item>
-      <el-form-item label="密码"><el-input v-model="form.password" type="password" show-password size="large" /></el-form-item>
-      <el-form-item label="确认密码"><el-input v-model="form.confirmPassword" type="password" show-password size="large" @keyup.enter="submit" /></el-form-item>
-      <el-button type="primary" size="large" :loading="loading" class="full-button" @click="submit">创建账号</el-button>
-    </el-form>
-    <p class="auth-link">已有账号？<router-link to="/login">返回登录</router-link></p>
-  </section></main>
+  <main class="auth-page">
+    <aside class="auth-visual">
+      <div class="auth-logo"><div class="brand-mark">EW</div><strong>EvalWeave</strong></div>
+      <div class="auth-statement">
+        <span class="signal">加入评测工作区</span>
+        <h2>把评测变成<br><em>团队共同语言</em></h2>
+        <p>选择你的团队身份，获得对应的工作权限，在同一条评测链路中协作。</p>
+      </div>
+      <div class="auth-proof"><span>统一数据</span><span>协同实验</span><span>可信决策</span></div>
+    </aside>
+    <section class="auth-form-wrap"><div class="auth-card">
+      <div class="auth-logo auth-mobile-logo"><div class="brand-mark">EW</div><strong>EvalWeave</strong></div>
+      <p class="eyebrow">创建账号</p><h1>加入工作区</h1><p class="auth-subtitle">创建账号，并选择与你工作职责匹配的用户类型。</p>
+      <el-form label-position="top" @submit.prevent="submit">
+        <el-form-item label="用户名"><el-input v-model="form.username" size="large" placeholder="设置用户名" /></el-form-item>
+        <el-form-item label="用户类型"><el-select v-model="form.user_type_id" size="large" class="full-button" placeholder="请选择团队身份"><el-option v-for="item in userTypes" :key="item.id" :label="item.name" :value="item.id" /></el-select></el-form-item>
+        <el-form-item label="密码"><el-input v-model="form.password" type="password" show-password size="large" placeholder="设置登录密码" /></el-form-item>
+        <el-form-item label="确认密码"><el-input v-model="form.confirmPassword" type="password" show-password size="large" placeholder="再次输入密码" @keyup.enter="submit" /></el-form-item>
+        <el-button type="primary" size="large" :loading="loading" class="full-button" @click="submit">创建账号</el-button>
+      </el-form>
+      <p class="auth-link">已有账号？ <router-link to="/login">返回登录</router-link></p>
+    </div></section>
+  </main>
 </template>

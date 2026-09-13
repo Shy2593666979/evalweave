@@ -46,7 +46,7 @@ class FileRead(BaseModel):
 
 
 ProjectReader = Annotated[User, Depends(require_permission(Permission.PROJECT_READ))]
-ProjectWriter = Annotated[User, Depends(require_permission(Permission.PROJECT_WRITE))]
+DatasetWriter = Annotated[User, Depends(require_permission(Permission.DATASET_WRITE))]
 UploadedFile = Annotated[UploadFile, File()]
 FileCategoryForm = Annotated[FileCategory, Form()]
 
@@ -83,7 +83,7 @@ def safe_filename(filename: str | None) -> str:
 )
 def upload_file(
     project_id: UUID,
-    _: ProjectWriter,
+    _: DatasetWriter,
     user: CurrentUser,
     session: SessionDependency,
     file: UploadedFile,
@@ -187,7 +187,7 @@ def download_file(
 @router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_file(
     file_id: UUID,
-    _: ProjectWriter,
+    _: DatasetWriter,
     session: SessionDependency,
 ) -> Response:
     file_object = require_file(file_id, session)

@@ -6,7 +6,7 @@ EvalWeave 是一个面向 AI 应用的开源评测与执行追踪平台。它计
 
 ## 技术栈
 
-- Python 3.12、uv、FastAPI、SQLModel、Alembic
+- Python 3.12、uv、FastAPI、SQLModel
 - Celery、Redis、MySQL 8
 - Vue 3、TypeScript、Vite、Element Plus
 - 所有应用配置均从 YAML 文件读取，不读取环境变量
@@ -32,7 +32,7 @@ EvalWeave 是一个面向 AI 应用的开源评测与执行追踪平台。它计
 
 ## 本地开发
 
-安装依赖、启动 MySQL/Redis、执行迁移并启动 API、Celery 和前端：
+安装依赖、启动 MySQL/Redis，并启动 API、Celery 和前端：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
@@ -60,13 +60,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
    docker compose -f deploy/docker-compose.yaml up -d
    ```
 
-4. 生成并执行首个数据库迁移：
-
-   ```powershell
-   uv run alembic upgrade head
-   ```
-
-5. 启动 API：
+4. 启动 API（启动时会自动创建尚不存在的数据表）：
 
    ```powershell
    uv run evalweave-api --config config/application.yaml
@@ -74,13 +68,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
 
    OpenAPI 文档位于 <http://127.0.0.1:8000/docs>。
 
-6. 启动 Celery Worker：
+5. 启动 Celery Worker：
 
    ```powershell
    uv run evalweave-worker --config config/application.yaml
    ```
 
-7. 启动前端：
+6. 启动前端：
 
    ```powershell
    Set-Location web
@@ -100,12 +94,6 @@ pnpm typecheck
 pnpm build
 ```
 
-创建新迁移时使用：
-
-```powershell
-uv run alembic revision --autogenerate -m "describe the change"
-```
-
 ## 评测 Agent 与通知
 
 Agent 默认关闭。请在 `config/application.yaml` 中配置 OpenAI Python SDK 使用的模型接口；
@@ -117,6 +105,11 @@ Agent 默认关闭。请在 `config/application.yaml` 中配置 OpenAI Python SD
 企业微信首版使用群机器人 Webhook，邮件使用 SMTP。通知内容包含平台人工任务链接，
 批准或拒绝操作统一在平台内完成并留存审计记录。完整配置字段见
 `config/application.example.yaml`。
+
+登录后可从“评测任务”完成项目选择、数据上传、任务启动、方案审核、运行跟踪和结果下载。
+运行中的任务会自动刷新状态；API 服务之外还需要同时启动 Redis 和 Celery Worker。
+评测助手支持通过对话整理接口地址、返回示例和评测要求，任务结果可导出为 Excel、
+JSONL、Markdown 或纯文本。Admin 可在“评测模型”中维护可选模型，API Key 加密保存且不回显。
 
 ## 许可证
 

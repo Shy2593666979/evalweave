@@ -56,3 +56,27 @@ def test_admin_can_create_user_type_and_user(client: TestClient) -> None:
     )
     assert created_user.status_code == 201
     assert created_user.json()["user_type_name"] == "运营同学"
+
+
+def test_admin_can_manage_evaluation_models_without_exposing_key(client: TestClient) -> None:
+    client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-admin-password"},
+    )
+    created = client.post(
+        "/api/admin/evaluation-models",
+        json={
+            "name": "测试模型",
+            "base_url": "https://model.example/v1/",
+            "model_name": "evaluation-model",
+            "api_mode": "responses",
+            "api_key": "secret-key",
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["base_url"] == "https://model.example/v1"
+    assert "api_key" not in created.json()
+
+    listing = client.get("/api/evaluation-models")
+    assert listing.status_code == 200
+    assert listing.json()[0]["name"] == "测试模型"

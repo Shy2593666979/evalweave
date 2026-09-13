@@ -55,9 +55,10 @@ onMounted(load)
 </script>
 
 <template>
-  <header class="page-header"><div><p class="eyebrow">ADMINISTRATION</p><h1>用户类型与权限</h1><p>Admin 可以创建团队身份，并决定每种身份可以执行哪些操作。</p></div><el-button type="primary" @click="openCreate">新建用户类型</el-button></header>
+  <header class="page-header"><div><p class="eyebrow">权限配置</p><h1>用户类型与权限</h1><p>用清晰的团队身份定义功能边界，并控制注册时可选择的角色。</p></div><div class="page-actions"><el-button type="primary" @click="openCreate">新建用户类型</el-button></div></header>
   <section class="table-panel">
-    <el-table :data="userTypes">
+    <div class="table-toolbar"><strong>权限角色</strong><span>共 {{ userTypes.length }} 种类型</span></div>
+    <el-table :data="userTypes" empty-text="还没有用户类型">
       <el-table-column prop="name" label="名称" min-width="140" />
       <el-table-column prop="code" label="编码" min-width="130" />
       <el-table-column label="权限" min-width="300"><template #default="scope"><el-tag v-for="key in scope.row.permissions" :key="key" class="permission-tag" type="info">{{ permissions.find((item) => item.key === key)?.label || key }}</el-tag></template></el-table-column>

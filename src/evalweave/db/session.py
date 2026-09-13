@@ -2,10 +2,12 @@ from collections.abc import Generator
 from functools import lru_cache
 from pathlib import Path
 
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
-from sqlmodel import Session, create_engine
+from sqlmodel import Session, SQLModel, create_engine
 
+import evalweave.db.models  # noqa: F401
 from evalweave.core.config import get_settings
 
 
@@ -29,3 +31,69 @@ def get_engine() -> Engine:
 def get_session() -> Generator[Session, None, None]:
     with Session(get_engine()) as session:
         yield session
+
+
+def create_db_and_tables() -> None:
+    engine = get_engine()
+    SQLModel.metadata.create_all(engine)
+    _ensure_assistant_message_attachment_columns(engine)
+    _ensure_human_review_campaign_columns(engine)
+
+
+def _ensure_assistant_message_attachment_columns(engine: Engine) -> None:
+    """Keep installations without Alembic compatible with attachment-aware messages."""
+    inspector = inspect(engine)
+    if "assistant_messages" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("assistant_messages")}
+    file_id_column = next(
+        (
+            column
+            for column in inspector.get_columns("file_objects")
+            if column["name"] == "id"
+        ),
+        None,
+    )
+    file_id_type = (
+        file_id_column["type"].compile(dialect=engine.dialect)
+        if file_id_column is not None
+        else "CHAR(32)"
+    )
+    additions = {
+        "attachment_file_id": file_id_type,
+        "attachment_name": "VARCHAR(255)",
+        "attachment_content_type": "VARCHAR(255)",
+        "attachment_size_bytes": "INTEGER",
+    }
+    with engine.begin() as connection:
+        for name, column_type in additions.items():
+            if name not in existing:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE assistant_messages ADD COLUMN {name} "
+                        f"{column_type} NULL"
+                    )
+                )
+
+
+def _ensure_human_review_campaign_columns(engine: Engine) -> None:
+    """Add deadline/finalization fields for installations without Alembic."""
+    inspector = inspect(engine)
+    if "human_review_campaigns" not in inspector.get_table_names():
+        return
+    existing = {
+        column["name"] for column in inspector.get_columns("human_review_campaigns")
+    }
+    additions = {
+        "deadline_at": "DATETIME NULL",
+        "summary_started_at": "DATETIME NULL",
+        "completion_reason": "VARCHAR(32) NULL",
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in existing:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE human_review_campaigns ADD COLUMN {name} {definition}"
+                    )
+                )

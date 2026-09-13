@@ -1,0 +1,13 @@
+MiSans Font Notice
+
+This software uses the MiSans font provided by Xiaomi Inc.
+
+Official source:
+https://hyperos.mi.com/font/
+
+MiSans is used under the MiSans Font Intellectual Property License Agreement.
+A copy of that agreement is included as MiSans-License.pdf in this directory.
+
+The included font files are unmodified copies from Xiaomi's official MiSans download package:
+- MiSans-Regular.woff2
+- MiSans-Semibold.woff2

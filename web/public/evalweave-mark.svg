@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="EvalWeave">
+  <defs>
+    <linearGradient id="evalweave-gradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#765ff4"/>
+      <stop offset="1" stop-color="#4f8dff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="5" width="20" height="54" rx="10" fill="url(#evalweave-gradient)" transform="translate(18 32) skewX(-7) translate(-18 -32)"/>
+  <rect x="36" y="5" width="20" height="54" rx="10" fill="url(#evalweave-gradient)" opacity=".82" transform="translate(46 32) skewX(7) translate(-46 -32)"/>
+</svg>

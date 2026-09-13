@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, Column, String, Text
+from sqlalchemy import JSON, Column, String, Text, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -131,6 +131,45 @@ class AgentJob(TimestampMixin, table=True):
     requires_approval: bool = Field(default=True, nullable=False)
 
 
+class EvaluationModel(TimestampMixin, table=True):
+    __tablename__ = "evaluation_models"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    name: str = Field(sa_column=Column(String(128), unique=True, nullable=False))
+    base_url: str = Field(max_length=512)
+    model_name: str = Field(max_length=128)
+    api_mode: str = Field(default="responses", max_length=32)
+    api_key_encrypted: str = Field(sa_column=Column(Text, nullable=False))
+    is_active: bool = Field(default=True, index=True, nullable=False)
+
+
+class AssistantConversation(TimestampMixin, table=True):
+    __tablename__ = "assistant_conversations"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    project_id: UUID | None = Field(default=None, foreign_key="projects.id", index=True)
+    created_by: UUID = Field(foreign_key="users.id", index=True)
+    title: str = Field(default="新的评测对话", max_length=128)
+    draft: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    status: str = Field(default="collecting", index=True, max_length=32)
+    agent_job_id: UUID | None = Field(default=None, foreign_key="agent_jobs.id", index=True)
+
+
+class AssistantMessage(TimestampMixin, table=True):
+    __tablename__ = "assistant_messages"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    conversation_id: UUID = Field(foreign_key="assistant_conversations.id", index=True)
+    role: str = Field(max_length=16)
+    content: str = Field(sa_column=Column(Text, nullable=False))
+    attachment_file_id: UUID | None = Field(
+        default=None, foreign_key="file_objects.id", index=True
+    )
+    attachment_name: str | None = Field(default=None, max_length=255)
+    attachment_content_type: str | None = Field(default=None, max_length=255)
+    attachment_size_bytes: int | None = Field(default=None, ge=0)
+
+
 class AgentStep(TimestampMixin, table=True):
     __tablename__ = "agent_steps"
 
@@ -148,6 +187,17 @@ class AgentStep(TimestampMixin, table=True):
     finished_at: datetime | None = None
 
 
+class AgentJobEvent(TimestampMixin, table=True):
+    __tablename__ = "agent_job_events"
+
+    id: int | None = Field(default=None, primary_key=True)
+    job_id: UUID = Field(foreign_key="agent_jobs.id", index=True)
+    phase: str = Field(index=True, max_length=64)
+    event_type: str = Field(index=True, max_length=32)
+    content: str = Field(default="", sa_column=Column(Text, nullable=False))
+    payload: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+
+
 class HumanTask(TimestampMixin, table=True):
     __tablename__ = "human_tasks"
 
@@ -162,6 +212,67 @@ class HumanTask(TimestampMixin, table=True):
     decision_reason: str | None = Field(default=None, sa_column=Column(Text))
     resolved_by: UUID | None = Field(default=None, foreign_key="users.id", index=True)
     resolved_at: datetime | None = None
+
+
+class HumanReviewCampaign(TimestampMixin, table=True):
+    __tablename__ = "human_review_campaigns"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    job_id: UUID = Field(foreign_key="agent_jobs.id", index=True)
+    created_by: UUID = Field(foreign_key="users.id", index=True)
+    title: str = Field(max_length=128)
+    instructions: str = Field(default="", sa_column=Column(Text, nullable=False))
+    status: str = Field(default="active", index=True, max_length=32)
+    rubric: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON, nullable=False)
+    )
+    blind_config: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    reviewer_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    reviews_per_item: int = Field(default=1, ge=1)
+    item_count: int = Field(default=0, ge=0)
+    total_assignments: int = Field(default=0, ge=0)
+    completed_assignments: int = Field(default=0, ge=0)
+    deadline_at: datetime | None = Field(default=None, index=True)
+    summary_started_at: datetime | None = None
+    completion_reason: str | None = Field(default=None, max_length=32)
+    summary: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    completed_at: datetime | None = None
+
+
+class HumanReviewItem(TimestampMixin, table=True):
+    __tablename__ = "human_review_items"
+    __table_args__ = (UniqueConstraint("campaign_id", "source_index"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    campaign_id: UUID = Field(foreign_key="human_review_campaigns.id", index=True)
+    source_index: int = Field(ge=0)
+    prompt: str = Field(default="", sa_column=Column(Text, nullable=False))
+    response: str = Field(default="", sa_column=Column(Text, nullable=False))
+    visible_metadata: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    private_metadata: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+
+
+class HumanReviewAssignment(TimestampMixin, table=True):
+    __tablename__ = "human_review_assignments"
+    __table_args__ = (UniqueConstraint("item_id", "reviewer_id"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    campaign_id: UUID = Field(foreign_key="human_review_campaigns.id", index=True)
+    item_id: UUID = Field(foreign_key="human_review_items.id", index=True)
+    reviewer_id: UUID = Field(foreign_key="users.id", index=True)
+    status: str = Field(default="pending", index=True, max_length=32)
+    dimension_scores: list[dict[str, Any]] = Field(
+        default_factory=list, sa_column=Column(JSON, nullable=False)
+    )
+    overall_score: float | None = None
+    reason: str | None = Field(default=None, sa_column=Column(Text))
+    submitted_at: datetime | None = None
 
 
 class NotificationDelivery(TimestampMixin, table=True):

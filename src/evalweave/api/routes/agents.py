@@ -1,20 +1,35 @@
 from __future__ import annotations
 
+import json
+import re
+import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlmodel import select
+from sqlmodel import Session, select
 
+from evalweave.agents.model_config import resolve_agent_config
+from evalweave.agents.planner import (
+    assist_job_configuration,
+    derive_task_title,
+)
+from evalweave.agents.react_runtime import stream_react_configuration
 from evalweave.auth.dependencies import SessionDependency, require_permission
 from evalweave.auth.permissions import Permission
 from evalweave.core.config import get_settings
 from evalweave.db.models import (
     AgentJob,
+    AgentJobEvent,
     AgentJobStatus,
     AgentStep,
+    AssistantConversation,
+    AssistantMessage,
+    EvaluationModel,
     FileObject,
     HumanTask,
     HumanTaskStatus,
@@ -22,6 +37,7 @@ from evalweave.db.models import (
     Project,
     User,
 )
+from evalweave.db.session import get_engine
 from evalweave.notifications import notify_human_task
 from evalweave.workers.factory import create_celery_app
 
@@ -30,6 +46,25 @@ router = APIRouter(tags=["evaluation-agent"])
 ExperimentReader = Annotated[User, Depends(require_permission(Permission.EXPERIMENT_READ))]
 ExperimentRunner = Annotated[User, Depends(require_permission(Permission.EXPERIMENT_RUN))]
 EvaluationReviewer = Annotated[User, Depends(require_permission(Permission.EVALUATION_REVIEW))]
+
+
+def redact_sensitive_content(content: str) -> str:
+    redacted = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s'\"\\]+",
+        r"\1[REDACTED]",
+        content,
+    )
+    redacted = re.sub(
+        r"(?is)(\s-b\s+)(['\"]).*?\2",
+        r"\1'[REDACTED]'",
+        redacted,
+    )
+    redacted = re.sub(
+        r'(?i)("(?:user_)?password"\s*:\s*")[^"]*(")',
+        r"\1[REDACTED]\2",
+        redacted,
+    )
+    return redacted
 
 
 def enqueue_agent_task(task_name: str, job_id: UUID) -> None:
@@ -48,6 +83,8 @@ class AgentJobCreate(BaseModel):
     input_config: dict[str, Any] = Field(default_factory=dict)
     notification_targets: list[NotificationTarget] = Field(default_factory=list)
     requires_approval: bool | None = None
+    output_format: Literal["xlsx", "jsonl", "markdown", "text"] = "xlsx"
+    evaluation_model_id: UUID | None = None
 
 
 class AgentJobRead(BaseModel):
@@ -86,6 +123,18 @@ class AgentStepRead(BaseModel):
     finished_at: datetime | None
 
 
+class AgentJobEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    job_id: UUID
+    phase: str
+    event_type: str
+    content: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
 class HumanTaskRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -104,6 +153,81 @@ class HumanTaskRead(BaseModel):
 class HumanDecision(BaseModel):
     decision: Literal["approve", "reject"]
     reason: str | None = Field(default=None, max_length=4000)
+
+
+class AgentRuntimeRead(BaseModel):
+    enabled: bool
+    model: str | None
+    require_approval: bool
+    allowed_target_hosts: list[str]
+    worker_available: bool
+
+
+class AgentAssistMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=10000)
+
+
+class AgentAssistRequest(BaseModel):
+    messages: list[AgentAssistMessage] = Field(min_length=1, max_length=20)
+    project_id: UUID | None = None
+    evaluation_model_id: UUID | None = None
+
+
+class AgentAssistRead(BaseModel):
+    reply: str
+    draft: dict[str, Any]
+
+
+class AssistantConversationCreate(BaseModel):
+    project_id: UUID | None = None
+
+
+class AssistantConversationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    project_id: UUID | None
+    title: str
+    draft: dict[str, Any]
+    status: str
+    agent_job_id: UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AssistantMessageRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    conversation_id: UUID
+    role: str
+    content: str
+    attachment_file_id: UUID | None
+    attachment_name: str | None
+    attachment_content_type: str | None
+    attachment_size_bytes: int | None
+    created_at: datetime
+
+
+class AssistantStreamRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+    source_file_id: UUID | None = None
+    evaluation_model_id: UUID | None = None
+    output_format: Literal["xlsx", "jsonl", "markdown", "text"] | None = None
+
+
+class AssistantStartedRequest(BaseModel):
+    agent_job_id: UUID
+
+
+class EvaluationModelOption(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    model_name: str
+    api_mode: str
 
 
 def require_project(project_id: UUID, session: SessionDependency) -> Project:
@@ -127,6 +251,318 @@ def require_human_task(task_id: UUID, session: SessionDependency) -> HumanTask:
     return task
 
 
+def require_assistant_conversation(
+    conversation_id: UUID, user: User, session: SessionDependency
+) -> AssistantConversation:
+    conversation = session.get(AssistantConversation, conversation_id)
+    if conversation is None or conversation.created_by != user.id:
+        raise HTTPException(status_code=404, detail="评测助手对话不存在")
+    return conversation
+
+
+@router.get("/agent/runtime", response_model=AgentRuntimeRead)
+def get_agent_runtime(_: ExperimentReader) -> AgentRuntimeRead:
+    config = get_settings().agent
+    try:
+        worker_available = bool(create_celery_app().control.inspect(timeout=0.5).ping())
+    except Exception:
+        worker_available = False
+    return AgentRuntimeRead(
+        enabled=config.enabled,
+        model=config.model or None,
+        require_approval=config.require_approval,
+        allowed_target_hosts=config.allowed_target_hosts,
+        worker_available=worker_available,
+    )
+
+
+@router.get("/evaluation-models", response_model=list[EvaluationModelOption])
+def list_available_evaluation_models(
+    _: ExperimentReader, session: SessionDependency
+) -> list[EvaluationModel]:
+    statement = (
+        select(EvaluationModel).where(EvaluationModel.is_active).order_by(EvaluationModel.name)
+    )
+    return list(session.exec(statement).all())
+
+
+@router.post("/agent/assist", response_model=AgentAssistRead)
+def assist_with_agent(
+    payload: AgentAssistRequest, _: ExperimentRunner, session: SessionDependency
+) -> AgentAssistRead:
+    config = resolve_agent_config(session, payload.evaluation_model_id)
+    result = assist_job_configuration(
+        config,
+        [message.model_dump() for message in payload.messages],
+        {
+            "project_id": str(payload.project_id) if payload.project_id else None,
+            "allowed_target_hosts": config.allowed_target_hosts,
+            "available_output_formats": ["xlsx", "jsonl", "markdown", "text"],
+        },
+    )
+    return AgentAssistRead.model_validate(result)
+
+
+@router.get("/assistant/conversations", response_model=list[AssistantConversationRead])
+def list_assistant_conversations(
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> list[AssistantConversation]:
+    statement = (
+        select(AssistantConversation)
+        .where(AssistantConversation.created_by == user.id)
+        .order_by(AssistantConversation.updated_at.desc())
+    )
+    return list(session.exec(statement).all())
+
+
+@router.post(
+    "/assistant/conversations",
+    response_model=AssistantConversationRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_assistant_conversation(
+    payload: AssistantConversationCreate,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> AssistantConversation:
+    if payload.project_id:
+        require_project(payload.project_id, session)
+    conversation = AssistantConversation(
+        project_id=payload.project_id,
+        created_by=user.id,
+    )
+    session.add(conversation)
+    session.commit()
+    session.refresh(conversation)
+    session.add(
+        AssistantMessage(
+            conversation_id=conversation.id,
+            role="assistant",
+            content=(
+                "你好，我是评测助手。告诉我你要评测什么：可以上传数据文件，也可以直接说明"
+                "接口地址、调用方式和判断标准。我会边聊边整理成可执行任务。"
+            ),
+        )
+    )
+    session.commit()
+    return conversation
+
+
+@router.get(
+    "/assistant/conversations/{conversation_id}/messages",
+    response_model=list[AssistantMessageRead],
+)
+def list_assistant_messages(
+    conversation_id: UUID,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> list[AssistantMessage]:
+    require_assistant_conversation(conversation_id, user, session)
+    statement = (
+        select(AssistantMessage)
+        .where(AssistantMessage.conversation_id == conversation_id)
+        .order_by(AssistantMessage.created_at)
+    )
+    return list(session.exec(statement).all())
+
+
+@router.post("/assistant/conversations/{conversation_id}/messages/stream")
+def stream_assistant_message(
+    conversation_id: UUID,
+    payload: AssistantStreamRequest,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> StreamingResponse:
+    conversation = require_assistant_conversation(conversation_id, user, session)
+    source: FileObject | None = None
+    if payload.source_file_id:
+        source = session.get(FileObject, payload.source_file_id)
+        if source is None or source.project_id != conversation.project_id:
+            raise HTTPException(status_code=422, detail="数据文件不属于当前项目")
+    user_message = AssistantMessage(
+        conversation_id=conversation.id,
+        role="user",
+        content=redact_sensitive_content(payload.content.strip()),
+        attachment_file_id=source.id if source else None,
+        attachment_name=source.original_name if source else None,
+        attachment_content_type=source.content_type if source else None,
+        attachment_size_bytes=source.size_bytes if source else None,
+    )
+    session.add(user_message)
+    if conversation.title == "新的评测对话":
+        conversation.title = payload.content.strip()[:36]
+    if source:
+        conversation.draft = {
+            **conversation.draft,
+            "source_file_id": str(source.id),
+        }
+    if payload.output_format:
+        conversation.draft = {
+            **conversation.draft,
+            "output_format": payload.output_format,
+        }
+    conversation.updated_at = datetime.now(UTC)
+    session.add(conversation)
+    session.commit()
+
+    statement = (
+        select(AssistantMessage)
+        .where(AssistantMessage.conversation_id == conversation.id)
+        .order_by(AssistantMessage.created_at)
+    )
+    message_history = [
+        {"role": item.role, "content": item.content} for item in session.exec(statement).all()
+    ]
+    if message_history:
+        message_history[-1]["content"] = payload.content.strip()
+    current_draft = dict(conversation.draft)
+    project_id = conversation.project_id
+    owner_id = user.id
+    config = resolve_agent_config(session, payload.evaluation_model_id)
+
+    def event_stream() -> Iterator[str]:
+        yield json.dumps({"type": "start"}, ensure_ascii=False) + "\n"
+        try:
+            result: dict[str, Any] | None = None
+            assistant_context = {
+                "project_id": str(project_id) if project_id else None,
+                "current_draft": current_draft,
+                "allowed_target_hosts": config.allowed_target_hosts,
+                "target_auth_configured": bool(
+                    config.target_headers or config.target_auth_flows
+                ),
+                "configured_target_header_names": list(config.target_headers),
+                "configured_auth_hosts": list(config.target_auth_flows),
+                "available_output_formats": ["xlsx", "jsonl", "markdown", "text"],
+            }
+            if not config.enabled or not config.base_url or not config.model:
+                fallback = assist_job_configuration(config, message_history, assistant_context)
+                result = {**fallback, "ui_action": None, "react_trace": []}
+                yield json.dumps(
+                    {"type": "delta", "content": fallback["reply"]}, ensure_ascii=False
+                ) + "\n"
+            else:
+                for event_type, value in stream_react_configuration(
+                    config, message_history, assistant_context, project_id
+                ):
+                    if event_type == "delta":
+                        yield json.dumps(
+                            {"type": "delta", "content": value}, ensure_ascii=False
+                        ) + "\n"
+                    elif event_type in {"tool_start", "tool_result"}:
+                        yield json.dumps(
+                            {"type": event_type, "tool": value}, ensure_ascii=False
+                        ) + "\n"
+                    else:
+                        result = value
+            if result is None:
+                raise ValueError("Agent model did not return a configuration result")
+            draft = {**current_draft, **result["draft"]}
+            draft["react_trace"] = result.get("react_trace", [])
+            draft["ui_action"] = result.get("ui_action")
+            goal = str(draft.get("goal", "")).strip()
+            if goal and not str(draft.get("title", "")).strip():
+                draft["title"] = derive_task_title(goal)
+            if payload.output_format:
+                draft["output_format"] = payload.output_format
+            has_source = bool(draft.get("source_file_id"))
+            has_target = bool(draft.get("target_url"))
+            target_ready = has_target and bool(draft.get("target_body"))
+            source_ready = has_source and bool(draft.get("source_inspected"))
+            target_ready = target_ready and bool(draft.get("target_validated"))
+            if draft.get("task_mode") == "human_review":
+                core_ready = bool(
+                    draft.get("title")
+                    and draft.get("goal")
+                    and source_ready
+                    and (draft.get("reviewer_type_codes") or draft.get("reviewer_usernames"))
+                    and draft.get("review_rubric")
+                    and draft.get("deadline_hours")
+                )
+            else:
+                core_ready = bool(draft.get("title") and draft.get("goal")) and (
+                    source_ready or target_ready
+                )
+            action_type = (result.get("ui_action") or {}).get("type")
+            if action_type == "choose_output" or (core_ready and not draft.get("output_format")):
+                stage = "choose_output"
+            elif action_type == "confirm" or core_ready:
+                stage = "ready"
+            else:
+                stage = "collecting"
+            reply = result["reply"]
+
+            with Session(get_engine()) as write_session:
+                stored = write_session.get(AssistantConversation, conversation_id)
+                if stored is None or stored.created_by != owner_id:
+                    return
+                stored.draft = draft
+                stored.status = stage
+                stored.updated_at = datetime.now(UTC)
+                write_session.add(stored)
+                write_session.add(
+                    AssistantMessage(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=reply,
+                    )
+                )
+                write_session.commit()
+            yield (
+                json.dumps(
+                    {"type": "done", "content": reply, "draft": draft, "stage": stage},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        except Exception as error:
+            yield json.dumps({"type": "error", "message": str(error)}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/assistant/conversations/{conversation_id}/started",
+    response_model=AssistantConversationRead,
+)
+def mark_assistant_conversation_started(
+    conversation_id: UUID,
+    payload: AssistantStartedRequest,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> AssistantConversation:
+    conversation = require_assistant_conversation(conversation_id, user, session)
+    job = require_job(payload.agent_job_id, session)
+    if job.created_by != user.id or job.project_id != conversation.project_id:
+        raise HTTPException(status_code=422, detail="评测任务与当前对话不匹配")
+    already_recorded = (
+        conversation.status == "started" and conversation.agent_job_id == job.id
+    )
+    conversation.agent_job_id = job.id
+    conversation.status = "started"
+    conversation.updated_at = datetime.now(UTC)
+    session.add(conversation)
+    if not already_recorded:
+        session.add(
+            AssistantMessage(
+                conversation_id=conversation.id,
+                role="user",
+                content="确认并开启",
+            )
+        )
+    session.commit()
+    session.refresh(conversation)
+    return conversation
+
+
 @router.post(
     "/projects/{project_id}/agent-jobs",
     response_model=AgentJobRead,
@@ -144,6 +580,9 @@ def create_agent_job(
         if file_object is None or file_object.project_id != project_id:
             raise HTTPException(status_code=422, detail="Source file does not belong to project")
     input_config = dict(payload.input_config)
+    input_config["output_format"] = payload.output_format
+    if payload.evaluation_model_id:
+        input_config["evaluation_model_id"] = str(payload.evaluation_model_id)
     input_config["notification_targets"] = [
         target.model_dump() for target in payload.notification_targets
     ]
@@ -191,15 +630,65 @@ def list_agent_steps(
     return list(session.exec(statement.order_by(AgentStep.created_at)).all())
 
 
+@router.get("/agent-jobs/{job_id}/events")
+def stream_agent_job_events(
+    job_id: UUID,
+    _: ExperimentReader,
+    session: SessionDependency,
+    after: int = 0,
+) -> StreamingResponse:
+    require_job(job_id, session)
+
+    def event_stream() -> Iterator[str]:
+        last_id = max(after, 0)
+        while True:
+            with Session(get_engine()) as read_session:
+                statement = (
+                    select(AgentJobEvent)
+                    .where(AgentJobEvent.job_id == job_id, AgentJobEvent.id > last_id)
+                    .order_by(AgentJobEvent.id)
+                )
+                events = list(read_session.exec(statement).all())
+                current_job = read_session.get(AgentJob, job_id)
+            for event in events:
+                last_id = int(event.id or last_id)
+                data = AgentJobEventRead.model_validate(event).model_dump(mode="json")
+                encoded = json.dumps(data, ensure_ascii=False)
+                yield f"id: {last_id}\nevent: agent-event\ndata: {encoded}\n\n"
+            terminal = current_job is None or current_job.status in {
+                AgentJobStatus.COMPLETED,
+                AgentJobStatus.FAILED,
+                AgentJobStatus.CANCELLED,
+            }
+            if terminal and not events:
+                yield "event: end\ndata: {}\n\n"
+                return
+            if not events:
+                yield ": keep-alive\n\n"
+            time.sleep(0.35)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/agent-jobs/{job_id}/start", response_model=AgentJobRead)
-def start_agent_job(
-    job_id: UUID, _: ExperimentRunner, session: SessionDependency
-) -> AgentJob:
+def start_agent_job(job_id: UUID, _: ExperimentRunner, session: SessionDependency) -> AgentJob:
     job = require_job(job_id, session)
-    if job.status not in {AgentJobStatus.PENDING, AgentJobStatus.FAILED}:
+    if job.status not in {
+        AgentJobStatus.PENDING,
+        AgentJobStatus.FAILED,
+        AgentJobStatus.COMPLETED,
+        AgentJobStatus.CANCELLED,
+    }:
         raise HTTPException(status_code=409, detail="Agent job cannot be started in current state")
     job.status = AgentJobStatus.PENDING
     job.error = None
+    job.eval_spec = {}
+    job.result = {}
+    job.result_file_id = None
     session.add(job)
     session.commit()
     enqueue_agent_task("evalweave.agent.plan", job.id)
@@ -220,9 +709,7 @@ def list_human_tasks(
 
 
 @router.get("/human-tasks/{task_id}", response_model=HumanTaskRead)
-def get_human_task(
-    task_id: UUID, _: EvaluationReviewer, session: SessionDependency
-) -> HumanTask:
+def get_human_task(task_id: UUID, _: EvaluationReviewer, session: SessionDependency) -> HumanTask:
     return require_human_task(task_id, session)
 
 
@@ -238,9 +725,7 @@ def decide_human_task(
         raise HTTPException(status_code=409, detail="Human task has already been resolved")
     job = require_job(task.job_id, session)
     task.status = (
-        HumanTaskStatus.APPROVED
-        if payload.decision == "approve"
-        else HumanTaskStatus.REJECTED
+        HumanTaskStatus.APPROVED if payload.decision == "approve" else HumanTaskStatus.REJECTED
     )
     task.decision_reason = payload.reason
     task.resolved_by = user.id

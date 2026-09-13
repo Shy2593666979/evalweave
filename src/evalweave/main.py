@@ -12,6 +12,7 @@ from evalweave.api.router import api_router
 from evalweave.auth.service import bootstrap_identity_data
 from evalweave.core.config import get_settings, set_config_path
 from evalweave.core.logging import configure_logging
+from evalweave.db.session import create_db_and_tables
 
 
 @asynccontextmanager
@@ -20,6 +21,7 @@ async def lifespan(_: FastAPI):
     configure_logging(settings)
     settings.storage.local_directory.mkdir(parents=True, exist_ok=True)
     settings.logging.directory.mkdir(parents=True, exist_ok=True)
+    create_db_and_tables()
     bootstrap_identity_data()
     yield
 
