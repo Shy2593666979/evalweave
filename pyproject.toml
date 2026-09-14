@@ -27,6 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
+evalweave = "evalweave.cli:main"
 evalweave-api = "evalweave.main:api_main"
 evalweave-worker = "evalweave.workers.app:worker_main"
 

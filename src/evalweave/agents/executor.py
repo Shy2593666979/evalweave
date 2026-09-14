@@ -18,35 +18,16 @@ from openpyxl.utils import get_column_letter
 from sqlmodel import Session
 
 from evalweave.agents.inspection import load_source_rows
-from evalweave.core.config import get_settings
+from evalweave.agents.model_config import decrypt_secret_payload
+from evalweave.core.config import TargetAuthFlowConfig, get_settings
 from evalweave.db.models import AgentJob, FileObject
 from evalweave.storage import LocalFileStorage
 
-LOCAL_FIELD_LABELS = {
-    "student_name": "姓名",
-    "student_id": "学号",
-    "gpa": "平均学分绩点",
-    "learning_basic_score": "学习基本分",
-    "learning_raw_bonus": "学习原始附加分",
-    "learning_bonus_total": "学习附加分总分",
-    "learning_deduction": "学习扣分",
-    "learning_total": "学习总分",
-    "learning_rank": "学习排名",
-    "moral_basic_score": "思想基本分",
-    "moral_raw_bonus": "思想原始附加分",
-    "moral_bonus_total": "思想附加分总分",
-    "moral_deduction": "思想扣分",
-    "moral_total": "思想总分",
-    "moral_rank": "思想排名",
-    "physical_aesthetic_labor_basic_score": "体美劳基本分",
-    "physical_aesthetic_labor_raw_bonus": "体美劳原始附加分",
-    "physical_aesthetic_labor_bonus_total": "体美劳附加分总分",
-    "physical_aesthetic_labor_deduction": "体美劳扣分",
-    "physical_aesthetic_labor_total": "体美劳总分",
-    "physical_aesthetic_labor_rank": "体美劳排名",
-    "comprehensive_total": "综合测评总分",
-    "comprehensive_rank": "综合测评排名",
-}
+
+class TargetApplicationError(ValueError):
+    def __init__(self, message: str, response: httpx.Response):
+        super().__init__(message)
+        self.response = response
 
 
 def render_template(value: Any, row: dict[str, Any]) -> Any:
@@ -91,12 +72,16 @@ def validate_target(target: dict[str, Any]) -> tuple[str, dict[str, str]]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Target URL must use http or https")
-    allowed_hosts = {host.lower() for host in get_settings().agent.allowed_target_hosts}
-    if parsed.hostname.lower() not in allowed_hosts:
-        raise ValueError(f"Target host is not allowed: {parsed.hostname}")
     if "headers" in target:
         raise ValueError("Configure target headers in application.yaml, not in job input")
-    return url, dict(get_settings().agent.target_headers)
+    headers = dict(get_settings().agent.target_headers)
+    credentials = target.get("credentials")
+    if isinstance(credentials, str) and credentials:
+        task_credentials = decrypt_secret_payload(credentials)
+        task_headers = task_credentials.get("headers")
+        if isinstance(task_headers, dict):
+            headers.update({str(key): str(value) for key, value in task_headers.items()})
+    return url, headers
 
 
 def value_at_path(value: Any, path: str) -> Any:
@@ -130,16 +115,23 @@ def value_at_path(value: Any, path: str) -> Any:
 
 
 def authenticate_target(
-    client: httpx.Client, target_url: str, headers: dict[str, str]
+    client: httpx.Client,
+    target_url: str,
+    headers: dict[str, str],
+    credentials: str | None = None,
 ) -> dict[str, Any]:
     target_host = (urlparse(target_url).hostname or "").lower()
-    flow = get_settings().agent.target_auth_flows.get(target_host)
+    flow = None
+    source = "configured"
+    if credentials:
+        task_auth = decrypt_secret_payload(credentials).get("auth")
+        if isinstance(task_auth, dict):
+            flow = TargetAuthFlowConfig.model_validate(task_auth)
+            source = "task"
+    if flow is None:
+        flow = get_settings().agent.target_auth_flows.get(target_host)
     if flow is None:
         return {"used": False}
-    login_host = (urlparse(flow.login_url).hostname or "").lower()
-    allowed_hosts = {host.lower() for host in get_settings().agent.allowed_target_hosts}
-    if login_host not in allowed_hosts:
-        raise ValueError(f"登录接口域名不在允许列表中：{login_host}")
     try:
         response = client.post(flow.login_url, json=flow.body)
         response.raise_for_status()
@@ -157,6 +149,7 @@ def authenticate_target(
         headers[flow.header_name] = f"{flow.header_prefix}{token}"
     return {
         "used": True,
+        "source": source,
         "login_url": flow.login_url,
         "header_name": flow.header_name if flow.token_path else None,
         "cookie_names": sorted(client.cookies.keys()),
@@ -196,13 +189,57 @@ def isolate_session_ids(value: Any, session_id: str | None = None) -> Any:
     if isinstance(value, dict):
         return {
             key: isolated_session_id
-            if key.lower() == "session_id"
+            if re.sub(r"[_-]", "", key).lower() == "sessionid"
             else isolate_session_ids(item, isolated_session_id)
             for key, item in value.items()
         }
     if isinstance(value, list):
         return [isolate_session_ids(item, isolated_session_id) for item in value]
     return value
+
+
+def detect_application_error(response: httpx.Response) -> str | None:
+    """Detect common JSON error envelopes returned with a successful HTTP status."""
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/event-stream" in content_type:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    reason: str | None = None
+    if payload.get("success") is False:
+        reason = "success=false"
+    code = payload.get("code")
+    numeric_code = (
+        float(code)
+        if isinstance(code, str) and re.fullmatch(r"\d+(?:\.\d+)?", code.strip())
+        else code
+    )
+    if (
+        isinstance(numeric_code, int | float)
+        and not isinstance(numeric_code, bool)
+        and numeric_code >= 400
+    ):
+        reason = f"code={numeric_code:g}"
+    status_code = payload.get("status_code", payload.get("statusCode"))
+    if (
+        isinstance(status_code, int | float)
+        and not isinstance(status_code, bool)
+        and status_code >= 400
+    ):
+        reason = f"status_code={status_code:g}"
+    status = str(payload.get("status", "")).strip().lower()
+    if status in {"error", "failed", "failure"}:
+        reason = f"status={status}"
+    if reason is None:
+        return None
+
+    message = str(payload.get("msg") or payload.get("message") or payload.get("error") or "")
+    return f"{reason}（{message[:500]}）" if message else reason
 
 
 def _markdown_value(value: Any, limit: int = 180) -> str:
@@ -358,9 +395,7 @@ def serialize_results(
             fields = list(
                 dict.fromkeys(str(key) for record in records for key in (record.get("input") or {}))
             )
-            sheet.append(
-                ["序号", "状态", *[LOCAL_FIELD_LABELS.get(field, field) for field in fields]]
-            )
+            sheet.append(["序号", "状态", *fields])
             for record in records:
                 row = record.get("input") or {}
                 sheet.append(
@@ -848,7 +883,7 @@ def execute_data_program(
             ttfbs: list[float] = []
             succeeded = 0
             with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                authenticate_target(client, url, headers)
+                authenticate_target(client, url, headers, target.get("credentials"))
                 for row_index, row in enumerate(rows):
                     record = execute_target_case(client, url, headers, target, row, row_index)
                     if record["status"] == "completed":
@@ -1117,6 +1152,11 @@ def execute_target_case(
             ttfb_ms = (time.perf_counter() - started) * 1000
         elapsed_ms = (time.perf_counter() - started) * 1000
         response.raise_for_status()
+        application_error = detect_application_error(response)
+        if application_error:
+            raise TargetApplicationError(
+                f"目标接口返回业务错误：{application_error}", response
+            )
         output, response_mode = parse_target_response(response, response_path)
         return {
             "case_index": index,
@@ -1149,7 +1189,7 @@ def validate_http_target(session: Session, job: AgentJob) -> dict[str, Any]:
     probe_count = min(3, len(rows))
     records: list[dict[str, Any]] = []
     with httpx.Client(timeout=timeout) as client:
-        authentication = authenticate_target(client, url, headers)
+        authentication = authenticate_target(client, url, headers, target.get("credentials"))
         for index, row in enumerate(rows[:probe_count]):
             record = execute_target_case(client, url, headers, target, row, index)
             records.append(record)
@@ -1164,8 +1204,8 @@ def validate_http_target(session: Session, job: AgentJob) -> dict[str, Any]:
             error = f"{error}; response body: {response_body}"
         if "401" in error or "Unauthorized" in error:
             raise ValueError(
-                "目标接口预检失败：HTTP 401 未授权。请先在 agent.target_headers 中配置"
-                "目标接口所需的鉴权请求头，再运行评测。"
+                "目标接口预检失败：HTTP 401 未授权。"
+                "请通过 Agent 提供本任务的请求头或登录流程后重试。"
             )
         raise ValueError(f"目标接口预检在第 {len(records)} 条失败：{error}")
     response_modes = sorted({str(record["response_mode"]) for record in records})
@@ -1198,7 +1238,7 @@ def execute_http_target(
     preflight_records = preflight.get("records", []) if isinstance(preflight, dict) else []
     records = [dict(record) for record in preflight_records]
     with httpx.Client(timeout=timeout) as client:
-        authenticate_target(client, url, headers)
+        authenticate_target(client, url, headers, target.get("credentials"))
         for index, row in enumerate(rows[len(records) :], start=len(records)):
             records.append(execute_target_case(client, url, headers, target, row, index))
     if evaluate_records is not None:

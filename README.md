@@ -60,21 +60,22 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
    docker compose -f deploy/docker-compose.yaml up -d
    ```
 
-4. 启动 API（启动时会自动创建尚不存在的数据表）：
+4. 同时启动 API 和 Celery Worker（API 启动时会自动创建尚不存在的数据表）：
+
+   ```powershell
+   uv run evalweave --config config/application.yaml
+   ```
+
+   按 `Ctrl+C` 会同时停止两个进程。OpenAPI 文档位于 <http://127.0.0.1:8000/docs>。
+
+   如需分别启动，也可以使用两个终端运行：
 
    ```powershell
    uv run evalweave-api --config config/application.yaml
-   ```
-
-   OpenAPI 文档位于 <http://127.0.0.1:8000/docs>。
-
-5. 启动 Celery Worker：
-
-   ```powershell
    uv run evalweave-worker --config config/application.yaml
    ```
 
-6. 启动前端：
+5. 启动前端：
 
    ```powershell
    Set-Location web
@@ -99,8 +100,8 @@ pnpm build
 Agent 默认关闭。请在 `config/application.yaml` 中配置 OpenAI Python SDK 使用的模型接口；
 `agent.api_mode` 默认使用 Responses API，兼容服务仅实现 Chat Completions 时可改为
 `chat_completions`；
-目标模型的主机必须加入 `agent.allowed_target_hosts`，请求头只允许放在服务端 YAML 的
-`agent.target_headers` 中，不接受任务提交者传入密钥。
+目标接口无需配置主机白名单；请求头只允许放在服务端 YAML 的 `agent.target_headers` 中，
+不接受任务提交者传入密钥。
 
 企业微信首版使用群机器人 Webhook，邮件使用 SMTP。通知内容包含平台人工任务链接，
 批准或拒绝操作统一在平台内完成并留存审计记录。完整配置字段见

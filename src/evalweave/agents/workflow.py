@@ -277,7 +277,6 @@ def repair_http_target_with_react(
     ]
     workspace = {
         "current_draft": draft,
-        "allowed_target_hosts": agent_config.allowed_target_hosts,
         "target_auth_configured": bool(
             agent_config.target_headers or agent_config.target_auth_flows
         ),
@@ -337,7 +336,7 @@ def validate_http_target_with_react(
                 session,
                 job,
                 "validate_target",
-                lambda: validate_http_target(session, job),
+                lambda: validate_http_target_semantics(session, job, agent_config),
                 attempt=attempt,
             )
         except Exception as error:
@@ -349,6 +348,55 @@ def validate_http_target_with_react(
             ):
                 raise
     raise last_error or RuntimeError("Target validation failed")
+
+
+def validate_http_target_semantics(
+    session: Session, job: AgentJob, agent_config: Any
+) -> dict[str, Any]:
+    preflight = validate_http_target(session, job)
+    records = preflight.get("records", [])
+    completed = [record for record in records if record.get("status") == "completed"]
+    if not completed:
+        return preflight
+    if not agent_config.enabled or not agent_config.base_url or not agent_config.model:
+        preflight["semantic_validation"] = {
+            "enabled": False,
+            "reason": "未配置可用的评测模型",
+        }
+        return preflight
+
+    evaluations = run_streamed_model_output(
+        job,
+        "validate_target",
+        "判断预检响应",
+        lambda on_delta: evaluate_target_records(
+            agent_config,
+            job.goal,
+            completed,
+            evaluation_plan=job.eval_spec,
+            on_delta=on_delta,
+        ),
+    )
+    evaluations_by_index = {item["case_index"]: item for item in evaluations}
+    for record in completed:
+        evaluation = evaluations_by_index.get(record.get("case_index"))
+        if evaluation is not None:
+            record["evaluation"] = evaluation
+    passed = sum(item.get("passed") is True for item in evaluations)
+    preflight["semantic_validation"] = {
+        "enabled": True,
+        "evaluated_cases": len(evaluations),
+        "passed_cases": passed,
+    }
+    if evaluations and passed == 0:
+        reasons = "；".join(
+            str(item.get("reason") or "响应未满足预期")[:300] for item in evaluations[:3]
+        )
+        raise ValueError(
+            "目标接口语义预检未通过：抽检响应全部不符合测试预期。"
+            f"可能是请求体、响应路径或目标服务配置错误。{reasons}"
+        )
+    return preflight
 
 
 def plan_agent_job(job_id: UUID) -> None:

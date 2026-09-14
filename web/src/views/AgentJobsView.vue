@@ -69,8 +69,8 @@ const jobForm = reactive({
   output_format: 'xlsx' as 'xlsx' | 'jsonl' | 'markdown' | 'text',
   evaluation_model_id: '',
 })
-let pollTimer: ReturnType<typeof setInterval> | undefined
-let pollInFlight = false
+let jobEventSource: EventSource | null = null
+let jobEventJobId = ''
 let viewActive = false
 
 function jobRenderKey(job: AgentJob | null) {
@@ -241,6 +241,7 @@ async function loadProjects() {
 
 async function loadProjectData(quiet = false) {
   if (!selectedProjectId.value) {
+    stopJobEventStream()
     files.value = []
     jobs.value = []
     selectedJob.value = null
@@ -259,6 +260,7 @@ async function loadProjectData(quiet = false) {
     const next = jobs.value.find((item) => item.id === currentId) ?? jobs.value[0] ?? null
     if (next) await selectJob(next, true)
     else {
+      stopJobEventStream()
       selectedJob.value = null
       steps.value = []
     }
@@ -269,6 +271,43 @@ async function loadProjectData(quiet = false) {
   }
 }
 
+function applyJobDetail(job: AgentJob, nextSteps: AgentStep[]) {
+  const jobChanged = jobRenderKey(selectedJob.value) !== jobRenderKey(job)
+  const stepsChanged = stepsRenderKey(steps.value) !== stepsRenderKey(nextSteps)
+  if (jobChanged) selectedJob.value = job
+  if (stepsChanged) steps.value = nextSteps
+  const index = jobs.value.findIndex((item) => item.id === job.id)
+  if (index >= 0 && jobRenderKey(jobs.value[index] ?? null) !== jobRenderKey(job)) {
+    jobs.value[index] = job
+  }
+}
+
+function stopJobEventStream() {
+  jobEventSource?.close()
+  jobEventSource = null
+  jobEventJobId = ''
+}
+
+function startJobEventStream(jobId: string) {
+  if (jobEventJobId === jobId && jobEventSource) return
+  stopJobEventStream()
+  jobEventJobId = jobId
+  const source = new EventSource(`/api/agent-jobs/${jobId}/events`)
+  jobEventSource = source
+  source.addEventListener('job-state', (event) => {
+    try {
+      const state = JSON.parse((event as MessageEvent).data) as {
+        job: AgentJob
+        steps: AgentStep[]
+      }
+      if (selectedJob.value?.id === state.job.id) applyJobDetail(state.job, state.steps)
+    } catch {
+      // Ignore malformed snapshots; the next changed snapshot will replace it.
+    }
+  })
+  source.addEventListener('end', () => stopJobEventStream())
+}
+
 async function loadJobDetail(jobId: string, quiet = false) {
   if (!quiet) detailLoading.value = true
   try {
@@ -276,14 +315,9 @@ async function loadJobDetail(jobId: string, quiet = false) {
       api.get<AgentJob>(`/agent-jobs/${jobId}`),
       api.get<AgentStep[]>(`/agent-jobs/${jobId}/steps`),
     ])
-    const jobChanged = jobRenderKey(selectedJob.value) !== jobRenderKey(jobResponse.data)
-    const stepsChanged = stepsRenderKey(steps.value) !== stepsRenderKey(stepResponse.data)
-    if (jobChanged) selectedJob.value = jobResponse.data
-    if (stepsChanged) steps.value = stepResponse.data
-    const index = jobs.value.findIndex((item) => item.id === jobId)
-    if (index >= 0 && jobRenderKey(jobs.value[index] ?? null) !== jobRenderKey(jobResponse.data)) {
-      jobs.value[index] = jobResponse.data
-    }
+    applyJobDetail(jobResponse.data, stepResponse.data)
+    if (isActive(jobResponse.data.status)) startJobEventStream(jobId)
+    else stopJobEventStream()
   } catch (error) {
     if (!quiet) ElMessage.error(errorMessage(error))
   } finally {
@@ -304,6 +338,7 @@ async function selectJob(job: AgentJob, quiet = false) {
 }
 
 async function changeProject() {
+  stopJobEventStream()
   localStorage.setItem('evalweave-project', selectedProjectId.value)
   await router.replace({ name: 'evaluations' })
   selectedJob.value = null
@@ -437,22 +472,11 @@ onMounted(async () => {
   } catch (error) {
     if (viewActive) ElMessage.error(errorMessage(error))
   }
-  if (!viewActive) return
-  pollTimer = setInterval(async () => {
-    if (pollInFlight || !selectedJob.value || !isActive(selectedJob.value.status)) return
-    pollInFlight = true
-    try {
-      await loadJobDetail(selectedJob.value.id, true)
-      if (!isActive(selectedJob.value.status)) await loadProjectData(true)
-    } finally {
-      pollInFlight = false
-    }
-  }, 2500)
 })
 
 onBeforeUnmount(() => {
   viewActive = false
-  clearInterval(pollTimer)
+  stopJobEventStream()
 })
 </script>
 

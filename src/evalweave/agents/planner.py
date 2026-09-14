@@ -5,8 +5,7 @@ import re
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from openai import OpenAI
-
+from evalweave.agents.model_client import AgentModelClient
 from evalweave.core.config import AgentConfig
 
 SYSTEM_PROMPT = """You design auditable, executable evaluation and data-processing plans.
@@ -52,7 +51,9 @@ from 1 to 10. Examples of possible dimensions include speed, rationality, releva
 format_compliance, factuality, or task_completion, but these are not mandatory. When speed or
 latency is requested, score it from the measured ttfb_ms and total latency_ms and any thresholds in
 expected; do not infer speed from writing quality. Judge only against supplied evidence. Do not
-reward fluent but irrelevant answers. Give concise Chinese reasons and do not omit any case."""
+reward fluent but irrelevant answers. HTTP or business-level success alone is not sufficient: set
+passed to false for empty, placeholder, error-like, irrelevant, or semantically incorrect output,
+even when its status code is 200. Give concise Chinese reasons and do not omit any case."""
 
 DATA_MODEL_MAP_PROMPT = """You perform one generic semantic transformation over tabular rows.
 Return one JSON object with a results array. Produce exactly one result for each supplied row_index.
@@ -106,72 +107,17 @@ def derive_task_title(goal: str) -> str:
 
 def request_json(
     config: AgentConfig,
-    instructions: str,
+    system_prompt: str,
     payload: dict[str, Any],
     on_delta: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    client = OpenAI(
-        api_key=config.api_key or "not-configured",
-        base_url=config.base_url,
-        timeout=config.timeout_seconds,
-        max_retries=0,
-    )
     serialized = json.dumps(payload, ensure_ascii=False)
-    if on_delta is not None and config.api_mode == "responses":
-        content = ""
-        stream = client.responses.create(
-            model=config.model,
-            instructions=instructions,
-            input=serialized,
-            text={"format": {"type": "json_object"}},
-            store=False,
-            stream=True,
-        )
-        for event in stream:
-            if (
-                getattr(event, "type", "") == "response.output_text.delta"
-                and getattr(event, "delta", None)
-            ):
-                delta = str(event.delta)
-                content += delta
-                on_delta(delta)
-    elif on_delta is not None:
-        content = ""
-        stream = client.chat.completions.create(
-            model=config.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": serialized},
-            ],
-            stream=True,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            if delta:
-                content += str(delta)
-                on_delta(str(delta))
-    elif config.api_mode == "responses":
-        response = client.responses.create(
-            model=config.model,
-            instructions=instructions,
-            input=serialized,
-            text={"format": {"type": "json_object"}},
-            store=False,
-        )
-        content = response.output_text
-    else:
-        response = client.chat.completions.create(
-            model=config.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": serialized},
-            ],
-        )
-        content = response.choices[0].message.content
+    content = AgentModelClient(config).request_text(
+        system_prompt,
+        [{"role": "user", "content": serialized}],
+        json_mode=True,
+        on_delta=on_delta,
+    )
     if not content:
         raise ValueError("Agent model returned empty content")
     result = json.loads(content)
@@ -182,69 +128,16 @@ def request_json(
 
 def request_text(
     config: AgentConfig,
-    instructions: str,
+    system_prompt: str,
     payload: dict[str, Any],
     on_delta: Callable[[str], None] | None = None,
 ) -> str:
-    client = OpenAI(
-        api_key=config.api_key or "not-configured",
-        base_url=config.base_url,
-        timeout=config.timeout_seconds,
-        max_retries=0,
-    )
     serialized = json.dumps(payload, ensure_ascii=False)
-    content = ""
-    if config.api_mode == "responses":
-        if on_delta is None:
-            response = client.responses.create(
-                model=config.model,
-                instructions=instructions,
-                input=serialized,
-                store=False,
-            )
-            content = str(response.output_text or "")
-        else:
-            stream = client.responses.create(
-                model=config.model,
-                instructions=instructions,
-                input=serialized,
-                store=False,
-                stream=True,
-            )
-            for event in stream:
-                if (
-                    getattr(event, "type", "") == "response.output_text.delta"
-                    and getattr(event, "delta", None)
-                ):
-                    delta = str(event.delta)
-                    content += delta
-                    on_delta(delta)
-    elif on_delta is None:
-        response = client.chat.completions.create(
-            model=config.model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": serialized},
-            ],
-        )
-        content = str(response.choices[0].message.content or "")
-    else:
-        stream = client.chat.completions.create(
-            model=config.model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": serialized},
-            ],
-            stream=True,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            if delta:
-                piece = str(delta)
-                content += piece
-                on_delta(piece)
+    content = AgentModelClient(config).request_text(
+        system_prompt,
+        [{"role": "user", "content": serialized}],
+        on_delta=on_delta,
+    )
     content = content.strip()
     if not content:
         raise ValueError("Agent model returned empty summary")
@@ -279,48 +172,16 @@ def extract_partial_json_string(document: str, key: str) -> str:
 
 
 def stream_json(
-    config: AgentConfig, instructions: str, payload: dict[str, Any]
+    config: AgentConfig, system_prompt: str, payload: dict[str, Any]
 ) -> Iterator[tuple[str, Any]]:
-    client = OpenAI(
-        api_key=config.api_key or "not-configured",
-        base_url=config.base_url,
-        timeout=config.timeout_seconds,
-        max_retries=0,
-    )
     serialized = json.dumps(payload, ensure_ascii=False)
     content = ""
     emitted_reply = ""
-    if config.api_mode == "responses":
-        stream = client.responses.create(
-            model=config.model,
-            instructions=instructions,
-            input=serialized,
-            text={"format": {"type": "json_object"}},
-            store=False,
-            stream=True,
-        )
-        deltas = (
-            str(event.delta)
-            for event in stream
-            if getattr(event, "type", "") == "response.output_text.delta"
-            and getattr(event, "delta", None)
-        )
-    else:
-        stream = client.chat.completions.create(
-            model=config.model,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": serialized},
-            ],
-            stream=True,
-        )
-        deltas = (
-            str(chunk.choices[0].delta.content)
-            for chunk in stream
-            if chunk.choices and chunk.choices[0].delta.content
-        )
+    deltas = AgentModelClient(config).stream_text(
+        system_prompt,
+        [{"role": "user", "content": serialized}],
+        json_mode=True,
+    )
     for delta in deltas:
         content += delta
         partial_reply = extract_partial_json_string(content, "reply")

@@ -52,15 +52,15 @@ const conversationMessageBuffers = new Map<string, AssistantMessage[]>()
 const conversationInputDrafts = new Map<string, string>()
 const uploading = ref(false)
 const starting = ref(false)
+const conversationSwitching = ref(false)
 const messagePane = ref<HTMLElement | null>(null)
 const runJob = ref<AgentJob | null>(null)
 const runSteps = ref<AgentStep[]>([])
 const runEvents = ref<AgentJobEvent[]>([])
-let runPollTimer: ReturnType<typeof setInterval> | null = null
-let runPollInFlight = false
 let viewActive = false
 let runEventSource: EventSource | null = null
 let runEventJobId = ''
+let conversationSelectionVersion = 0
 
 function runJobRenderKey(job: AgentJob | null) {
   if (!job) return ''
@@ -120,16 +120,27 @@ const hasRunnableConfig = computed(() => {
     || (draft.target_url && draft.target_body && draft.target_validated),
   )
 })
+const outputFormatValues = new Set(['xlsx', 'jsonl', 'markdown', 'text'])
+
+function isOutputFormatAction(action: { type?: string, options?: unknown[] } | undefined) {
+  if (action?.type === 'choose_output') return true
+  if (action?.type !== 'user_input' || !Array.isArray(action.options)) return false
+  const options = new Set(action.options.map((item) => String(item).trim().toLocaleLowerCase()))
+  return options.size === outputFormatValues.size
+    && [...outputFormatValues].every((format) => options.has(format))
+}
+
 const showOutputChoices = computed(() => {
-  const action = current.value?.draft.ui_action as { type?: string } | undefined
-  return action?.type === 'choose_output' || hasRunnableConfig.value
+  const action = current.value?.draft.ui_action as { type?: string, options?: unknown[] } | undefined
+  return isOutputFormatAction(action) || current.value?.status === 'choose_output'
 })
 const canStartTask = computed(() => hasRunnableConfig.value
   && Boolean(current.value?.draft.output_format)
   && current.value?.status !== 'started'
   && !streaming.value
   && (
-    (current.value?.draft.ui_action as { type?: string } | undefined)?.type === 'confirm'
+    current.value?.status === 'ready'
+    || (current.value?.draft.ui_action as { type?: string } | undefined)?.type === 'confirm'
     || hasCompleteHumanReviewConfig.value
   )
   && messages.value.at(-1)?.role === 'assistant'
@@ -164,8 +175,11 @@ function shouldShowStartTaskButton(index: number) {
   return current.value?.status === 'started' && index === confirmationAssistantIndex.value
 }
 const genericOptions = computed(() => {
+  // While a new reply is streaming, draft.ui_action still belongs to the
+  // previous turn. Do not move those stale buttons onto the new assistant bubble.
+  if (streaming.value) return []
   const action = current.value?.draft.ui_action as { type?: string, options?: unknown[] } | undefined
-  if (action?.type !== 'user_input' || !Array.isArray(action.options)) return []
+  if (action?.type !== 'user_input' || !Array.isArray(action.options) || isOutputFormatAction(action)) return []
   return action.options.map(String)
 })
 const runHeading = computed(() => {
@@ -298,17 +312,35 @@ const outputChoices = [
   { label: 'Excel 文件', description: '适合分析与二次处理', icon: Grid, tone: 'excel', prompt: '请把结果整理成 Excel 文件。', value: 'xlsx' },
   { label: 'JSONL 文件', description: '适合程序读取与批处理', icon: Files, tone: 'jsonl', prompt: '请把结果整理成 JSONL 文件。', value: 'jsonl' },
 ]
-const outputChoiceMessageIndex = computed(() => {
+function isOutputChoiceMessage(content: string) {
+  const normalized = content.trim().toLocaleLowerCase()
+  return outputChoices.some((choice) => (
+    normalized === choice.value
+    || normalized === choice.label.toLocaleLowerCase()
+    || normalized === choice.prompt.toLocaleLowerCase()
+  ))
+}
+
+const outputSelectionMessageIndex = computed(() => {
   for (let index = messages.value.length - 1; index >= 0; index -= 1) {
     const message = messages.value[index]
-    if (message?.role !== 'user') continue
-    if (!outputChoices.some((choice) => choice.prompt === message.content)) continue
-    for (let previous = index - 1; previous >= 0; previous -= 1) {
+    if (message?.role === 'user' && isOutputChoiceMessage(message.content)) return index
+  }
+  return -1
+})
+
+const outputChoiceMessageIndex = computed(() => {
+  if (outputSelectionMessageIndex.value >= 0) {
+    for (let previous = outputSelectionMessageIndex.value - 1; previous >= 0; previous -= 1) {
       if (messages.value[previous]?.role === 'assistant') return previous
     }
   }
   return showOutputChoices.value ? lastAssistantIndex.value : -1
 })
+const outputChoiceSubmitted = computed(() => (
+  outputSelectionMessageIndex.value >= 0
+  || (Boolean(current.value?.draft.output_format) && current.value?.status !== 'choose_output')
+))
 
 async function scrollToBottom() {
   await nextTick()
@@ -359,37 +391,78 @@ async function createConversation() {
 }
 
 async function selectConversation(conversation: AssistantConversation) {
+  const selectionVersion = ++conversationSelectionVersion
+  const conversationId = conversation.id
+  conversationSwitching.value = true
+  try {
   if (current.value) conversationInputDrafts.set(current.value.id, input.value)
-  stopRunPolling()
   stopRunEventStream()
   runJob.value = null
   runSteps.value = []
   runEvents.value = []
   current.value = conversation
-  input.value = conversationInputDrafts.get(conversation.id) ?? ''
-  projectId.value = conversation.project_id ?? projectId.value
+  input.value = conversationInputDrafts.get(conversationId) ?? ''
+  const conversationProjectId = conversation.project_id ?? projectId.value
+  projectId.value = conversationProjectId
   sourceFileId.value = ''
-  const bufferedMessages = conversationMessageBuffers.get(conversation.id)
-  const messageRequest = bufferedMessages
-    ? Promise.resolve(bufferedMessages)
-    : api.get<AssistantMessage[]>(`/assistant/conversations/${conversation.id}/messages`)
-      .then((response) => response.data)
-  const [, loadedMessages] = await Promise.all([loadFiles(), messageRequest])
-  messages.value = loadedMessages
-  if (conversation.agent_job_id) await loadRun(conversation.agent_job_id)
+
+  // Keep the URL in sync before loading. A slower, older selection must never
+  // navigate back after a newer conversation has already been selected.
   if (
     viewActive
     && route.name === 'assistant'
-    && String(route.params.conversationId ?? '') !== conversation.id
+    && String(route.params.conversationId ?? '') !== conversationId
   ) {
-    await router.replace({ name: 'assistant', params: { conversationId: conversation.id } })
+    await router.replace({ name: 'assistant', params: { conversationId } })
+    if (selectionVersion !== conversationSelectionVersion || current.value?.id !== conversationId) return
   }
-  await scrollToBottom()
-}
 
-function stopRunPolling() {
-  if (runPollTimer) clearInterval(runPollTimer)
-  runPollTimer = null
+  const bufferedMessages = conversationMessageBuffers.get(conversationId)
+  const messageRequest = bufferedMessages
+    ? Promise.resolve(bufferedMessages)
+    : api.get<AssistantMessage[]>(`/assistant/conversations/${conversationId}/messages`)
+      .then((response) => response.data)
+  const fileRequest = conversationProjectId
+    ? api.get<FileObject[]>(`/projects/${conversationProjectId}/files`, {
+        params: { category: 'dataset_source' },
+      }).then((response) => response.data)
+    : Promise.resolve([] as FileObject[])
+  const runRequest = conversation.agent_job_id
+    ? Promise.all([
+        api.get<AgentJob>(`/agent-jobs/${conversation.agent_job_id}`),
+        api.get<AgentStep[]>(`/agent-jobs/${conversation.agent_job_id}/steps`),
+      ]).then(([jobResponse, stepResponse]) => ({
+        job: jobResponse.data,
+        steps: stepResponse.data,
+      }))
+    : Promise.resolve(null)
+  const [loadedFiles, loadedMessages, loadedRun] = await Promise.all([
+    fileRequest,
+    messageRequest,
+    runRequest,
+  ])
+  if (selectionVersion !== conversationSelectionVersion || current.value?.id !== conversationId) return
+
+  // Commit the complete conversation in one render. Inserting the run timeline
+  // after the messages were already visible caused a second layout and a jump.
+  files.value = loadedFiles
+  messages.value = loadedMessages
+  runJob.value = loadedRun?.job ?? null
+  runSteps.value = loadedRun?.steps ?? []
+  await scrollToBottom()
+  if (selectionVersion !== conversationSelectionVersion || current.value?.id !== conversationId) return
+  if (
+    conversation.agent_job_id
+    && loadedRun
+    && !['completed', 'failed', 'cancelled'].includes(loadedRun.job.status)
+  ) {
+    startRunEventStream(conversation.agent_job_id)
+  }
+  } finally {
+    if (selectionVersion === conversationSelectionVersion && current.value?.id === conversationId) {
+      conversationSwitching.value = false
+    }
+  }
 }
 
 function stopRunEventStream() {
@@ -406,6 +479,7 @@ function startRunEventStream(jobId: string) {
   const source = new EventSource(`/api/agent-jobs/${jobId}/events`)
   runEventSource = source
   source.addEventListener('agent-event', (event) => {
+    if (runEventJobId !== jobId) return
     try {
       const item = JSON.parse((event as MessageEvent).data) as AgentJobEvent
       if (!runEvents.value.some((existing) => existing.id === item.id)) {
@@ -416,47 +490,71 @@ function startRunEventStream(jobId: string) {
       // Ignore malformed transport events; persisted events can be replayed on reconnect.
     }
   })
-  source.addEventListener('end', () => stopRunEventStream())
+  source.addEventListener('job-state', (event) => {
+    if (runEventJobId !== jobId) return
+    try {
+      const state = JSON.parse((event as MessageEvent).data) as {
+        job: AgentJob
+        steps: AgentStep[]
+      }
+      applyRunState(state.job, state.steps)
+    } catch {
+      // Ignore malformed snapshots; the next changed snapshot will replace it.
+    }
+  })
+  source.addEventListener('end', () => {
+    if (runEventJobId === jobId) stopRunEventStream()
+  })
 }
 
-async function loadRun(jobId: string) {
-  startRunEventStream(jobId)
+function applyRunState(job: AgentJob, steps: AgentStep[]) {
+  const jobChanged = runJobRenderKey(runJob.value) !== runJobRenderKey(job)
+  const stepsChanged = runStepsRenderKey(runSteps.value) !== runStepsRenderKey(steps)
+  if (jobChanged) runJob.value = job
+  if (stepsChanged) runSteps.value = steps
+  if (jobChanged || stepsChanged) void scrollToBottom()
+}
+
+async function loadRun(jobId: string, isCurrent: () => boolean = () => true) {
   const [jobResponse, stepResponse] = await Promise.all([
     api.get<AgentJob>(`/agent-jobs/${jobId}`),
     api.get<AgentStep[]>(`/agent-jobs/${jobId}/steps`),
   ])
-  const jobChanged = runJobRenderKey(runJob.value) !== runJobRenderKey(jobResponse.data)
-  const stepsChanged = runStepsRenderKey(runSteps.value) !== runStepsRenderKey(stepResponse.data)
-  if (jobChanged) runJob.value = jobResponse.data
-  if (stepsChanged) runSteps.value = stepResponse.data
-  if (jobChanged || stepsChanged) await scrollToBottom()
-  if (!['completed', 'failed', 'cancelled'].includes(jobResponse.data.status) && !runPollTimer) {
-    runPollTimer = setInterval(() => {
-      if (runPollInFlight) return
-      runPollInFlight = true
-      void loadRun(jobId).finally(() => { runPollInFlight = false })
-    }, 1600)
+  if (!isCurrent()) return
+  applyRunState(jobResponse.data, stepResponse.data)
+  if (isCurrent() && !['completed', 'failed', 'cancelled'].includes(jobResponse.data.status)) {
+    startRunEventStream(jobId)
   }
-  if (['completed', 'failed', 'cancelled'].includes(jobResponse.data.status)) stopRunPolling()
 }
 
-async function uploadDataset(options: UploadRequestOptions) {
-  if (!projectId.value) return
+async function attachDataset(fileToUpload: File) {
+  if (!projectId.value || uploading.value) return false
   uploading.value = true
   const form = new FormData()
-  form.append('file', options.file)
+  form.append('file', fileToUpload)
   form.append('category', 'dataset_source')
   try {
     const file = (await api.post<FileObject>(`/projects/${projectId.value}/files`, form)).data
     await loadFiles()
     sourceFileId.value = file.id
-    options.onSuccess({})
     ElMessage.success('数据文件已加入当前对话')
+    return true
   } catch (error) {
     ElMessage.error(errorMessage(error))
+    return false
   } finally {
     uploading.value = false
   }
+}
+
+async function uploadDataset(options: UploadRequestOptions) {
+  if (await attachDataset(options.file)) options.onSuccess({})
+}
+
+function dropDataset(event: DragEvent) {
+  if (streaming.value || uploading.value) return
+  const file = event.dataTransfer?.files.item(0)
+  if (file) void attachDataset(file)
 }
 
 function removeAttachedFile() {
@@ -480,7 +578,7 @@ function downloadAttachment(fileId?: string | null) {
 }
 
 function chooseOutput(value: string, prompt: string) {
-  if (!current.value || streaming.value) return
+  if (!current.value || streaming.value || outputChoiceSubmitted.value) return
   current.value.draft = { ...current.value.draft, output_format: value }
   void sendMessage(prompt)
 }
@@ -529,7 +627,13 @@ function parseStreamEvent(
   }
   if (event.type === 'error') throw new Error(event.message || '助手回复失败')
   if (event.type === 'done') {
-    if (typeof event.content === 'string') assistant.content = event.content
+    if (typeof event.content === 'string') {
+      // New servers return the complete accumulated stream. With an older
+      // server, do not let its final-turn-only payload erase earlier deltas.
+      if (!assistant.content || event.content.startsWith(assistant.content)) {
+        assistant.content = event.content
+      }
+    }
     const draft = event.draft ?? {}
     const status = event.stage ?? 'collecting'
     conversation.draft = draft
@@ -653,6 +757,7 @@ async function startTask() {
         body: targetBody,
         response_path: String(draft.response_path ?? ''),
         expected_streaming: draft.expected_streaming ?? null,
+        ...(draft.target_credentials ? { credentials: String(draft.target_credentials) } : {}),
       }
     }
     const job = (await api.post<AgentJob>(`/projects/${projectId.value}/agent-jobs`, {
@@ -733,7 +838,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   viewActive = false
-  stopRunPolling()
+  conversationSelectionVersion += 1
   stopRunEventStream()
 })
 
@@ -745,6 +850,7 @@ watch(
       let conversation = conversations.value.find((item) => item.id === conversationId)
       if (!conversation) {
         await loadConversations()
+        if (String(route.params.conversationId ?? '') !== conversationId) return
         conversation = conversations.value.find((item) => item.id === conversationId)
       }
       if (conversation) await selectConversation(conversation)
@@ -784,7 +890,7 @@ watch(
       </aside>
       <div class="assistant-main-column">
         <main class="assistant-conversation">
-        <div ref="messagePane" class="assistant-message-pane">
+        <div ref="messagePane" class="assistant-message-pane" :class="{ switching: conversationSwitching }">
           <div class="assistant-message-inner">
             <template v-for="(message, index) in messages" :key="message.id ?? index">
             <div class="assistant-message-row" :class="message.role">
@@ -814,7 +920,9 @@ watch(
                 </span>
                 <template v-else>
                   <div class="message-content markdown-body chat-markdown" v-html="renderMarkdown(message.content)"></div>
-                  <span v-if="message.streaming" class="stream-caret"></span>
+                  <span v-if="message.streaming" class="message-thinking message-thinking-continuation" aria-hidden="true">
+                    <i></i><i></i><i></i>
+                  </span>
                 </template>
                 <div v-if="index === outputChoiceMessageIndex" class="bubble-choice-block">
                   <div class="choice-heading"><strong>结果交付方式</strong><span>选择最适合你的结果格式</span></div>
@@ -825,6 +933,7 @@ watch(
                       type="button"
                       class="output-card"
                       :class="{ selected: current?.draft.output_format === choice.value, muted: current?.draft.output_format && current?.draft.output_format !== choice.value }"
+                      :disabled="outputChoiceSubmitted"
                       @click="chooseOutput(choice.value, choice.prompt)"
                     >
                       <span class="output-card-icon" :class="choice.tone"><component :is="choice.icon" /></span>
@@ -858,7 +967,10 @@ watch(
                       <strong>{{ stepLabels[item.step.name] ?? item.step.name }}</strong>
                       <span>{{ item.step.status === 'running' ? '执行中' : item.step.status === 'completed' ? '已完成' : item.step.status === 'failed' ? '失败' : '等待' }}</span>
                       <p v-if="item.stream?.content" class="react-node-output-text">
-                        {{ modelOutputPreview(item.stream.content) }}<i v-if="item.stream.status === 'running'" class="stream-caret"></i>
+                        {{ modelOutputPreview(item.stream.content) }}
+                        <span v-if="item.stream.status === 'running'" class="message-thinking message-thinking-continuation" aria-hidden="true">
+                          <i></i><i></i><i></i>
+                        </span>
                       </p>
                       <p v-if="item.step.error">{{ item.step.error }}</p>
                     </div>
@@ -877,7 +989,9 @@ watch(
                 <div class="message-bubble">
                   <button type="button" class="message-copy-button" title="复制全部内容" aria-label="复制全部内容" @click.stop="copyMessage(finalAssistantReply.content)"><el-icon><CopyDocument /></el-icon></button>
                   <div class="message-content markdown-body chat-markdown" v-html="renderMarkdown(finalAssistantReply.content)"></div>
-                  <span v-if="finalAssistantReply.streaming" class="stream-caret"></span>
+                  <span v-if="finalAssistantReply.streaming" class="message-thinking message-thinking-continuation" aria-hidden="true">
+                    <i></i><i></i><i></i>
+                  </span>
                   <button v-if="runJob?.result_file_id" type="button" class="result-download-link" @click="downloadResult">
                     <el-icon><Download /></el-icon><span>下载评测结果</span>
                   </button>
@@ -887,7 +1001,7 @@ watch(
           </div>
         </div>
 
-        <div class="assistant-composer">
+        <div class="assistant-composer" @dragenter.prevent @dragover.prevent @drop.prevent="dropDataset">
           <div v-if="selectedFile" class="composer-attachment"><el-icon><UploadFilled /></el-icon><span>{{ selectedFile.original_name }}</span><button type="button" title="移除附件" @click="removeAttachedFile"><el-icon><Close /></el-icon></button></div>
           <textarea v-model="input" :disabled="streaming" rows="1" placeholder="告诉评测助手你的需求，Shift + Enter 换行" @keydown.enter.exact.prevent="sendMessage()"></textarea>
           <div class="composer-actions">

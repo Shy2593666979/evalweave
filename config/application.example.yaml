@@ -54,7 +54,6 @@ agent:
   max_repair_attempts: 3
   dry_run_cases: 5
   require_approval: true
-  allowed_target_hosts: []
   target_headers: {}
   # Optional per-host login flow. Keep credentials only in the untracked application.yaml.
   target_auth_flows: {}

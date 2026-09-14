@@ -80,7 +80,9 @@ class AgentConfig(StrictModel):
     max_repair_attempts: int = Field(default=3, ge=0, le=10)
     dry_run_cases: int = Field(default=5, ge=1, le=100)
     require_approval: bool = True
-    allowed_target_hosts: list[str] = Field(default_factory=list)
+    # Accepted only so existing application.yaml files continue to load. Target requests are not
+    # restricted by this legacy setting anymore.
+    allowed_target_hosts: list[str] = Field(default_factory=list, exclude=True)
     target_headers: dict[str, str] = Field(default_factory=dict)
     target_auth_flows: dict[str, TargetAuthFlowConfig] = Field(default_factory=dict)
 

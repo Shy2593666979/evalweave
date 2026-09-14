@@ -72,7 +72,6 @@ export interface AgentRuntime {
   enabled: boolean
   model: string | null
   require_approval: boolean
-  allowed_target_hosts: string[]
   worker_available: boolean
 }
 

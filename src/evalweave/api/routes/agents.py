@@ -35,7 +35,9 @@ from evalweave.db.models import (
     HumanTaskStatus,
     NotificationDelivery,
     Project,
+    SystemRole,
     User,
+    UserType,
 )
 from evalweave.db.session import get_engine
 from evalweave.notifications import notify_human_task
@@ -159,7 +161,6 @@ class AgentRuntimeRead(BaseModel):
     enabled: bool
     model: str | None
     require_approval: bool
-    allowed_target_hosts: list[str]
     worker_available: bool
 
 
@@ -211,7 +212,7 @@ class AssistantMessageRead(BaseModel):
 
 
 class AssistantStreamRequest(BaseModel):
-    content: str = Field(min_length=1, max_length=10000)
+    content: str = Field(min_length=1, max_length=100000)
     source_file_id: UUID | None = None
     evaluation_model_id: UUID | None = None
     output_format: Literal["xlsx", "jsonl", "markdown", "text"] | None = None
@@ -271,7 +272,6 @@ def get_agent_runtime(_: ExperimentReader) -> AgentRuntimeRead:
         enabled=config.enabled,
         model=config.model or None,
         require_approval=config.require_approval,
-        allowed_target_hosts=config.allowed_target_hosts,
         worker_available=worker_available,
     )
 
@@ -296,7 +296,6 @@ def assist_with_agent(
         [message.model_dump() for message in payload.messages],
         {
             "project_id": str(payload.project_id) if payload.project_id else None,
-            "allowed_target_hosts": config.allowed_target_hosts,
             "available_output_formats": ["xlsx", "jsonl", "markdown", "text"],
         },
     )
@@ -420,25 +419,44 @@ def stream_assistant_message(
     project_id = conversation.project_id
     owner_id = user.id
     config = resolve_agent_config(session, payload.evaluation_model_id)
+    user_types = {item.id: item for item in session.exec(select(UserType)).all()}
+    reviewer_type_counts: dict[str, int] = {
+        item.code.lower(): 0 for item in user_types.values()
+    }
+    available_reviewer_usernames: list[str] = []
+    for candidate in session.exec(select(User).where(User.is_active == True)).all():  # noqa: E712
+        candidate_type = user_types.get(candidate.user_type_id)
+        can_review = candidate.system_role == SystemRole.ADMIN or bool(
+            candidate_type and Permission.EVALUATION_REVIEW.value in candidate_type.permissions
+        )
+        if not can_review:
+            continue
+        available_reviewer_usernames.append(candidate.username.lower())
+        if candidate_type:
+            code = candidate_type.code.lower()
+            reviewer_type_counts[code] = reviewer_type_counts.get(code, 0) + 1
 
     def event_stream() -> Iterator[str]:
         yield json.dumps({"type": "start"}, ensure_ascii=False) + "\n"
         try:
             result: dict[str, Any] | None = None
+            streamed_reply_parts: list[str] = []
             assistant_context = {
                 "project_id": str(project_id) if project_id else None,
                 "current_draft": current_draft,
-                "allowed_target_hosts": config.allowed_target_hosts,
                 "target_auth_configured": bool(
                     config.target_headers or config.target_auth_flows
                 ),
                 "configured_target_header_names": list(config.target_headers),
                 "configured_auth_hosts": list(config.target_auth_flows),
                 "available_output_formats": ["xlsx", "jsonl", "markdown", "text"],
+                "reviewer_type_counts": reviewer_type_counts,
+                "available_reviewer_usernames": available_reviewer_usernames,
             }
             if not config.enabled or not config.base_url or not config.model:
                 fallback = assist_job_configuration(config, message_history, assistant_context)
                 result = {**fallback, "ui_action": None, "react_trace": []}
+                streamed_reply_parts.append(fallback["reply"])
                 yield json.dumps(
                     {"type": "delta", "content": fallback["reply"]}, ensure_ascii=False
                 ) + "\n"
@@ -447,6 +465,7 @@ def stream_assistant_message(
                     config, message_history, assistant_context, project_id
                 ):
                     if event_type == "delta":
+                        streamed_reply_parts.append(str(value))
                         yield json.dumps(
                             {"type": "delta", "content": value}, ensure_ascii=False
                         ) + "\n"
@@ -485,13 +504,20 @@ def stream_assistant_message(
                     source_ready or target_ready
                 )
             action_type = (result.get("ui_action") or {}).get("type")
-            if action_type == "choose_output" or (core_ready and not draft.get("output_format")):
+            if action_type == "user_input":
+                stage = "collecting"
+            elif action_type == "choose_output" or (
+                core_ready and not draft.get("output_format")
+            ):
                 stage = "choose_output"
             elif action_type == "confirm" or core_ready:
                 stage = "ready"
             else:
                 stage = "collecting"
-            reply = result["reply"]
+            # A ReAct exchange can emit useful text before and after several tool
+            # calls. Persist the same complete text that the client streamed,
+            # instead of replacing it with only the final model turn.
+            reply = "".join(streamed_reply_parts) or result["reply"]
 
             with Session(get_engine()) as write_session:
                 stored = write_session.get(AssistantConversation, conversation_id)
@@ -641,6 +667,7 @@ def stream_agent_job_events(
 
     def event_stream() -> Iterator[str]:
         last_id = max(after, 0)
+        last_state = ""
         while True:
             with Session(get_engine()) as read_session:
                 statement = (
@@ -650,11 +677,30 @@ def stream_agent_job_events(
                 )
                 events = list(read_session.exec(statement).all())
                 current_job = read_session.get(AgentJob, job_id)
+                steps = list(
+                    read_session.exec(
+                        select(AgentStep)
+                        .where(AgentStep.job_id == job_id)
+                        .order_by(AgentStep.created_at)
+                    ).all()
+                )
             for event in events:
                 last_id = int(event.id or last_id)
                 data = AgentJobEventRead.model_validate(event).model_dump(mode="json")
                 encoded = json.dumps(data, ensure_ascii=False)
                 yield f"id: {last_id}\nevent: agent-event\ndata: {encoded}\n\n"
+            if current_job is not None:
+                state = {
+                    "job": AgentJobRead.model_validate(current_job).model_dump(mode="json"),
+                    "steps": [
+                        AgentStepRead.model_validate(step).model_dump(mode="json")
+                        for step in steps
+                    ],
+                }
+                encoded_state = json.dumps(state, ensure_ascii=False)
+                if encoded_state != last_state:
+                    last_state = encoded_state
+                    yield f"event: job-state\ndata: {encoded_state}\n\n"
             terminal = current_job is None or current_job.status in {
                 AgentJobStatus.COMPLETED,
                 AgentJobStatus.FAILED,

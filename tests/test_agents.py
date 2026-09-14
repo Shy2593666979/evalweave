@@ -2,28 +2,39 @@ import json
 from io import BytesIO
 from uuid import UUID
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from sqlmodel import Session
 
 from evalweave.agents.executor import (
     _tabular_markdown_report,
+    authenticate_target,
+    detect_application_error,
     execute_data_program,
+    execute_target_case,
     isolate_session_ids,
     normalize_target_body,
     parse_target_response,
     serialize_results,
     source_parsing_options,
+    validate_target,
 )
+from evalweave.agents.inspection import load_source_rows
+from evalweave.agents.model_config import encrypt_secret_payload
 from evalweave.agents.planner import evaluate_target_records
+from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.agents.workflow import (
     execute_agent_job,
     plan_agent_job,
+    validate_http_target_semantics,
     validate_http_target_with_react,
 )
 from evalweave.core.config import AgentConfig, get_settings
-from evalweave.db.models import AgentJob
+from evalweave.db.models import AgentJob, FileObject
 from evalweave.db.session import get_engine
+from evalweave.storage import LocalFileStorage
 
 
 def login_as_developer(client: TestClient) -> None:
@@ -287,8 +298,12 @@ def test_target_record_evaluation_accepts_dynamic_dimensions(monkeypatch) -> Non
     assert evaluations[0]["dimensions"][0]["score"] == 8
 
 
-def test_agent_executes_allowlisted_http_target(client: TestClient, monkeypatch) -> None:
+def test_agent_executes_http_target_without_host_allowlist(
+    client: TestClient, monkeypatch
+) -> None:
     class FakeResponse:
+        headers = {"content-type": "application/json"}
+
         def raise_for_status(self) -> None:
             return None
 
@@ -314,30 +329,24 @@ def test_agent_executes_allowlisted_http_target(client: TestClient, monkeypatch)
         f"/api/projects/{project['id']}/files",
         files={"file": ("cases.json", b'[{"message":"hello"}]', "application/json")},
     ).json()
-    settings = get_settings()
-    original_hosts = list(settings.agent.allowed_target_hosts)
-    settings.agent.allowed_target_hosts = ["model.test"]
     monkeypatch.setattr("evalweave.agents.executor.httpx.Client", FakeClient)
-    try:
-        created = client.post(
-            f"/api/projects/{project['id']}/agent-jobs",
-            json={
-                "title": "HTTP target",
-                "goal": "Run target",
-                "source_file_id": upload["id"],
-                "requires_approval": False,
-                "input_config": {
-                    "target": {
-                        "url": "https://model.test/chat",
-                        "body": {"message": "{{message}}"},
-                        "response_path": "data.reply",
-                    }
-                },
+    created = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={
+            "title": "HTTP target",
+            "goal": "Run target",
+            "source_file_id": upload["id"],
+            "requires_approval": False,
+            "input_config": {
+                "target": {
+                    "url": "https://model.test/chat",
+                    "body": {"message": "{{message}}"},
+                    "response_path": "data.reply",
+                }
             },
-        ).json()
-        plan_agent_job(UUID(created["id"]))
-    finally:
-        settings.agent.allowed_target_hosts = original_hosts
+        },
+    ).json()
+    plan_agent_job(UUID(created["id"]))
 
     completed = client.get(f"/api/agent-jobs/{created['id']}").json()
     target = completed["result"]["execution"]["target"]
@@ -353,10 +362,111 @@ def test_agent_executes_allowlisted_http_target(client: TestClient, monkeypatch)
         workbook.close()
 
 
+def test_task_credentials_run_login_and_inject_token(client: TestClient) -> None:
+    class LoginClient:
+        cookies: dict[str, str] = {}
+
+        def post(self, url: str, **kwargs):
+            assert url == "https://auth.test/login"
+            assert kwargs["json"] == {"username": "agent", "password": "secret"}
+            return httpx.Response(
+                200,
+                json={"data": {"access_token": "runtime-token"}},
+                request=httpx.Request("POST", url),
+            )
+
+    credentials = encrypt_secret_payload(
+        {
+            "headers": {"X-Task": "evaluation"},
+            "auth": {
+                "login_url": "https://auth.test/login",
+                "body": {"username": "agent", "password": "secret"},
+                "token_path": "data.access_token",
+                "header_name": "Authorization",
+                "header_prefix": "Bearer ",
+            },
+        }
+    )
+
+    _, headers = validate_target(
+        {"url": "https://target.test/chat", "credentials": credentials}
+    )
+    authentication = authenticate_target(
+        LoginClient(), "https://target.test/chat", headers, credentials
+    )
+
+    assert headers == {
+        "X-Task": "evaluation",
+        "Authorization": "Bearer runtime-token",
+    }
+    assert authentication["used"] is True
+    assert authentication["source"] == "task"
+    assert "runtime-token" not in str(authentication)
+
+
+def test_python_workspace_registers_transformed_file(client: TestClient) -> None:
+    login_as_developer(client)
+    project = client.post("/api/projects", json={"name": "Python workspace"}).json()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["input", "output"])
+    sheet.append(
+        [
+            json.dumps({"content": "你好"}, ensure_ascii=False),
+            json.dumps({"answer": "您好"}, ensure_ascii=False),
+        ]
+    )
+    content = BytesIO()
+    workbook.save(content)
+    workbook.close()
+    uploaded = client.post(
+        f"/api/projects/{project['id']}/files",
+        files={
+            "file": (
+                "source.xlsx",
+                content.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    ).json()
+    code = """
+import json
+from pathlib import Path
+from openpyxl import Workbook, load_workbook
+
+source = next(Path("inputs").glob("*.xlsx"))
+workbook = load_workbook(source)
+sheet = workbook.active
+sheet["A2"] = json.loads(sheet["A2"].value)["content"]
+sheet["B2"] = json.loads(sheet["B2"].value)["answer"]
+workbook.save("outputs/cleaned.xlsx")
+workbook.close()
+"""
+
+    with Session(get_engine()) as session:
+        observation, updates = run_python_workspace(
+            session,
+            UUID(project["id"]),
+            {"source_file_id": uploaded["id"]},
+            code,
+        )
+        transformed = session.get(FileObject, UUID(updates["source_file_id"]))
+        assert transformed is not None
+        path = LocalFileStorage(get_settings().storage.local_directory).path_for(
+            transformed.storage_key
+        )
+        rows = load_source_rows(path, transformed.original_name, 10)
+
+    assert observation["outputs"][0]["file_name"] == "cleaned.xlsx"
+    assert rows == [{"input": "你好", "output": "您好"}]
+
+
 def test_agent_generates_cases_when_http_target_has_no_source_file(
     client: TestClient, monkeypatch
 ) -> None:
     class FakeResponse:
+        headers = {"content-type": "application/json"}
+
         def raise_for_status(self) -> None:
             return None
 
@@ -378,9 +488,6 @@ def test_agent_generates_cases_when_http_target_has_no_source_file(
 
     login_as_developer(client)
     project = client.post("/api/projects", json={"name": "Generated cases"}).json()
-    settings = get_settings()
-    original_hosts = list(settings.agent.allowed_target_hosts)
-    settings.agent.allowed_target_hosts = ["model.test"]
     monkeypatch.setattr("evalweave.agents.executor.httpx.Client", FakeClient)
     monkeypatch.setattr(
         "evalweave.agents.workflow.generate_test_cases",
@@ -393,25 +500,22 @@ def test_agent_generates_cases_when_http_target_has_no_source_file(
             },
         ],
     )
-    try:
-        created = client.post(
-            f"/api/projects/{project['id']}/agent-jobs",
-            json={
-                "title": "Generated HTTP cases",
-                "goal": "Generate two chat cases and run the target",
-                "requires_approval": False,
-                "input_config": {
-                    "max_cases": 2,
-                    "target": {
-                        "url": "https://model.test/chat",
-                        "body": {"message": "{{message}}"},
-                    },
+    created = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={
+            "title": "Generated HTTP cases",
+            "goal": "Generate two chat cases and run the target",
+            "requires_approval": False,
+            "input_config": {
+                "max_cases": 2,
+                "target": {
+                    "url": "https://model.test/chat",
+                    "body": {"message": "{{message}}"},
                 },
             },
-        ).json()
-        plan_agent_job(UUID(created["id"]))
-    finally:
-        settings.agent.allowed_target_hosts = original_hosts
+        },
+    ).json()
+    plan_agent_job(UUID(created["id"]))
 
     completed = client.get(f"/api/agent-jobs/{created['id']}").json()
     target = completed["result"]["execution"]["target"]
@@ -430,6 +534,8 @@ def test_agent_generates_cases_when_http_target_has_no_source_file(
     event_stream = client.get(f"/api/agent-jobs/{created['id']}/events")
     assert event_stream.status_code == 200
     assert "event: agent-event" in event_stream.text
+    assert "event: job-state" in event_stream.text
+    assert '"steps":' in event_stream.text
     assert '"event_type": "model_start"' in event_stream.text
     assert "event: end" in event_stream.text
 
@@ -506,6 +612,62 @@ def test_target_preflight_failure_returns_to_react_and_retries(
     ]
 
 
+def test_semantic_preflight_rejects_when_all_sample_responses_are_wrong(
+    client: TestClient, monkeypatch
+) -> None:
+    login_as_developer(client)
+    project = client.post("/api/projects", json={"name": "Semantic preflight"}).json()
+    created = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={
+            "title": "Validate response meaning",
+            "goal": "检查回答是否正确",
+            "requires_approval": False,
+            "input_config": {"target": {"url": "https://model.test/chat"}},
+        },
+    ).json()
+    records = [
+        {
+            "case_index": 0,
+            "status": "completed",
+            "input": {"input": {"content": "太阳系行星顺序"}, "expected": {"correct": True}},
+            "output": {"code": 200, "data": "错误答案"},
+        },
+        {
+            "case_index": 1,
+            "status": "completed",
+            "input": {"input": {"content": "计算价格"}, "expected": {"correct": True}},
+            "output": {"code": 200, "data": "无法回答"},
+        },
+    ]
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.validate_http_target",
+        lambda *_: {"validated": True, "records": records},
+    )
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.evaluate_target_records",
+        lambda *_args, **_kwargs: [
+            {
+                "case_index": record["case_index"],
+                "passed": False,
+                "reason": "回答与问题和预期不符",
+            }
+            for record in records
+        ],
+    )
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.run_streamed_model_output",
+        lambda _job, _phase, _label, operation: operation(lambda _delta: None),
+    )
+    config = AgentConfig(enabled=True, base_url="https://judge.test", model="judge")
+
+    with Session(get_engine()) as session:
+        job = session.get(AgentJob, UUID(created["id"]))
+        assert job is not None
+        with pytest.raises(ValueError, match="抽检响应全部不符合测试预期"):
+            validate_http_target_semantics(session, job, config)
+
+
 def test_parse_target_response_detects_server_sent_events() -> None:
     class StreamingResponse:
         headers = {"content-type": "text/event-stream; charset=utf-8"}
@@ -538,6 +700,54 @@ def test_normalize_target_body_decodes_json_object_template() -> None:
     body = normalize_target_body('{"query":"{{generated_query}}","plugins":[]}')
 
     assert body == {"query": "{{generated_query}}", "plugins": []}
+
+
+def test_session_id_isolation_supports_camel_and_snake_case() -> None:
+    isolated = isolate_session_ids(
+        {
+            "sessionId": "shared-camel",
+            "nested": {"session_id": "shared-snake"},
+        },
+        session_id="isolated-case",
+    )
+
+    assert isolated["sessionId"] == "isolated-case"
+    assert isolated["nested"]["session_id"] == "isolated-case"
+
+
+def test_target_case_rejects_application_error_inside_http_200() -> None:
+    class FakeClient:
+        def post(self, *_args, **_kwargs) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={"code": 500, "msg": "服务器内部错误!", "data": None},
+                request=httpx.Request("POST", "https://model.test/chat"),
+            )
+
+    record = execute_target_case(
+        FakeClient(),
+        "https://model.test/chat",
+        {},
+        {"body": "{{row}}"},
+        {"input": {"sessionId": "shared", "content": "hello"}},
+        0,
+    )
+
+    assert record["status"] == "failed"
+    assert record["status_code"] == 200
+    assert "code=500" in record["error"]
+    assert "服务器内部错误" in record["response_body"]
+
+
+def test_application_error_detector_allows_success_envelope() -> None:
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        json={"code": 200, "msg": "ok", "data": {"answer": "hello"}},
+    )
+
+    assert detect_application_error(response) is None
 
 
 def test_assistant_conversation_streams_and_persists_draft(client: TestClient, monkeypatch) -> None:
@@ -585,6 +795,8 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
     )
     events = [json.loads(line) for line in response.text.splitlines()]
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache, no-transform"
+    assert response.headers["x-accel-buffering"] == "no"
     assert events[0]["type"] == "start"
     assert events[-1]["type"] == "done"
     assert events[-1]["stage"] == "choose_output"
@@ -657,10 +869,12 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
     def fake_react(*_):
         running = {"name": "probe_http_target", "label": "验证目标接口", "status": "running"}
         completed = {**running, "status": "completed", "summary": {"status_code": 200}}
+        yield "delta", "The endpoint is reachable. "
         yield "tool_start", running
         yield "tool_result", completed
+        yield "delta", "Choose a delivery format."
         yield "result", {
-            "reply": "接口预检通过，请选择交付方式。",
+            "reply": "Choose a delivery format.",
             "draft": {
                 "title": "接口评测",
                 "goal": "验证接口质量",
@@ -683,12 +897,61 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
 
     assert [event["type"] for event in events] == [
         "start",
+        "delta",
         "tool_start",
         "tool_result",
+        "delta",
         "done",
     ]
+    assert events[-1]["content"] == "The endpoint is reachable. Choose a delivery format."
     assert events[-1]["stage"] == "choose_output"
     assert events[-1]["draft"]["react_trace"][0]["status"] == "completed"
+    stored_messages = client.get(
+        f"/api/assistant/conversations/{conversation['id']}/messages"
+    ).json()
+    assert stored_messages[-1]["content"] == events[-1]["content"]
+
+
+def test_assistant_user_input_keeps_conversation_collecting(
+    client: TestClient, monkeypatch
+) -> None:
+    login_as_developer(client)
+    project = client.post("/api/projects", json={"name": "Input required"}).json()
+    conversation = client.post(
+        "/api/assistant/conversations", json={"project_id": project["id"]}
+    ).json()
+    config = AgentConfig(enabled=True, base_url="https://model.test", model="test-model")
+    monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
+
+    def fake_react(*_):
+        yield "result", {
+            "reply": "Please provide the missing request field.",
+            "draft": {
+                "title": "API evaluation",
+                "goal": "Evaluate answer quality",
+                "target_url": "https://model.test/chat",
+                "target_body": {"query": "{{query}}"},
+                "target_validated": True,
+                "output_format": "xlsx",
+            },
+            "ui_action": {
+                "type": "user_input",
+                "question": "Please provide the missing request field.",
+                "options": [],
+            },
+            "react_trace": [],
+        }
+
+    monkeypatch.setattr(
+        "evalweave.api.routes.agents.stream_react_configuration", fake_react
+    )
+    response = client.post(
+        f"/api/assistant/conversations/{conversation['id']}/messages/stream",
+        json={"content": "Continue configuring"},
+    )
+    events = [json.loads(line) for line in response.text.splitlines()]
+
+    assert events[-1]["stage"] == "collecting"
 
 
 def test_generic_data_program_combines_model_and_multiple_http_targets(
@@ -730,9 +993,6 @@ def test_generic_data_program_combines_model_and_multiple_http_targets(
             },
         },
     ).json()
-    settings = get_settings()
-    original_hosts = list(settings.agent.allowed_target_hosts)
-    settings.agent.allowed_target_hosts = ["model.test"]
     monkeypatch.setattr(
         "evalweave.agents.executor.authenticate_target", lambda *_args, **_kwargs: "none"
     )
@@ -750,51 +1010,48 @@ def test_generic_data_program_combines_model_and_multiple_http_targets(
         }
 
     monkeypatch.setattr("evalweave.agents.executor.execute_target_case", fake_target_case)
-    try:
-        with Session(get_engine()) as session:
-            job = session.get(AgentJob, UUID(created["id"]))
-            assert job is not None
-            job.eval_spec = {
-                "source": {
-                    "header_row": 1,
-                    "field_mappings": {"query": "canonical_query"},
-                },
-                "data_program": {
-                    "steps": [
-                        {"primitive": "convert"},
-                        {
-                            "primitive": "model_map",
-                            "instruction": "Generate two additional cases",
-                            "input_fields": ["canonical_query"],
-                            "output_columns": [{"name": "generated_cases", "type": "array"}],
-                        },
-                        {"action": "http_map", "target_index": 0, "answer_column": "answer1"},
-                        {"action": "http_map", "target_index": 1, "answer_column": "answer2"},
-                        {"primitive": "aggregate", "instruction": "Summarize numeric metrics"},
-                        {"primitive": "summarize"},
-                        {"primitive": "format_convert"},
-                    ]
-                },
-            }
-            session.add(job)
-            session.commit()
-
-            result = execute_data_program(
-                session,
-                job,
-                lambda _instruction, rows, _columns, _index: [
+    with Session(get_engine()) as session:
+        job = session.get(AgentJob, UUID(created["id"]))
+        assert job is not None
+        job.eval_spec = {
+            "source": {
+                "header_row": 1,
+                "field_mappings": {"query": "canonical_query"},
+            },
+            "data_program": {
+                "steps": [
+                    {"primitive": "convert"},
                     {
-                        "generated_cases": [
-                            f"{row['canonical_query']}-normal",
-                            f"{row['canonical_query']}-edge",
-                        ]
-                    }
-                    for row in rows
-                ],
-            )
-            result_file_id = result["result_file_id"]
-    finally:
-        settings.agent.allowed_target_hosts = original_hosts
+                        "primitive": "model_map",
+                        "instruction": "Generate two additional cases",
+                        "input_fields": ["canonical_query"],
+                        "output_columns": [{"name": "generated_cases", "type": "array"}],
+                    },
+                    {"action": "http_map", "target_index": 0, "answer_column": "answer1"},
+                    {"action": "http_map", "target_index": 1, "answer_column": "answer2"},
+                    {"primitive": "aggregate", "instruction": "Summarize numeric metrics"},
+                    {"primitive": "summarize"},
+                    {"primitive": "format_convert"},
+                ]
+            },
+        }
+        session.add(job)
+        session.commit()
+
+        result = execute_data_program(
+            session,
+            job,
+            lambda _instruction, rows, _columns, _index: [
+                {
+                    "generated_cases": [
+                        f"{row['canonical_query']}-normal",
+                        f"{row['canonical_query']}-edge",
+                    ]
+                }
+                for row in rows
+            ],
+        )
+        result_file_id = result["result_file_id"]
 
     assert result["summaries"][0]["average_latency_ms"] == 100.5
     assert result["summaries"][1]["average_latency_ms"] == 200.5

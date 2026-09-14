@@ -35,7 +35,7 @@ def test_request_json_uses_openai_sdk(monkeypatch, api_mode: str) -> None:
             self.responses = Responses()
             self.chat = SimpleNamespace(completions=Completions())
 
-    monkeypatch.setattr("evalweave.agents.planner.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("evalweave.agents.model_client.OpenAI", FakeOpenAI)
     config = AgentConfig(
         enabled=True,
         api_mode=api_mode,
@@ -50,6 +50,14 @@ def test_request_json_uses_openai_sdk(monkeypatch, api_mode: str) -> None:
     assert calls[0][0] == "client"
     assert calls[0][1]["base_url"] == "https://model.example/v1"
     assert calls[1][0] == api_mode
+    request_options = calls[1][1]
+    assert "instructions" not in request_options
+    message_key = "input" if api_mode == "responses" else "messages"
+    assert request_options[message_key][0] == {
+        "role": "system",
+        "content": "Return JSON",
+    }
+    assert request_options[message_key][1]["role"] == "user"
 
 
 @pytest.mark.parametrize("api_mode", ["responses", "chat_completions"])
@@ -79,7 +87,7 @@ def test_request_json_streams_model_output(monkeypatch, api_mode: str) -> None:
             self.responses = Responses()
             self.chat = SimpleNamespace(completions=Completions())
 
-    monkeypatch.setattr("evalweave.agents.planner.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("evalweave.agents.model_client.OpenAI", FakeOpenAI)
     config = AgentConfig(
         enabled=True,
         api_mode=api_mode,

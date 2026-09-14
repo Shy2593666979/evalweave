@@ -13,12 +13,15 @@ from sqlmodel import Session
 
 from evalweave.agents.executor import (
     authenticate_target,
+    detect_application_error,
     normalize_target_body,
     parse_target_response,
     validate_target,
 )
 from evalweave.agents.inspection import inspect_source
-from evalweave.core.config import get_settings
+from evalweave.agents.model_config import encrypt_secret_payload
+from evalweave.agents.python_workspace import run_python_workspace
+from evalweave.core.config import TargetAuthFlowConfig, get_settings
 from evalweave.db.models import FileObject
 from evalweave.storage import LocalFileStorage
 
@@ -51,6 +54,8 @@ class AssistantToolContext:
     project_id: UUID | None
     ui_action: dict[str, Any] | None = None
     trace: list[dict[str, Any]] = field(default_factory=list)
+    reviewer_type_counts: dict[str, int] | None = None
+    available_reviewer_usernames: set[str] | None = None
 
 
 class BaseAssistantTool(ABC):
@@ -59,15 +64,15 @@ class BaseAssistantTool(ABC):
     parameters: dict[str, Any]
     terminal: bool = False
 
-    def to_openai_def(self, api_mode: str) -> dict[str, Any]:
-        definition = {
+    def can_stream_terminal_text(self, context: AssistantToolContext) -> bool:
+        return False
+
+    def to_model_def(self) -> dict[str, Any]:
+        return {
             "name": self.name,
             "description": self.description,
             "parameters": self.parameters,
         }
-        if api_mode == "responses":
-            return {"type": "function", **definition}
-        return {"type": "function", "function": definition}
 
     @abstractmethod
     def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
@@ -97,7 +102,9 @@ class UpdateTaskDraftTool(BaseAssistantTool):
             "output_format": {"type": "string", "enum": ["xlsx", "jsonl", "markdown", "text"]},
             "reviewer_type_codes": {
                 "type": "array",
-                "description": "仅保存用户明确要求的全部角色群组；具体人员的角色说明不属于群组选择。",
+                "description": (
+                    "仅保存用户明确要求的全部角色群组；具体人员的角色说明不属于群组选择。"
+                ),
                 "items": {
                     "type": "string",
                     "enum": ["product", "research", "development", "testing"],
@@ -173,17 +180,77 @@ class InspectSourceTool(BaseAssistantTool):
         return json.dumps({"ok": True, **observation}, ensure_ascii=False)
 
 
+class RunPythonTool(BaseAssistantTool):
+    name = "run_python"
+    description = (
+        "在临时 Python 工作区中处理当前项目文件。输入文件位于 inputs/，manifest.json 描述文件映射；"
+        "脚本可使用 Python 标准库和项目已安装依赖，并应把新文件写入 outputs/。"
+        "适用于任意清洗、JSON 解包、列转换、合并、拆分或格式修复。用户要求修改文件时直接调用，"
+        "不得声称没有脚本或要求用户自行修改后重传。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "要执行的完整 Python 脚本。"},
+            "source_file_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "输入文件 ID；省略时使用当前 source_file_id。",
+                "maxItems": 8,
+            },
+            "primary_output": {
+                "type": "string",
+                "description": "outputs/ 下作为后续任务数据源的文件名；默认使用第一个输出。",
+            },
+        },
+        "required": ["code"],
+        "additionalProperties": False,
+    }
+
+    def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        with Session(get_settings_engine()) as session:
+            observation, updates = run_python_workspace(
+                session,
+                context.project_id,
+                context.draft,
+                str(kwargs.get("code", "")),
+                [str(item) for item in kwargs.get("source_file_ids", [])] or None,
+                str(kwargs.get("primary_output") or "") or None,
+            )
+        context.draft.update(updates)
+        return json.dumps({"ok": True, **observation}, ensure_ascii=False)
+
+
 class ProbeHttpTargetTool(BaseAssistantTool):
     name = "probe_http_target"
     description = (
         "实际请求目标 HTTP 接口并观察状态、JSON/SSE 响应和响应结构。"
-        "有地址和可发送请求体后必须先调用本工具，不能让用户代替提供响应。"
+        "工具可直接使用任务请求头或先执行登录流程，再自动注入 Token/Cookie。"
+        "有地址和可发送请求体后必须调用本工具，不能让用户改用 curl/Postman 代替。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "url": {"type": "string"},
             "body": {"type": ["object", "array"]},
+            "headers": {
+                "type": "object",
+                "description": "用户为本任务提供的请求头；可包含 Authorization。",
+                "additionalProperties": {"type": "string"},
+            },
+            "auth": {
+                "type": "object",
+                "description": "可选登录流程。工具先登录，再用提取的 Token 或 Cookie 请求目标。",
+                "properties": {
+                    "login_url": {"type": "string"},
+                    "body": {"type": "object"},
+                    "token_path": {"type": "string"},
+                    "header_name": {"type": "string"},
+                    "header_prefix": {"type": "string"},
+                },
+                "required": ["login_url", "body"],
+                "additionalProperties": False,
+            },
         },
         "required": ["url", "body"],
         "additionalProperties": False,
@@ -227,6 +294,14 @@ class RequestConfirmationTool(BaseAssistantTool):
     }
     terminal = True
 
+    def can_stream_terminal_text(self, context: AssistantToolContext) -> bool:
+        _ensure_human_review_defaults(context.draft)
+        return bool(
+            _draft_checked(context.draft)
+            and context.draft.get("output_format")
+            and not _reviewer_availability_error(context)
+        )
+
     def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
         _ensure_human_review_defaults(context.draft)
         if not _draft_checked(context.draft) or not context.draft.get("output_format"):
@@ -234,7 +309,10 @@ class RequestConfirmationTool(BaseAssistantTool):
                 {"ok": False, "error": "任务尚未验证完成或未选择输出格式"},
                 ensure_ascii=False,
             )
-        summary = str(kwargs.get("summary", "")).strip()
+        reviewer_error = _reviewer_availability_error(context)
+        if reviewer_error:
+            return json.dumps({"ok": False, "error": reviewer_error}, ensure_ascii=False)
+        summary = str(kwargs.get("summary", "")).replace("\\n", "\n").strip()
         context.ui_action = {"type": "confirm", "summary": summary}
         return json.dumps({"ok": True, "waiting_for": "confirmation"}, ensure_ascii=False)
 
@@ -253,11 +331,22 @@ class RequestUserInputTool(BaseAssistantTool):
     }
     terminal = True
 
+    def can_stream_terminal_text(self, context: AssistantToolContext) -> bool:
+        return True
+
     def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        question = str(kwargs.get("question", "")).strip()
+        options = [str(item) for item in kwargs.get("options", [])]
+        normalized_options = {item.strip().casefold() for item in options}
+        if normalized_options == {"xlsx", "jsonl", "markdown", "text"}:
+            context.ui_action = {"type": "choose_output", "question": question}
+            return json.dumps(
+                {"ok": True, "waiting_for": "output_format"}, ensure_ascii=False
+            )
         context.ui_action = {
             "type": "user_input",
-            "question": str(kwargs.get("question", "")).strip(),
-            "options": [str(item) for item in kwargs.get("options", [])],
+            "question": question,
+            "options": options,
         }
         return json.dumps({"ok": True, "waiting_for": "user_input"}, ensure_ascii=False)
 
@@ -265,11 +354,41 @@ class RequestUserInputTool(BaseAssistantTool):
 ASSISTANT_TOOL_REGISTRY: list[BaseAssistantTool] = [
     UpdateTaskDraftTool(),
     InspectSourceTool(),
+    RunPythonTool(),
     ProbeHttpTargetTool(),
     RequestOutputFormatTool(),
     RequestConfirmationTool(),
     RequestUserInputTool(),
 ]
+
+
+def _reviewer_availability_error(context: AssistantToolContext) -> str | None:
+    if context.draft.get("task_mode") != "human_review":
+        return None
+    if context.reviewer_type_counts is None or context.available_reviewer_usernames is None:
+        return None
+    requested_types = {
+        str(item).strip().lower()
+        for item in context.draft.get("reviewer_type_codes", [])
+        if str(item).strip()
+    }
+    requested_names = {
+        str(item).strip().lower()
+        for item in context.draft.get("reviewer_usernames", [])
+        if str(item).strip()
+    }
+    empty_types = sorted(
+        code for code in requested_types if context.reviewer_type_counts.get(code, 0) <= 0
+    )
+    missing_names = sorted(requested_names - context.available_reviewer_usernames)
+    problems: list[str] = []
+    if empty_types:
+        problems.append(f"这些评审人员类型当前没有可用用户：{', '.join(empty_types)}")
+    if missing_names:
+        problems.append(f"这些指定评审人员不存在、已停用或没有评审权限：{', '.join(missing_names)}")
+    if problems:
+        return "；".join(problems) + "。请重新选择评审人员后再请求确认。"
+    return None
 
 
 def _ensure_human_review_defaults(draft: dict[str, Any]) -> None:
@@ -399,13 +518,36 @@ def run_assistant_tool(
             body = materialize_probe_body(template)
         if not isinstance(body, (dict, list)):
             raise ValueError("probe_http_target 需要可发送的 JSON 请求体")
-        _, headers = validate_target({"url": url})
+        task_headers = arguments.get("headers")
+        if task_headers is not None and not isinstance(task_headers, dict):
+            raise ValueError("probe_http_target headers 必须是对象")
+        raw_auth = arguments.get("auth")
+        if raw_auth is not None and not isinstance(raw_auth, dict):
+            raise ValueError("probe_http_target auth 必须是对象")
+        auth = TargetAuthFlowConfig.model_validate(raw_auth).model_dump() if raw_auth else None
+        credentials = draft.get("target_credentials")
+        if task_headers or auth:
+            credentials = encrypt_secret_payload(
+                {
+                    "headers": {
+                        str(key): str(value) for key, value in (task_headers or {}).items()
+                    },
+                    "auth": auth,
+                }
+            )
+        target_config = {"url": url}
+        if isinstance(credentials, str) and credentials:
+            target_config["credentials"] = credentials
+        _, headers = validate_target(target_config)
         timeout = float(get_settings().evaluation.default_timeout_seconds)
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            authentication = authenticate_target(client, url, headers)
+            authentication = authenticate_target(client, url, headers, credentials)
             try:
                 response = client.post(url, headers=headers, json=body)
                 response.raise_for_status()
+                application_error = detect_application_error(response)
+                if application_error:
+                    raise ValueError(f"目标接口返回业务错误：{application_error}")
             except Exception as error:
                 failed_response = getattr(error, "response", None)
                 response_text = str(getattr(failed_response, "text", "")).strip()
@@ -428,6 +570,7 @@ def run_assistant_tool(
                     dict.fromkeys([*draft.get("validated_targets", []), url])
                 ),
                 "expected_streaming": response_mode == "streaming",
+                **({"target_credentials": credentials} if credentials else {}),
             },
         )
 
@@ -438,6 +581,7 @@ def tool_label(name: str) -> str:
     return {
         "update_task_draft": "整理任务信息",
         "inspect_source": "检查数据文件",
+        "run_python": "运行 Python 文件处理",
         "probe_http_target": "验证目标接口",
         "request_output_format": "请求选择交付方式",
         "request_confirmation": "请求确认任务",

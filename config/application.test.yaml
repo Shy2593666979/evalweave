@@ -46,7 +46,6 @@ agent:
   max_repair_attempts: 2
   dry_run_cases: 3
   require_approval: true
-  allowed_target_hosts: []
   target_headers: {}
 
 notifications:

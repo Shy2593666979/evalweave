@@ -1,5 +1,7 @@
+import json
 from base64 import urlsafe_b64encode
 from hashlib import sha256
+from typing import Any
 from uuid import UUID
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -23,6 +25,20 @@ def decrypt_api_key(value: str) -> str:
         return _cipher().decrypt(value.encode()).decode()
     except InvalidToken as error:
         raise ValueError("评测模型密钥无法解密，请由管理员重新填写") from error
+
+
+def encrypt_secret_payload(value: dict[str, Any]) -> str:
+    return _cipher().encrypt(json.dumps(value, ensure_ascii=False).encode()).decode()
+
+
+def decrypt_secret_payload(value: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(_cipher().decrypt(value.encode()).decode())
+    except (InvalidToken, json.JSONDecodeError) as error:
+        raise ValueError("任务鉴权配置无法解密，请重新提供") from error
+    if not isinstance(payload, dict):
+        raise ValueError("任务鉴权配置格式无效")
+    return payload
 
 
 def resolve_agent_config(session: Session, model_id: UUID | str | None) -> AgentConfig:

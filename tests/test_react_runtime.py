@@ -4,6 +4,7 @@ from evalweave.agents.react_runtime import stream_react_configuration
 from evalweave.agents.react_tools import (
     AssistantToolContext,
     RequestConfirmationTool,
+    RequestUserInputTool,
     UpdateTaskDraftTool,
 )
 from evalweave.api.routes.agents import redact_sensitive_content
@@ -40,14 +41,18 @@ def test_chat_completion_react_loop_dispatches_tools(monkeypatch) -> None:
     )
 
     class Completions:
-        def create(self, **_):
+        def create(self, **kwargs):
+            assert all(
+                tool.get("type") == "function" and "function" in tool
+                for tool in kwargs["tools"]
+            )
             return next(turns)
 
     class FakeOpenAI:
         def __init__(self, **_):
             self.chat = SimpleNamespace(completions=Completions())
 
-    monkeypatch.setattr("evalweave.agents.react_runtime.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("evalweave.agents.model_client.OpenAI", FakeOpenAI)
     config = AgentConfig(
         enabled=True,
         api_mode="chat_completions",
@@ -68,9 +73,9 @@ def test_chat_completion_react_loop_dispatches_tools(monkeypatch) -> None:
     assert [event[0] for event in events] == [
         "tool_start",
         "tool_result",
+        "delta",
         "tool_start",
         "tool_result",
-        "delta",
         "result",
     ]
     assert result["draft"]["title"] == "接口评测"
@@ -108,14 +113,20 @@ def test_responses_react_streams_terminal_tool_text(monkeypatch) -> None:
     ]
 
     class Responses:
-        def create(self, **_):
+        def create(self, **kwargs):
+            assert all(
+                tool.get("type") == "function"
+                and "name" in tool
+                and "function" not in tool
+                for tool in kwargs["tools"]
+            )
             return stream
 
     class FakeOpenAI:
         def __init__(self, **_):
             self.responses = Responses()
 
-    monkeypatch.setattr("evalweave.agents.react_runtime.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("evalweave.agents.model_client.OpenAI", FakeOpenAI)
     config = AgentConfig(
         enabled=True,
         api_mode="responses",
@@ -141,7 +152,9 @@ def test_responses_react_streams_terminal_tool_text(monkeypatch) -> None:
         )
     )
 
-    assert "".join(value for kind, value in events if kind == "delta") == "确认并启动本次评测任务。"
+    deltas = [value for kind, value in events if kind == "delta"]
+    assert deltas == ["确认并", "启动本次评测任务。"]
+    assert "".join(deltas) == "确认并启动本次评测任务。"
     assert events[-1][0] == "result"
     assert events[-1][1]["reply"] == "确认并启动本次评测任务。"
 
@@ -168,6 +181,12 @@ def test_failed_confirmation_text_is_not_streamed(monkeypatch) -> None:
                     type="response.output_item.added",
                     output_index=0,
                     item=failed_confirmation,
+                ),
+                SimpleNamespace(
+                    type="response.function_call_arguments.delta",
+                    output_index=0,
+                    item_id="item-confirm",
+                    delta='{"summary":"任务已经启动。"}',
                 ),
                 SimpleNamespace(
                     type="response.output_item.done",
@@ -198,7 +217,7 @@ def test_failed_confirmation_text_is_not_streamed(monkeypatch) -> None:
         def __init__(self, **_):
             self.responses = Responses()
 
-    monkeypatch.setattr("evalweave.agents.react_runtime.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("evalweave.agents.model_client.OpenAI", FakeOpenAI)
     config = AgentConfig(
         enabled=True,
         api_mode="responses",
@@ -247,6 +266,49 @@ def test_human_review_confirmation_derives_goal_when_model_omits_it() -> None:
 
     assert '"ok": true' in confirmation
     assert context.ui_action == {"type": "confirm", "summary": "请确认并开启任务。"}
+
+
+def test_human_review_confirmation_rejects_empty_reviewer_group() -> None:
+    context = AssistantToolContext(
+        draft={
+            "task_mode": "human_review",
+            "title": "人工评审",
+            "goal": "评审回复质量",
+            "source_file_id": "source-id",
+            "source_inspected": True,
+            "reviewer_type_codes": ["product"],
+            "deadline_hours": 1,
+            "review_rubric": [
+                {"key": "quality", "label": "效果", "min_score": 1, "max_score": 10}
+            ],
+            "output_format": "text",
+        },
+        project_id=None,
+        reviewer_type_counts={"product": 0, "development": 1},
+        available_reviewer_usernames={"tianmingguang"},
+    )
+
+    confirmation = RequestConfirmationTool().run(context, summary="请确认执行。")
+
+    assert '"ok": false' in confirmation
+    assert "product" in confirmation
+    assert context.ui_action is None
+
+
+def test_output_format_user_input_is_normalized_to_output_chooser() -> None:
+    context = AssistantToolContext(draft={}, project_id=None)
+
+    result = RequestUserInputTool().run(
+        context,
+        question="请选择本次评测结果的交付格式？",
+        options=["xlsx", "jsonl", "markdown", "text"],
+    )
+
+    assert '"waiting_for": "output_format"' in result
+    assert context.ui_action == {
+        "type": "choose_output",
+        "question": "请选择本次评测结果的交付格式？",
+    }
 
 
 def test_sensitive_curl_values_are_redacted_before_persistence() -> None:
