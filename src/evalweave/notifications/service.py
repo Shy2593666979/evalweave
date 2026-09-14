@@ -9,7 +9,7 @@ import httpx
 from sqlmodel import Session
 
 from evalweave.core.config import get_settings
-from evalweave.db.models import DeliveryStatus, HumanTask, NotificationDelivery
+from evalweave.db.models import AgentJob, DeliveryStatus, HumanTask, NotificationDelivery, User
 
 
 def send_wecom(content: str, recipient: str) -> str | None:
@@ -56,6 +56,26 @@ def send_email(subject: str, content: str, recipient: str) -> str | None:
                 client.login(config.username, config.password)
             client.send_message(message)
     return message.get("Message-ID")
+
+
+def notify_agent_job_completed(session: Session, job: AgentJob) -> str | None:
+    """Email the task creator after an evaluation has completed."""
+    settings = get_settings()
+    if not settings.notifications.email.enabled:
+        return None
+    creator = session.get(User, job.created_by)
+    if creator is None or not creator.email:
+        return None
+    link = f"{settings.notifications.platform_base_url.rstrip('/')}/evaluations/{job.id}"
+    summary = job.result.get("summary")
+    summary_text = summary.strip() if isinstance(summary, str) else "评测任务已经执行完成。"
+    content = (
+        f"你好，{creator.username}：\n\n"
+        f"你发起的评测任务《{job.title}》已经完成。\n\n"
+        f"{summary_text}\n\n"
+        f"查看完整结果：{link}\n"
+    )
+    return send_email(f"[EvalWeave] 评测任务已完成：{job.title}", content, creator.email)
 
 
 def notify_human_task(session: Session, task: HumanTask) -> list[NotificationDelivery]:

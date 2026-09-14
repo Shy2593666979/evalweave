@@ -85,3 +85,4 @@ auth:
     enabled: true
     username: admin
     password: change-me-now
+    email: "admin@example.com"

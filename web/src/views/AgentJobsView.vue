@@ -4,10 +4,8 @@ import {
   Clock,
   Document,
   Download,
-  FolderAdd,
   Plus,
   Refresh,
-  UploadFilled,
   VideoPlay,
   WarningFilled,
 } from '@element-plus/icons-vue'
@@ -28,9 +26,7 @@ import {
   ElSelect,
   ElSwitch,
   ElTag,
-  ElUpload,
 } from 'element-plus'
-import type { UploadRequestOptions } from 'element-plus'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
@@ -45,7 +41,6 @@ const router = useRouter()
 const auth = useAuthStore()
 const loading = ref(false)
 const detailLoading = ref(false)
-const uploading = ref(false)
 const starting = ref(false)
 const projects = ref<Project[]>([])
 const selectedProjectId = ref('')
@@ -54,10 +49,9 @@ const jobs = ref<AgentJob[]>([])
 const selectedJob = ref<AgentJob | null>(null)
 const steps = ref<AgentStep[]>([])
 const runtime = ref<AgentRuntime | null>(null)
+const workerProbeFailures = ref(0)
 const evaluationModels = ref<EvaluationModelOption[]>([])
-const createProjectVisible = ref(false)
 const createJobVisible = ref(false)
-const projectForm = reactive({ name: '', description: '' })
 const jobForm = reactive({
   title: '',
   goal: '',
@@ -72,6 +66,25 @@ const jobForm = reactive({
 let jobEventSource: EventSource | null = null
 let jobEventJobId = ''
 let viewActive = false
+let runtimeRetryTimer: ReturnType<typeof setTimeout> | null = null
+
+async function loadRuntime() {
+  try {
+    const response = await api.get<AgentRuntime>('/agent/runtime')
+    if (!viewActive) return
+    runtime.value = response.data
+    workerProbeFailures.value = response.data.worker_available ? 0 : workerProbeFailures.value + 1
+    if (!response.data.worker_available) {
+      if (runtimeRetryTimer) clearTimeout(runtimeRetryTimer)
+      runtimeRetryTimer = setTimeout(() => { void loadRuntime() }, 3000)
+    }
+  } catch {
+    if (viewActive) {
+      if (runtimeRetryTimer) clearTimeout(runtimeRetryTimer)
+      runtimeRetryTimer = setTimeout(() => { void loadRuntime() }, 3000)
+    }
+  }
+}
 
 function jobRenderKey(job: AgentJob | null) {
   if (!job) return ''
@@ -83,8 +96,6 @@ function stepsRenderKey(items: AgentStep[]) {
   return JSON.stringify(items)
 }
 
-const canCreateProject = computed(() => auth.hasPermission('project:write'))
-const canUpload = computed(() => auth.hasPermission('dataset:write'))
 const canRun = computed(() => auth.hasPermission('experiment:run'))
 const selectedFile = computed(() => files.value.find((item) => item.id === selectedJob.value?.source_file_id))
 const currentSteps = computed(() => {
@@ -337,53 +348,8 @@ async function selectJob(job: AgentJob, quiet = false) {
   await loadJobDetail(job.id, quiet)
 }
 
-async function changeProject() {
-  stopJobEventStream()
-  localStorage.setItem('evalweave-project', selectedProjectId.value)
-  await router.replace({ name: 'evaluations' })
-  selectedJob.value = null
-  await loadProjectData()
-}
-
-async function createProject() {
-  if (!projectForm.name.trim()) return ElMessage.warning('请输入项目名称')
-  try {
-    const project = (await api.post<Project>('/projects', {
-      name: projectForm.name.trim(),
-      description: projectForm.description.trim() || null,
-    })).data
-    projects.value.unshift(project)
-    selectedProjectId.value = project.id
-    projectForm.name = ''
-    projectForm.description = ''
-    createProjectVisible.value = false
-    ElMessage.success('项目已创建')
-    await changeProject()
-  } catch (error) {
-    ElMessage.error(errorMessage(error))
-  }
-}
-
-async function uploadDataset(options: UploadRequestOptions) {
-  if (!selectedProjectId.value) return
-  uploading.value = true
-  const form = new FormData()
-  form.append('file', options.file)
-  form.append('category', 'dataset_source')
-  try {
-    await api.post(`/projects/${selectedProjectId.value}/files`, form)
-    ElMessage.success('数据文件已上传')
-    options.onSuccess({})
-    await loadProjectData()
-  } catch (error) {
-    ElMessage.error(errorMessage(error))
-  } finally {
-    uploading.value = false
-  }
-}
-
 function openCreateJob() {
-  if (!files.value.length) return ElMessage.warning('请先上传评测数据')
+  if (!files.value.length) return ElMessage.warning('请先在评测助手中上传评测数据')
   jobForm.title = ''
   jobForm.goal = ''
   jobForm.source_file_id = files.value[0]?.id ?? ''
@@ -443,7 +409,7 @@ async function restartJob() {
 }
 
 async function refresh() {
-  await loadProjectData()
+  await Promise.all([loadProjectData(), loadRuntime()])
 }
 
 function downloadResult() {
@@ -459,13 +425,12 @@ watch(selectedProjectId, (value) => {
 onMounted(async () => {
   viewActive = true
   try {
-    const [, runtimeResponse, modelResponse] = await Promise.all([
+    const [, , modelResponse] = await Promise.all([
       loadProjects(),
-      api.get<AgentRuntime>('/agent/runtime'),
+      loadRuntime(),
       api.get<EvaluationModelOption[]>('/evaluation-models'),
     ])
     if (!viewActive) return
-    runtime.value = runtimeResponse.data
     evaluationModels.value = modelResponse.data
     jobForm.evaluation_model_id = evaluationModels.value[0]?.id ?? ''
     await loadProjectData()
@@ -476,6 +441,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   viewActive = false
+  if (runtimeRetryTimer) clearTimeout(runtimeRetryTimer)
   stopJobEventStream()
 })
 </script>
@@ -497,34 +463,12 @@ onBeforeUnmount(() => {
     <el-icon><WarningFilled /></el-icon>
     <div><strong>当前使用基础规划模式</strong><span>模型规划尚未启用，任务仍可运行，但只会生成默认评测方案。</span></div>
   </div>
-  <div v-if="runtime && !runtime.worker_available" class="agent-notice worker-notice">
+  <div v-if="runtime && !runtime.worker_available && workerProbeFailures >= 2" class="agent-notice worker-notice">
     <el-icon><WarningFilled /></el-icon>
     <div><strong>任务执行进程未连接</strong><span>请启动 Celery Worker；否则新任务会停留在等待开始状态。</span></div>
   </div>
 
-  <section class="project-bar">
-    <div class="data-actions">
-      <span v-if="files.length">{{ files.length }} 个数据文件</span>
-      <el-upload
-        v-if="canUpload"
-        :show-file-list="false"
-        :http-request="uploadDataset"
-        :disabled="!selectedProjectId || uploading"
-        accept=".json,.jsonl,.csv,.xlsx"
-      >
-        <el-button :icon="UploadFilled" :loading="uploading">上传数据</el-button>
-      </el-upload>
-    </div>
-  </section>
-
-  <div v-if="!projects.length && !loading" class="agent-empty surface">
-    <el-icon><FolderAdd /></el-icon>
-    <h2>初始化工作项目</h2>
-    <p>首次使用需要建立唯一的工作项目，后续数据和评测任务都会归档在这里。</p>
-    <el-button v-if="canCreateProject" type="primary" @click="createProjectVisible = true">初始化项目</el-button>
-  </div>
-
-  <section v-else class="agent-workspace" v-loading="loading">
+  <section class="agent-workspace" v-loading="loading">
     <aside class="job-list surface">
       <div class="job-list-head"><strong>任务记录</strong><span>{{ jobs.length }}</span></div>
       <button
@@ -609,14 +553,6 @@ onBeforeUnmount(() => {
     </main>
 
   </section>
-
-  <el-dialog v-model="createProjectVisible" title="初始化工作项目" width="480px">
-    <el-form label-position="top">
-      <el-form-item label="项目名称"><el-input v-model="projectForm.name" maxlength="128" placeholder="例如：客服助手质量评测" /></el-form-item>
-      <el-form-item label="项目说明"><el-input v-model="projectForm.description" type="textarea" :rows="3" placeholder="可选" /></el-form-item>
-    </el-form>
-    <template #footer><el-button @click="createProjectVisible = false">取消</el-button><el-button type="primary" @click="createProject">完成初始化</el-button></template>
-  </el-dialog>
 
   <el-dialog v-model="createJobVisible" title="新建评测任务" width="min(840px, 94vw)" class="agent-dialog">
     <el-form label-position="top">

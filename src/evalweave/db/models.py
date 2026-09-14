@@ -80,6 +80,10 @@ class User(TimestampMixin, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     username: str = Field(sa_column=Column(String(64), unique=True, index=True, nullable=False))
+    email: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), unique=True, index=True, nullable=True),
+    )
     password_hash: str = Field(sa_column=Column(String(255), nullable=False))
     system_role: SystemRole = Field(default=SystemRole.USER, index=True)
     user_type_id: UUID | None = Field(default=None, foreign_key="user_types.id", index=True)

@@ -11,6 +11,7 @@ def register_and_login(client: TestClient, username: str, user_type_code: str) -
         "/api/auth/register",
         json={
             "username": username,
+            "email": f"{username}@example.com",
             "password": "review-password",
             "user_type_id": user_type["id"],
         },

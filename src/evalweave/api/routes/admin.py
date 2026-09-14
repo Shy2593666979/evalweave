@@ -184,13 +184,14 @@ def create_user(payload: UserCreate, _: AdminUser, session: SessionDependency) -
         ensure_user_type(session, payload.user_type_id)
     user = User(
         username=payload.username.strip(),
+        email=payload.email,
         password_hash=hash_password(payload.password),
         system_role=payload.system_role,
         user_type_id=payload.user_type_id if payload.system_role == SystemRole.USER else None,
         is_active=payload.is_active,
     )
     session.add(user)
-    commit_or_conflict(session, "用户名已存在")
+    commit_or_conflict(session, "用户名或邮箱已存在")
     session.refresh(user)
     return user_to_read(session, user)
 
@@ -211,6 +212,8 @@ def update_user(
             raise HTTPException(status_code=422, detail="普通用户必须选择用户类型")
         ensure_user_type(session, changes["user_type_id"])
         user.user_type_id = changes["user_type_id"]
+    if "email" in changes:
+        user.email = changes["email"]
     if password := changes.get("password"):
         user.password_hash = hash_password(password)
     if "is_active" in changes:
@@ -219,6 +222,6 @@ def update_user(
         user.is_active = changes["is_active"]
     user.updated_at = datetime.now(UTC)
     session.add(user)
-    session.commit()
+    commit_or_conflict(session, "邮箱已被其他用户使用")
     session.refresh(user)
     return user_to_read(session, user)

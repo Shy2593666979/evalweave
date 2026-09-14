@@ -33,12 +33,13 @@ def register(payload: RegisterRequest, session: SessionDependency) -> UserRead:
     ensure_user_type(session, payload.user_type_id, registration=True)
     user = User(
         username=payload.username,
+        email=payload.email,
         password_hash=hash_password(payload.password),
         system_role=SystemRole.USER,
         user_type_id=payload.user_type_id,
     )
     session.add(user)
-    commit_or_conflict(session, "用户名已存在")
+    commit_or_conflict(session, "用户名或邮箱已存在")
     session.refresh(user)
     return user_to_read(session, user)
 

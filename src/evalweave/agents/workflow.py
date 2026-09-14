@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -39,10 +40,11 @@ from evalweave.db.models import (
     StepStatus,
 )
 from evalweave.db.session import get_engine
-from evalweave.notifications import notify_human_task
+from evalweave.notifications import notify_agent_job_completed, notify_human_task
 from evalweave.storage import LocalFileStorage
 
 StepCallable = Callable[[], dict[str, Any]]
+logger = logging.getLogger(__name__)
 
 
 def run_streamed_model_output(
@@ -665,6 +667,10 @@ def execute_agent_job(job_id: UUID) -> None:
             job.error = None
             update_job(session, job, AgentJobStatus.COMPLETED)
             return_result_to_assistant(session, job, result)
+            try:
+                notify_agent_job_completed(session, job)
+            except Exception:
+                logger.exception("Failed to send completion email for agent job %s", job.id)
         except Exception as error:
             session.rollback()
             job = session.get(AgentJob, job_id)

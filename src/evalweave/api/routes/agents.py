@@ -69,6 +69,36 @@ def redact_sensitive_content(content: str) -> str:
     return redacted
 
 
+def assistant_output_attachment(
+    session: Session,
+    result: dict[str, Any],
+    project_id: UUID | None,
+) -> FileObject | None:
+    """Return the newest file produced by a successful tool call in this turn."""
+    trace = result.get("react_trace")
+    if not isinstance(trace, list):
+        return None
+    for item in reversed(trace):
+        if not isinstance(item, dict) or item.get("name") != "run_python":
+            continue
+        if item.get("status") != "completed" or not isinstance(item.get("summary"), dict):
+            continue
+        summary = item["summary"]
+        file_id = summary.get("primary_output_file_id")
+        outputs = summary.get("outputs")
+        if not file_id and isinstance(outputs, list) and outputs:
+            last_output = outputs[-1]
+            if isinstance(last_output, dict):
+                file_id = last_output.get("file_id")
+        try:
+            output = session.get(FileObject, UUID(str(file_id))) if file_id else None
+        except ValueError:
+            output = None
+        if output is not None and (project_id is None or output.project_id == project_id):
+            return output
+    return None
+
+
 def enqueue_agent_task(task_name: str, job_id: UUID) -> None:
     create_celery_app().send_task(task_name, args=[str(job_id)])
 
@@ -265,7 +295,10 @@ def require_assistant_conversation(
 def get_agent_runtime(_: ExperimentReader) -> AgentRuntimeRead:
     config = get_settings().agent
     try:
-        worker_available = bool(create_celery_app().control.inspect(timeout=0.5).ping())
+        # A Celery broadcast ping commonly takes slightly over 500 ms on Windows,
+        # especially with the solo pool. A 0.5 s window caused healthy workers to
+        # be reported as disconnected during normal startup and under light load.
+        worker_available = bool(create_celery_app().control.inspect(timeout=1.5).ping())
     except Exception:
         worker_available = False
     return AgentRuntimeRead(
@@ -455,7 +488,11 @@ def stream_assistant_message(
             }
             if not config.enabled or not config.base_url or not config.model:
                 fallback = assist_job_configuration(config, message_history, assistant_context)
-                result = {**fallback, "ui_action": None, "react_trace": []}
+                result = {
+                    **fallback,
+                    "ui_action": fallback.get("ui_action"),
+                    "react_trace": [],
+                }
                 streamed_reply_parts.append(fallback["reply"])
                 yield json.dumps(
                     {"type": "delta", "content": fallback["reply"]}, ensure_ascii=False
@@ -510,7 +547,7 @@ def stream_assistant_message(
                 core_ready and not draft.get("output_format")
             ):
                 stage = "choose_output"
-            elif action_type == "confirm" or core_ready:
+            elif action_type == "confirm":
                 stage = "ready"
             else:
                 stage = "collecting"
@@ -523,6 +560,23 @@ def stream_assistant_message(
                 stored = write_session.get(AssistantConversation, conversation_id)
                 if stored is None or stored.created_by != owner_id:
                     return
+                output_attachment = assistant_output_attachment(
+                    write_session, result, stored.project_id
+                )
+                attachment_payload = {
+                    "attachment_file_id": (
+                        str(output_attachment.id) if output_attachment else None
+                    ),
+                    "attachment_name": (
+                        output_attachment.original_name if output_attachment else None
+                    ),
+                    "attachment_content_type": (
+                        output_attachment.content_type if output_attachment else None
+                    ),
+                    "attachment_size_bytes": (
+                        output_attachment.size_bytes if output_attachment else None
+                    ),
+                }
                 stored.draft = draft
                 stored.status = stage
                 stored.updated_at = datetime.now(UTC)
@@ -532,12 +586,24 @@ def stream_assistant_message(
                         conversation_id=conversation_id,
                         role="assistant",
                         content=reply,
+                        attachment_file_id=(output_attachment.id if output_attachment else None),
+                        attachment_name=attachment_payload["attachment_name"],
+                        attachment_content_type=attachment_payload[
+                            "attachment_content_type"
+                        ],
+                        attachment_size_bytes=attachment_payload["attachment_size_bytes"],
                     )
                 )
                 write_session.commit()
             yield (
                 json.dumps(
-                    {"type": "done", "content": reply, "draft": draft, "stage": stage},
+                    {
+                        "type": "done",
+                        "content": reply,
+                        "draft": draft,
+                        "stage": stage,
+                        **attachment_payload,
+                    },
                     ensure_ascii=False,
                 )
                 + "\n"

@@ -10,11 +10,13 @@ def test_registration_login_and_permissions(client: TestClient) -> None:
         "/api/auth/register",
         json={
             "username": "product_user",
+            "email": "product_user@example.com",
             "password": "strong-password",
             "user_type_id": product["id"],
         },
     )
     assert registration.status_code == 201
+    assert registration.json()["email"] == "product_user@example.com"
     assert registration.json()["user_type_name"] == "产品同学"
 
     login = client.post(
@@ -24,6 +26,21 @@ def test_registration_login_and_permissions(client: TestClient) -> None:
     assert login.status_code == 200
     assert client.get("/api/auth/me").json()["username"] == "product_user"
     assert client.post("/api/projects", json={"name": "Forbidden"}).status_code == 403
+
+
+def test_registration_rejects_invalid_email(client: TestClient) -> None:
+    options = client.get("/api/auth/registration-options").json()
+    product = next(item for item in options if item["code"] == "product")
+    response = client.post(
+        "/api/auth/register",
+        json={
+            "username": "invalid_email_user",
+            "email": "这不是邮箱",
+            "password": "strong-password",
+            "user_type_id": product["id"],
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_admin_can_create_user_type_and_user(client: TestClient) -> None:
@@ -48,6 +65,7 @@ def test_admin_can_create_user_type_and_user(client: TestClient) -> None:
         "/api/admin/users",
         json={
             "username": "operator",
+            "email": "operator@example.com",
             "password": "operator-password",
             "system_role": "user",
             "user_type_id": created_type.json()["id"],

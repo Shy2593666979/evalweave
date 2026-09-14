@@ -52,6 +52,7 @@ def user_to_read(session: Session, user: User) -> UserRead:
     return UserRead(
         id=user.id,
         username=user.username,
+        email=user.email,
         system_role=user.system_role,
         user_type_id=user.user_type_id,
         user_type_name=user_type.name if user_type else None,
@@ -88,8 +89,13 @@ def bootstrap_identity_data() -> None:
             session.add(
                 User(
                     username=admin_config.username.strip(),
+                    email=admin_config.email.strip().lower() or None,
                     password_hash=hash_password(admin_config.password),
                     system_role=SystemRole.ADMIN,
                 )
             )
             commit_or_conflict(session, "初始化 Admin 用户失败，用户名已存在")
+        elif admin_config.email and not admin.email:
+            admin.email = admin_config.email.strip().lower()
+            session.add(admin)
+            commit_or_conflict(session, "初始化 Admin 邮箱失败，邮箱已存在")

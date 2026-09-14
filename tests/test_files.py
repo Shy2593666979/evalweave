@@ -10,6 +10,7 @@ def login_as_developer(client: TestClient) -> None:
         "/api/auth/register",
         json={
             "username": "file_developer",
+            "email": "file_developer@example.com",
             "password": "developer-password",
             "user_type_id": development["id"],
         },

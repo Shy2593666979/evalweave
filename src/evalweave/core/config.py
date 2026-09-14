@@ -115,6 +115,7 @@ class BootstrapAdminConfig(StrictModel):
     enabled: bool = True
     username: str = "admin"
     password: str = Field(min_length=8)
+    email: str = ""
 
 
 class AuthConfig(StrictModel):

@@ -12,7 +12,6 @@ import {
   Plus,
   Promotion,
   Search,
-  UploadFilled,
   UserFilled,
 } from '@element-plus/icons-vue'
 import { ElButton, ElIcon, ElMessage, ElUpload } from 'element-plus'
@@ -566,6 +565,28 @@ function attachmentExtension(name?: string | null) {
   return extension && extension.length <= 5 ? extension : 'FILE'
 }
 
+function attachmentTone(name?: string | null) {
+  const extension = name?.split('.').pop()?.trim().toLowerCase()
+  if (extension === 'xlsx' || extension === 'xls') return 'excel'
+  if (extension === 'json' || extension === 'jsonl') return 'json'
+  if (extension === 'csv') return 'csv'
+  if (extension === 'md' || extension === 'markdown') return 'markdown'
+  return 'default'
+}
+
+function attachmentTypeLabel(name?: string | null) {
+  const extension = name?.split('.').pop()?.trim().toLowerCase()
+  return {
+    xlsx: 'Excel 工作簿',
+    xls: 'Excel 工作簿',
+    csv: 'CSV 数据文件',
+    json: 'JSON 数据文件',
+    jsonl: 'JSONL 数据文件',
+    md: 'Markdown 文档',
+    markdown: 'Markdown 文档',
+  }[extension ?? ''] ?? '数据文件'
+}
+
 function formatFileSize(size?: number | null) {
   if (size == null || !Number.isFinite(size)) return '附件'
   if (size < 1024) return `${size} B`
@@ -607,6 +628,10 @@ function parseStreamEvent(
     draft?: Record<string, unknown>
     stage?: AssistantConversation['status']
     tool?: ReactToolStep
+    attachment_file_id?: string | null
+    attachment_name?: string | null
+    attachment_content_type?: string | null
+    attachment_size_bytes?: number | null
   }
   if (event.type === 'delta') assistant.content += event.content ?? ''
   if (event.type === 'tool_start' && event.tool) {
@@ -648,6 +673,10 @@ function parseStreamEvent(
       current.value.status = status
     }
     assistant.react_trace = (conversation.draft.react_trace as ReactToolStep[] | undefined) ?? assistant.react_trace
+    assistant.attachment_file_id = event.attachment_file_id ?? null
+    assistant.attachment_name = event.attachment_name ?? null
+    assistant.attachment_content_type = event.attachment_content_type ?? null
+    assistant.attachment_size_bytes = event.attachment_size_bytes ?? null
     assistant.streaming = false
   }
 }
@@ -906,7 +935,7 @@ watch(
                   @click.stop="copyMessage(message.content)"
                 ><el-icon><CopyDocument /></el-icon></button>
                 <button
-                  v-if="message.attachment_file_id"
+                  v-if="message.role === 'user' && message.attachment_file_id"
                   type="button"
                   class="message-file-attachment"
                   :title="`下载 ${message.attachment_name || '附件'}`"
@@ -948,6 +977,14 @@ watch(
                 <div v-if="index === lastAssistantIndex && genericOptions.length" class="bubble-actions react-input-actions">
                   <button v-for="option in genericOptions" :key="option" @click="sendMessage(option)">{{ option }}</button>
                 </div>
+                <button
+                  v-if="message.role === 'assistant' && message.attachment_file_id && !isStoredResultMessage(message)"
+                  type="button"
+                  class="result-download-link"
+                  @click.stop="downloadAttachment(message.attachment_file_id)"
+                >
+                  <el-icon><Download /></el-icon><span>下载评测结果</span>
+                </button>
                 <button v-if="isStoredResultMessage(message) && runJob?.result_file_id" type="button" class="result-download-link" @click="downloadResult">
                   <el-icon><Download /></el-icon><span>下载评测结果</span>
                 </button>
@@ -1002,7 +1039,14 @@ watch(
         </div>
 
         <div class="assistant-composer" @dragenter.prevent @dragover.prevent @drop.prevent="dropDataset">
-          <div v-if="selectedFile" class="composer-attachment"><el-icon><UploadFilled /></el-icon><span>{{ selectedFile.original_name }}</span><button type="button" title="移除附件" @click="removeAttachedFile"><el-icon><Close /></el-icon></button></div>
+          <div v-if="selectedFile" class="composer-attachment">
+            <span class="composer-file-icon" :class="attachmentTone(selectedFile.original_name)" aria-hidden="true"><i>{{ attachmentExtension(selectedFile.original_name) }}</i></span>
+            <span class="composer-file-details">
+              <strong :title="selectedFile.original_name">{{ selectedFile.original_name }}</strong>
+              <small><i></i>{{ attachmentTypeLabel(selectedFile.original_name) }} · {{ formatFileSize(selectedFile.size_bytes) }} · 已添加</small>
+            </span>
+            <button type="button" title="移除附件" aria-label="移除附件" @click="removeAttachedFile"><el-icon><Close /></el-icon></button>
+          </div>
           <textarea v-model="input" :disabled="streaming" rows="1" placeholder="告诉评测助手你的需求，Shift + Enter 换行" @keydown.enter.exact.prevent="sendMessage()"></textarea>
           <div class="composer-actions">
             <div><el-upload :show-file-list="false" :http-request="uploadDataset" accept=".json,.jsonl,.csv,.xlsx"><el-button text :icon="Paperclip" :loading="uploading" title="上传数据文件">上传文件</el-button></el-upload><span>支持 JSON、JSONL、CSV、XLSX</span></div>

@@ -12,6 +12,7 @@ export interface UserType {
 export interface User {
   id: string
   username: string
+  email: string | null
   system_role: SystemRole
   user_type_id: string | null
   user_type_name: string | null

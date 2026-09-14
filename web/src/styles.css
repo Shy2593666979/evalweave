@@ -483,7 +483,7 @@ button, input, textarea, select { font: inherit; }
 .chat-compose > div:last-child { display: flex; margin-top: 8px; align-items: center; justify-content: space-between; }
 .chat-compose span { color: #91a0b4; font-size: 11px; }
 .assistant-page { height: calc(100vh - 24px); min-height: 650px; }
-.assistant-shell { display: grid; height: 100%; min-height: 590px; overflow: hidden; grid-template-columns: 280px minmax(0,1fr); gap: 10px; border: 0; border-radius: 22px; background: transparent; box-shadow: none; }
+.assistant-shell { display: grid; height: 100%; min-height: 590px; overflow: hidden; grid-template-columns: 240px minmax(0,1fr); gap: 10px; border: 0; border-radius: 22px; background: transparent; box-shadow: none; }
 .conversation-list { display: grid; min-height: 0; overflow: hidden; grid-template-rows: auto auto minmax(0,1fr); border: 1px solid rgba(229,234,243,.78); border-radius: 20px; background: #fff; box-shadow: 0 8px 30px rgba(30,64,175,.035); font-family: "MiSans Web","PingFang SC","Microsoft YaHei UI",sans-serif; }
 .conversation-list-title { display: flex; min-height: 72px; padding: 16px 16px 10px 18px; align-items: center; justify-content: space-between; color: var(--ew-ink); }
 .conversation-list-title div { min-width: 0; }
@@ -529,13 +529,12 @@ button, input, textarea, select { font: inherit; }
 .assistant-message-row.user .message-stack { max-width: min(66%,700px); align-items: flex-end; }
 .message-stack:has(.bubble-choice-block) { width: min(92%,940px); max-width: min(92%,940px); }
 .message-bubble { position: relative; max-width: 100%; padding: 14px 18px; color: #40516b; border: 1px solid rgba(228,235,246,.7); border-radius: 6px 15px 15px 15px; background: #f1f5fc; font-size: 15px; font-weight: 400; line-height: 1.72; letter-spacing: .012em; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 4px 14px rgba(31,42,68,.025); }
-.message-bubble:has(.message-copy-button) { padding-right: 52px; }
-.message-copy-button { position: absolute; top: 9px; right: 10px; display: grid; width: 28px; height: 28px; padding: 0; place-items: center; color: #7184a0; border: 1px solid rgba(213,222,235,.9); border-radius: 8px; background: rgba(255,255,255,.9); box-shadow: 0 3px 10px rgba(31,42,68,.06); cursor: pointer; opacity: 0; pointer-events: none; transition: opacity .16s ease, color .16s ease, border-color .16s ease, background .16s ease; }
+.message-copy-button { position: absolute; z-index: 2; top: 8px; right: 8px; display: grid; width: 28px; height: 28px; padding: 0; place-items: center; color: #7184a0; border: 1px solid rgba(213,222,235,.9); border-radius: 8px; background: rgba(255,255,255,.94); box-shadow: 0 3px 10px rgba(31,42,68,.06); cursor: pointer; opacity: 0; pointer-events: none; transition: opacity .16s ease, color .16s ease, border-color .16s ease, background .16s ease; }
 .message-copy-button .el-icon { font-size: 15px; }
 .message-bubble:hover .message-copy-button, .message-copy-button:focus-visible { opacity: 1; pointer-events: auto; }
 .message-copy-button:hover { color: #4f7cff; border-color: #cbd9fb; background: #f7f9ff; }
-.assistant-message-row.user .message-copy-button { color: #fff; border-color: rgba(255,255,255,.3); background: rgba(255,255,255,.14); box-shadow: none; }
-.assistant-message-row.user .message-copy-button:hover { border-color: rgba(255,255,255,.55); background: rgba(255,255,255,.23); }
+.assistant-message-row.user .message-copy-button { color: #fff; border-color: rgba(255,255,255,.34); background: rgba(255,255,255,.16); box-shadow: none; backdrop-filter: blur(6px); }
+.assistant-message-row.user .message-copy-button:hover { color: #fff; border-color: rgba(255,255,255,.58); background: rgba(255,255,255,.25); }
 @media (hover: none) { .message-copy-button { opacity: 1; pointer-events: auto; } }
 .message-content { display: inline; text-rendering: optimizeLegibility; }
 .chat-markdown { display: block; min-width: 0; white-space: normal; }
@@ -616,10 +615,23 @@ button, input, textarea, select { font: inherit; }
 .react-input-actions { margin-top: 12px; padding-top: 11px; border-top: 1px solid #d9e6f5; }
 .assistant-composer { width: calc(100% - 30px); margin: 0 auto 14px; padding: 13px 15px 10px; border: 1px solid #d8e3fa; border-radius: 18px; background: rgba(255,255,255,.96); box-shadow: 0 7px 24px rgba(30,64,175,.055); transition: border-color .18s ease, box-shadow .18s ease; }
 .assistant-composer:focus-within { border-color: #8caaff; box-shadow: 0 0 0 4px rgba(79,124,255,.08),0 10px 28px rgba(30,64,175,.08); }
-.composer-attachment { display: flex; width: fit-content; max-width: 100%; margin-bottom: 8px; padding: 6px 7px 6px 9px; align-items: center; gap: 7px; color: #456b98; border: 1px solid #c9ddf4; border-radius: 8px; background: #eef6ff; font-size: 12px; }
-.composer-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.composer-attachment button { display: grid; width: 22px; height: 22px; padding: 0; place-items: center; flex: 0 0 auto; color: #7890ad; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
-.composer-attachment button:hover { color: #315d91; background: #dcecff; }
+.composer-attachment { display: grid; width: min(390px,100%); min-height: 64px; margin: 0 0 11px; padding: 9px 10px; grid-template-columns: 42px minmax(0,1fr) 30px; align-items: center; gap: 10px; color: #30445f; border: 1px solid #dce6f3; border-radius: 13px; background: linear-gradient(145deg,#fbfdff,#f7faff); box-shadow: 0 4px 14px rgba(39,69,125,.055); transition: border-color .18s ease,box-shadow .18s ease,transform .18s ease; }
+.composer-attachment:hover { border-color: #c6d6ef; box-shadow: 0 7px 19px rgba(39,69,125,.075); transform: translateY(-1px); }
+.composer-file-icon { position: relative; display: block; width: 38px; height: 44px; overflow: hidden; border-radius: 8px 8px 10px 10px; background: linear-gradient(145deg,#7195fa,#4f76e7); box-shadow: 0 6px 14px rgba(67,104,213,.18); }
+.composer-file-icon::before { content: ""; position: absolute; top: 0; right: 0; width: 12px; height: 12px; border-radius: 0 7px 0 5px; background: rgba(255,255,255,.58); }
+.composer-file-icon::after { content: ""; position: absolute; right: 7px; bottom: 12px; left: 7px; height: 2px; border-radius: 2px; background: rgba(255,255,255,.48); box-shadow: 0 5px 0 rgba(255,255,255,.32); }
+.composer-file-icon.excel { background: linear-gradient(145deg,#39b86e,#15934f); box-shadow: 0 6px 14px rgba(21,147,79,.18); }
+.composer-file-icon.json { background: linear-gradient(145deg,#9a77f4,#7652d7); box-shadow: 0 6px 14px rgba(118,82,215,.18); }
+.composer-file-icon.csv { background: linear-gradient(145deg,#37b7bc,#168f99); box-shadow: 0 6px 14px rgba(22,143,153,.18); }
+.composer-file-icon.markdown { background: linear-gradient(145deg,#6097f4,#3973d8); }
+.composer-file-icon > i { position: absolute; right: 4px; bottom: 4px; left: 4px; z-index: 1; overflow: hidden; color: #fff; font: 700 8px/1 "MiSans Web",sans-serif; font-style: normal; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.composer-file-details { display: block; min-width: 0; }
+.composer-file-details strong,.composer-file-details small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-file-details strong { color: #2b405e; font-size: 13px; font-weight: 650; line-height: 1.45; }
+.composer-file-details small { margin-top: 5px; color: #8596ac; font-size: 10px; line-height: 1.2; }
+.composer-file-details small i { display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: #36aa78; box-shadow: 0 0 0 3px rgba(54,170,120,.1); vertical-align: 1px; }
+.composer-attachment button { display: grid; width: 28px; height: 28px; padding: 0; place-items: center; color: #8798ad; border: 0; border-radius: 9px; background: #fff; cursor: pointer; box-shadow: inset 0 0 0 1px #e5ebf3; transition: color .16s ease,background .16s ease,box-shadow .16s ease; }
+.composer-attachment button:hover { color: #d65362; background: #fff4f5; box-shadow: inset 0 0 0 1px #f0cdd2; }
 .assistant-composer textarea { width: 100%; min-height: 58px; max-height: 150px; padding: 2px 3px; resize: none; color: #27364b; border: 0; outline: 0; background: transparent; font: 14px/1.65 inherit; }
 .assistant-composer textarea::placeholder { color: #9aaabd; }
 .composer-actions { display: flex; min-height: 38px; align-items: center; justify-content: space-between; }

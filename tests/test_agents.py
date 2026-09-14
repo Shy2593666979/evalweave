@@ -44,6 +44,7 @@ def login_as_developer(client: TestClient) -> None:
         "/api/auth/register",
         json={
             "username": "agent_developer",
+            "email": "agent_developer@example.com",
             "password": "developer-password",
             "user_type_id": development["id"],
         },
@@ -823,6 +824,7 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
         lambda *_: {
             "reply": "将使用上传的数据比较成绩并生成 Excel 结果，是否开始执行？",
             "draft": {},
+            "ui_action": {"type": "confirm"},
         },
     )
     ready_response = client.post(
@@ -952,6 +954,73 @@ def test_assistant_user_input_keeps_conversation_collecting(
     events = [json.loads(line) for line in response.text.splitlines()]
 
     assert events[-1]["stage"] == "collecting"
+
+
+def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
+    client: TestClient, monkeypatch
+) -> None:
+    login_as_developer(client)
+    project = client.post("/api/projects", json={"name": "Completed file operation"}).json()
+    conversation = client.post(
+        "/api/assistant/conversations", json={"project_id": project["id"]}
+    ).json()
+    generated_file = client.post(
+        f"/api/projects/{project['id']}/files",
+        data={"category": "dataset_source"},
+        files={"file": ("scored_results.xlsx", b"generated workbook", "application/xlsx")},
+    ).json()
+    config = AgentConfig(enabled=True, base_url="https://model.test", model="test-model")
+    monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
+
+    def fake_react(*_):
+        yield "result", {
+            "reply": "文件已经重新评分并生成，可以直接下载。",
+            "draft": {
+                "title": "模型回答质量评分",
+                "goal": "重新评估回答相关性",
+                "task_mode": "local_analysis",
+                "source_file_id": generated_file["id"],
+                "source_inspected": True,
+                "output_format": "xlsx",
+            },
+            "ui_action": None,
+            "react_trace": [
+                {
+                    "name": "run_python",
+                    "label": "运行 Python 文件处理",
+                    "status": "completed",
+                    "summary": {
+                        "ok": True,
+                        "primary_output_file_id": generated_file["id"],
+                        "outputs": [
+                            {
+                                "file_id": generated_file["id"],
+                                "file_name": "scored_results.xlsx",
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "evalweave.api.routes.agents.stream_react_configuration", fake_react
+    )
+    response = client.post(
+        f"/api/assistant/conversations/{conversation['id']}/messages/stream",
+        json={"content": "重新评分这个文件"},
+    )
+    events = [json.loads(line) for line in response.text.splitlines()]
+
+    assert events[-1]["type"] == "done", events
+    assert events[-1]["stage"] == "collecting"
+    assert events[-1]["draft"]["ui_action"] is None
+    assert events[-1]["attachment_file_id"] == generated_file["id"]
+    messages = client.get(
+        f"/api/assistant/conversations/{conversation['id']}/messages"
+    ).json()
+    assert messages[-1]["attachment_file_id"] == generated_file["id"]
+    assert messages[-1]["attachment_name"] == "scored_results.xlsx"
 
 
 def test_generic_data_program_combines_model_and_multiple_http_targets(

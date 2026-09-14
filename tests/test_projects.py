@@ -8,6 +8,7 @@ def test_create_and_list_project(client: TestClient) -> None:
         "/api/auth/register",
         json={
             "username": "developer",
+            "email": "developer@example.com",
             "password": "developer-password",
             "user_type_id": development["id"],
         },
