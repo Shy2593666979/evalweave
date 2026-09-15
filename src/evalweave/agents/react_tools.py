@@ -4,6 +4,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -20,9 +21,18 @@ from evalweave.agents.executor import (
 )
 from evalweave.agents.inspection import inspect_source
 from evalweave.agents.model_config import encrypt_secret_payload
-from evalweave.agents.python_workspace import run_python_workspace
+from evalweave.agents.python_workspace import (
+    PYTHON_DIALOG_TIMEOUT_SECONDS,
+    run_python_workspace,
+)
 from evalweave.core.config import TargetAuthFlowConfig, get_settings
-from evalweave.db.models import AgentJob, AgentJobStatus, FileObject
+from evalweave.db.models import (
+    AgentJob,
+    AgentJobStatus,
+    AgentStep,
+    FileObject,
+    StepStatus,
+)
 from evalweave.notifications import send_wecom, send_wecom_file
 from evalweave.storage import LocalFileStorage
 
@@ -167,7 +177,13 @@ class InspectSourceTool(BaseAssistantTool):
     description = "检查已上传数据文件的格式、字段和样例。需要理解文件时调用。"
     parameters = {
         "type": "object",
-        "properties": {"source_file_id": {"type": "string"}},
+        "properties": {
+            "source_file_id": {"type": "string"},
+            "step_title": {
+                "type": "string",
+                "description": "本次检查对应的简短业务步骤名称。",
+            },
+        },
         "required": ["source_file_id"],
         "additionalProperties": False,
     }
@@ -190,13 +206,17 @@ class RunPythonTool(BaseAssistantTool):
         "脚本可使用 Python 标准库和项目已安装依赖，并应把新文件写入 outputs/。"
         "适用于从零生成数据，以及任意清洗、JSON 解包、列转换、合并、拆分或格式修复。"
         "用户要求创建或修改文件时直接调用，不得要求用户先上传空白载体。"
-        "预计超过 30 秒、包含批量接口调用或属于批量评测时，设置 run_as_job=true，"
-        "任务会交给后台 Worker，避免对话一直等待。"
+        "本工具最多运行 30 秒，适合探索、抽样试跑和验证真实数据或响应结构；"
+        "长时间完整任务应改用 submit_python_job。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "要执行的完整 Python 脚本。"},
+            "step_title": {
+                "type": "string",
+                "description": "本次处理对应的简短业务步骤名称，不要使用技术实现名称。",
+            },
             "source_file_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -210,13 +230,6 @@ class RunPythonTool(BaseAssistantTool):
                 "type": "string",
                 "description": "outputs/ 下作为后续任务数据源的文件名；默认使用第一个输出。",
             },
-            "run_as_job": {
-                "type": "boolean",
-                "description": (
-                    "预计耗时超过 30 秒、包含批量接口调用或属于批量评测时设为 true；"
-                    "普通重命名、格式转换和短文件处理设为 false。"
-                ),
-            },
         },
         "required": ["code"],
         "additionalProperties": False,
@@ -229,73 +242,6 @@ class RunPythonTool(BaseAssistantTool):
             if isinstance(raw_source_file_ids, list)
             else None
         )
-        if bool(kwargs.get("run_as_job")):
-            if context.project_id is None or context.actor_id is None:
-                raise ValueError("Python 后台任务需要当前项目和执行用户")
-            code = str(kwargs.get("code", ""))
-            if not code.strip():
-                raise ValueError("Python 文件工具需要可执行脚本")
-            resolved_source_ids = source_file_ids
-            if resolved_source_ids is None:
-                current_source_id = str(context.draft.get("source_file_id") or "")
-                resolved_source_ids = [current_source_id] if current_source_id else []
-            primary_output = str(kwargs.get("primary_output") or "") or None
-            extension = Path(primary_output or "").suffix.lower()
-            output_format = {
-                ".xlsx": "xlsx",
-                ".jsonl": "jsonl",
-                ".md": "markdown",
-                ".markdown": "markdown",
-                ".txt": "text",
-            }.get(extension, "file")
-            title = str(context.draft.get("title") or "Python 后台任务").strip()[:128]
-            goal = str(context.draft.get("goal") or title).strip()
-            with Session(get_settings_engine()) as session:
-                job = AgentJob(
-                    project_id=context.project_id,
-                    created_by=context.actor_id,
-                    source_file_id=(
-                        UUID(resolved_source_ids[0]) if resolved_source_ids else None
-                    ),
-                    title=title,
-                    goal=goal,
-                    status=AgentJobStatus.PENDING,
-                    input_config={
-                        "job_type": "python",
-                        "python_code": code,
-                        "source_file_ids": resolved_source_ids,
-                        "primary_output": primary_output,
-                        "output_format": output_format,
-                    },
-                    eval_spec={"execution_mode": "python"},
-                    requires_approval=False,
-                )
-                session.add(job)
-                session.commit()
-                session.refresh(job)
-                try:
-                    enqueue_python_job(job.id)
-                except Exception as error:
-                    job.status = AgentJobStatus.FAILED
-                    job.error = f"后台任务提交失败：{error}"[:4000]
-                    session.add(job)
-                    session.commit()
-                    raise ValueError(job.error) from error
-            context.draft["background_job_id"] = str(job.id)
-            context.ui_action = {
-                "type": "background_job",
-                "job_id": str(job.id),
-                "path": f"/evaluations/{job.id}",
-            }
-            return json.dumps(
-                {
-                    "ok": True,
-                    "queued": True,
-                    "job_id": str(job.id),
-                    "status": "pending",
-                },
-                ensure_ascii=False,
-            )
         with Session(get_settings_engine()) as session:
             observation, updates = run_python_workspace(
                 session,
@@ -305,9 +251,232 @@ class RunPythonTool(BaseAssistantTool):
                 source_file_ids,
                 str(kwargs.get("primary_output") or "") or None,
                 created_by=context.actor_id,
+                timeout_seconds=PYTHON_DIALOG_TIMEOUT_SECONDS,
             )
         context.draft.update(updates)
         return json.dumps({"ok": True, **observation}, ensure_ascii=False)
+
+
+class SubmitPythonJobTool(BaseAssistantTool):
+    name = "submit_python_job"
+    description = (
+        "把完整 Python 脚本提交为后台评测任务，不设置 Python 总执行时限。"
+        "适合批量接口调用、批量评测或其他预计超过 30 秒的工作。"
+        "提交时必须给出根据当前场景生成的评测方案；主流程包含方案、执行和结果汇总，"
+        "具体准备及执行步骤由实际任务决定。"
+        "工具调用顺序由当前任务决定；当外部响应、数据结构或处理逻辑存在不确定性时，"
+        "应先使用 run_python、probe_http_target 或 inspect_source 获得真实观察并完善脚本。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "要在后台执行的完整 Python 脚本。"},
+            "source_file_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "输入文件 ID；省略时使用当前 source_file_id，"
+                    "传空数组表示不使用输入文件。"
+                ),
+                "maxItems": 8,
+            },
+            "primary_output": {
+                "type": "string",
+                "description": "outputs/ 下作为任务主要结果的文件名；默认使用第一个输出。",
+            },
+            "evaluation_plan": {
+                "type": "object",
+                "description": "结合当前目标和已有工具观察生成的动态评测方案。",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "description": {"type": "string"},
+                                "phase": {
+                                    "type": "string",
+                                    "enum": ["preparation", "execution", "analysis"],
+                                },
+                            },
+                            "required": ["title", "description", "phase"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["summary", "steps"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["code", "evaluation_plan"],
+        "additionalProperties": False,
+    }
+
+    def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        if context.project_id is None or context.actor_id is None:
+            raise ValueError("后台评测任务需要当前项目和执行用户")
+        code = str(kwargs.get("code", ""))
+        if not code.strip():
+            raise ValueError("后台评测任务需要可执行脚本")
+        raw_source_file_ids = kwargs.get("source_file_ids")
+        resolved_source_ids = (
+            [str(item) for item in raw_source_file_ids]
+            if isinstance(raw_source_file_ids, list)
+            else None
+        )
+        if resolved_source_ids is None:
+            current_source_id = str(context.draft.get("source_file_id") or "")
+            resolved_source_ids = [current_source_id] if current_source_id else []
+        primary_output = str(kwargs.get("primary_output") or "") or None
+        extension = Path(primary_output or "").suffix.lower()
+        output_format = {
+            ".xlsx": "xlsx",
+            ".jsonl": "jsonl",
+            ".md": "markdown",
+            ".markdown": "markdown",
+            ".txt": "text",
+        }.get(extension, "file")
+        title = str(context.draft.get("title") or "后台评测任务").strip()[:128]
+        goal = str(context.draft.get("goal") or title).strip()
+        raw_plan = kwargs.get("evaluation_plan")
+        evaluation_plan = raw_plan if isinstance(raw_plan, dict) else {}
+        raw_plan_steps = evaluation_plan.get("steps")
+        plan_steps = [
+            {
+                "title": str(item.get("title") or "评测步骤"),
+                "instruction": str(item.get("description") or "按照评测目标执行。"),
+                "phase": str(item.get("phase") or "execution"),
+                "type": "agent_step",
+            }
+            for item in raw_plan_steps
+            if isinstance(item, dict)
+        ] if isinstance(raw_plan_steps, list) else []
+        eval_spec = {
+            "execution_mode": "agent_python",
+            "summary": str(evaluation_plan.get("summary") or goal),
+            "source": (
+                "使用用户上传或 Agent 准备的数据文件"
+                if resolved_source_ids
+                else "由 Agent 根据评测目标动态生成所需数据"
+            ),
+            "output_spec": {"format": output_format},
+            "operations": ["prepare", "evaluate", "summarize"],
+            "data_program": {"steps": plan_steps},
+        }
+        with Session(get_settings_engine()) as session:
+            job = AgentJob(
+                project_id=context.project_id,
+                created_by=context.actor_id,
+                source_file_id=(
+                    UUID(resolved_source_ids[0]) if resolved_source_ids else None
+                ),
+                title=title,
+                goal=goal,
+                status=AgentJobStatus.PENDING,
+                input_config={
+                    "job_type": "python",
+                    "python_code": code,
+                    "source_file_ids": resolved_source_ids,
+                    "primary_output": primary_output,
+                    "output_format": output_format,
+                    **(
+                        {"evaluation_model_id": str(context.draft["evaluation_model_id"])}
+                        if context.draft.get("evaluation_model_id")
+                        else {}
+                    ),
+                },
+                eval_spec=eval_spec,
+                requires_approval=False,
+            )
+            session.add(job)
+            recorded_at = datetime.now(UTC)
+            session.add(
+                AgentStep(
+                    job_id=job.id,
+                    name="generate_eval_spec",
+                    status=StepStatus.COMPLETED,
+                    output_data={"label": "生成评测方案", "plan": eval_spec},
+                    started_at=recorded_at,
+                    finished_at=recorded_at,
+                )
+            )
+            excluded_tools = {
+                "request_confirmation",
+                "request_output_format",
+                "request_user_input",
+                "send_wecom_message",
+                "submit_python_job",
+                "update_task_draft",
+            }
+            for index, item in enumerate(context.trace, start=1):
+                tool_name = str(item.get("name") or "").strip()
+                trace_status = str(item.get("status") or "")
+                if (
+                    not tool_name
+                    or tool_name in excluded_tools
+                    or trace_status not in {"completed", "failed"}
+                ):
+                    continue
+                safe_tool_name = re.sub(r"[^a-zA-Z0-9_]+", "_", tool_name).strip("_")
+                session.add(
+                    AgentStep(
+                        job_id=job.id,
+                        name=f"preflight_{index}_{safe_tool_name or 'tool'}"[:64],
+                        status=(
+                            StepStatus.COMPLETED
+                            if trace_status == "completed"
+                            else StepStatus.FAILED
+                        ),
+                        output_data={
+                            "label": str(item.get("label") or tool_name),
+                            "tool_name": tool_name,
+                            "phase": "preparation",
+                        },
+                        started_at=recorded_at,
+                        finished_at=recorded_at,
+                    )
+                )
+            session.add(
+                AgentStep(
+                    job_id=job.id,
+                    name="execute_eval_spec",
+                    status=StepStatus.PENDING,
+                )
+            )
+            session.add(
+                AgentStep(
+                    job_id=job.id,
+                    name="summarize",
+                    status=StepStatus.PENDING,
+                )
+            )
+            session.commit()
+            session.refresh(job)
+            try:
+                enqueue_python_job(job.id)
+            except Exception as error:
+                job.status = AgentJobStatus.FAILED
+                job.error = f"后台任务提交失败：{error}"[:4000]
+                session.add(job)
+                session.commit()
+                raise ValueError(job.error) from error
+        context.draft["background_job_id"] = str(job.id)
+        context.ui_action = {
+            "type": "background_job",
+            "job_id": str(job.id),
+            "path": f"/evaluations/{job.id}",
+        }
+        return json.dumps(
+            {
+                "ok": True,
+                "queued": True,
+                "job_id": str(job.id),
+                "status": "pending",
+            },
+            ensure_ascii=False,
+        )
 
 
 class ProbeHttpTargetTool(BaseAssistantTool):
@@ -322,6 +491,10 @@ class ProbeHttpTargetTool(BaseAssistantTool):
         "properties": {
             "url": {"type": "string"},
             "body": {"type": ["object", "array"]},
+            "step_title": {
+                "type": "string",
+                "description": "本次探测对应的简短业务步骤名称。",
+            },
             "headers": {
                 "type": "object",
                 "description": "用户为本任务提供的请求头；可包含 Authorization。",
@@ -526,6 +699,7 @@ ASSISTANT_TOOL_REGISTRY: list[BaseAssistantTool] = [
     UpdateTaskDraftTool(),
     InspectSourceTool(),
     RunPythonTool(),
+    SubmitPythonJobTool(),
     ProbeHttpTargetTool(),
     SendWeComMessageTool(),
     RequestOutputFormatTool(),
@@ -760,6 +934,7 @@ def tool_label(name: str) -> str:
         "update_task_draft": "整理任务信息",
         "inspect_source": "检查数据文件",
         "run_python": "运行 Python 文件处理",
+        "submit_python_job": "提交后台评测任务",
         "probe_http_target": "验证目标接口",
         "send_wecom_message": "发送企业微信消息",
         "request_output_format": "请求选择交付方式",

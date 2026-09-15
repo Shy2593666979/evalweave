@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -18,7 +19,7 @@ from evalweave.agents.executor import (
     normalize_target_body,
     validate_http_target,
 )
-from evalweave.agents.inspection import inspect_source
+from evalweave.agents.inspection import inspect_source, load_source_rows
 from evalweave.agents.model_config import resolve_agent_config
 from evalweave.agents.planner import (
     evaluate_target_records,
@@ -110,14 +111,23 @@ def run_step(
     input_data: dict[str, Any] | None = None,
     attempt: int = 1,
 ) -> dict[str, Any]:
-    step = AgentStep(
-        job_id=job.id,
-        name=name,
-        status=StepStatus.RUNNING,
-        attempt=attempt,
-        input_data=input_data or {},
-        started_at=datetime.now(UTC),
-    )
+    step = session.exec(
+        select(AgentStep)
+        .where(
+            AgentStep.job_id == job.id,
+            AgentStep.name == name,
+            AgentStep.status == StepStatus.PENDING,
+        )
+        .order_by(AgentStep.created_at)
+    ).first()
+    if step is None:
+        step = AgentStep(job_id=job.id, name=name)
+    step.status = StepStatus.RUNNING
+    step.attempt = attempt
+    step.input_data = input_data or {}
+    step.started_at = datetime.now(UTC)
+    step.finished_at = None
+    step.error = None
     session.add(step)
     session.commit()
     try:
@@ -137,6 +147,21 @@ def run_step(
     session.add(step)
     session.commit()
     return output
+
+
+def ensure_pending_steps(session: Session, job: AgentJob, names: list[str]) -> None:
+    """Create not-yet-executed steps once their task plan is known."""
+    for name in names:
+        existing = session.exec(
+            select(AgentStep).where(
+                AgentStep.job_id == job.id,
+                AgentStep.name == name,
+                AgentStep.status.in_([StepStatus.PENDING, StepStatus.RUNNING]),
+            )
+        ).first()
+        if existing is None:
+            session.add(AgentStep(job_id=job.id, name=name, status=StepStatus.PENDING))
+    session.commit()
 
 
 def run_step_with_retries(
@@ -166,7 +191,7 @@ def run_step_with_retries(
 
 
 def execute_python_job(job_id: UUID) -> None:
-    """Execute a Python workspace task created directly from the assistant."""
+    """Execute a tool-planned evaluation whose implementation uses Python."""
     with Session(get_engine()) as session:
         job = session.get(AgentJob, job_id)
         if job is None or job.status in {
@@ -176,6 +201,7 @@ def execute_python_job(job_id: UUID) -> None:
             return
         if job.input_config.get("job_type") != "python":
             raise ValueError("任务不是 Python 后台任务")
+        ensure_pending_steps(session, job, ["execute_eval_spec", "summarize"])
         update_job(session, job, AgentJobStatus.RUNNING)
         try:
             source_file_ids = job.input_config.get("source_file_ids")
@@ -184,7 +210,7 @@ def execute_python_job(job_id: UUID) -> None:
             observation = run_step(
                 session,
                 job,
-                "execute_python",
+                "execute_eval_spec",
                 lambda: run_python_workspace(
                     session,
                     job.project_id,
@@ -195,19 +221,73 @@ def execute_python_job(job_id: UUID) -> None:
                     else None,
                     str(job.input_config.get("primary_output") or "") or None,
                     created_by=job.created_by,
+                    timeout_seconds=None,
                 )[0],
             )
             raw_file_id = observation.get("primary_output_file_id")
             job.result_file_id = UUID(str(raw_file_id)) if raw_file_id else None
-            job.result = {
-                "summary": (
-                    "Python 后台任务已完成。"
-                    if raw_file_id
-                    else "Python 后台任务已完成，没有生成结果文件。"
-                ),
-                "outputs": observation.get("outputs", []),
-                "stdout": observation.get("stdout", ""),
-            }
+            update_job(session, job, AgentJobStatus.ANALYZING)
+
+            def summarize_python_evaluation() -> dict[str, Any]:
+                outputs = observation.get("outputs", [])
+                execution = {
+                    "execution_mode": "agent_python",
+                    "evaluation_plan": job.eval_spec,
+                    "outputs": outputs,
+                    "stdout": observation.get("stdout", ""),
+                }
+                if job.result_file_id:
+                    result_file = session.get(FileObject, job.result_file_id)
+                    if result_file is not None:
+                        path = LocalFileStorage(
+                            get_settings().storage.local_directory
+                        ).path_for(result_file.storage_key)
+                        extension = Path(result_file.original_name).suffix.lower()
+                        preview: dict[str, Any] = {
+                            "file_name": result_file.original_name,
+                            "content_type": result_file.content_type,
+                        }
+                        try:
+                            if extension in {".csv", ".json", ".jsonl", ".xlsx"}:
+                                preview["rows"] = load_source_rows(
+                                    path,
+                                    result_file.original_name,
+                                    100,
+                                )
+                            elif extension in {".md", ".markdown", ".txt"}:
+                                preview["content"] = path.read_text(
+                                    encoding="utf-8-sig"
+                                )[:20000]
+                        except Exception as error:
+                            preview["preview_error"] = str(error)[:500]
+                        execution["primary_result"] = preview
+                agent_config = resolve_agent_config(
+                    session, job.input_config.get("evaluation_model_id")
+                )
+                summary = run_streamed_model_output(
+                    job,
+                    "summarize",
+                    "总结评测结果",
+                    lambda on_delta: generate_summary(
+                        agent_config,
+                        job.goal,
+                        execution,
+                        on_delta=on_delta,
+                    ),
+                )
+                summary["execution"] = {
+                    "execution_mode": "agent_python",
+                    "outputs": outputs,
+                    "stdout": observation.get("stdout", ""),
+                }
+                return summary
+
+            job.result = run_step(
+                session,
+                job,
+                "summarize",
+                summarize_python_evaluation,
+            )
             job.error = None
             update_job(session, job, AgentJobStatus.COMPLETED)
             try:
@@ -472,6 +552,10 @@ def plan_agent_job(job_id: UUID) -> None:
             return
         job.error = None
         try:
+            initial_steps = ["generate_eval_spec"]
+            if job.source_file_id:
+                initial_steps.insert(0, "discover_source")
+            ensure_pending_steps(session, job, initial_steps)
             agent_config = resolve_agent_config(
                 session, job.input_config.get("evaluation_model_id")
             )
@@ -530,6 +614,13 @@ def plan_agent_job(job_id: UUID) -> None:
             if spec is None:
                 raise RuntimeError("Agent failed to generate EvalSpec")
             target = job.input_config.get("target")
+            remaining_steps = []
+            if not job.source_file_id and isinstance(target, dict) and target:
+                remaining_steps.append("generate_test_cases")
+            if isinstance(target, dict) and target:
+                remaining_steps.append("validate_target")
+            remaining_steps.extend(["execute_eval_spec", "summarize"])
+            ensure_pending_steps(session, job, remaining_steps)
             if not job.source_file_id and isinstance(target, dict) and target:
                 case_count = int(job.input_config.get("max_cases", 30))
                 generated_output = run_step_with_retries(

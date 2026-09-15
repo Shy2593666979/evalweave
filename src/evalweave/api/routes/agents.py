@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -47,28 +47,20 @@ from evalweave.workers.factory import create_celery_app
 
 router = APIRouter(tags=["evaluation-agent"])
 
+_WORKER_PROBE_TTL_SECONDS = 5.0
+_worker_probe_lock = Lock()
+_worker_probe_available = False
+_worker_probe_checked_at = 0.0
+_worker_probe_running = False
+
 ExperimentReader = Annotated[User, Depends(require_permission(Permission.EXPERIMENT_READ))]
 ExperimentRunner = Annotated[User, Depends(require_permission(Permission.EXPERIMENT_RUN))]
 EvaluationReviewer = Annotated[User, Depends(require_permission(Permission.EVALUATION_REVIEW))]
 
 
 def redact_sensitive_content(content: str) -> str:
-    redacted = re.sub(
-        r"(?i)(authorization\s*:\s*bearer\s+)[^\s'\"\\]+",
-        r"\1[REDACTED]",
-        content,
-    )
-    redacted = re.sub(
-        r"(?is)(\s-b\s+)(['\"]).*?\2",
-        r"\1'[REDACTED]'",
-        redacted,
-    )
-    redacted = re.sub(
-        r'(?i)("(?:user_)?password"\s*:\s*")[^"]*(")',
-        r"\1[REDACTED]\2",
-        redacted,
-    )
-    return redacted
+    """Keep user-provided task content unchanged when it is persisted."""
+    return content
 
 
 def sanitize_assistant_display(content: str) -> str:
@@ -266,6 +258,7 @@ class AssistantMessageRead(BaseModel):
     conversation_id: UUID
     role: str
     content: str
+    ui_action: dict[str, Any] | None
     include_in_context: bool
     is_streaming: bool
     attachment_file_id: UUID | None
@@ -293,6 +286,33 @@ class EvaluationModelOption(BaseModel):
     name: str
     model_name: str
     api_mode: str
+
+
+def _refresh_worker_status() -> None:
+    global _worker_probe_available, _worker_probe_checked_at, _worker_probe_running
+    try:
+        available = bool(create_celery_app().control.inspect(timeout=1.5).ping())
+    except Exception:
+        available = False
+    with _worker_probe_lock:
+        _worker_probe_available = available
+        _worker_probe_checked_at = time.monotonic()
+        _worker_probe_running = False
+
+
+def cached_worker_status() -> bool:
+    """Return immediately and refresh a stale Celery status in the background."""
+    global _worker_probe_running
+    with _worker_probe_lock:
+        stale = time.monotonic() - _worker_probe_checked_at >= _WORKER_PROBE_TTL_SECONDS
+        if stale and not _worker_probe_running:
+            _worker_probe_running = True
+            Thread(
+                target=_refresh_worker_status,
+                name="worker-status-probe",
+                daemon=True,
+            ).start()
+        return _worker_probe_available
 
 
 def require_project(project_id: UUID, session: SessionDependency) -> Project:
@@ -328,18 +348,11 @@ def require_assistant_conversation(
 @router.get("/agent/runtime", response_model=AgentRuntimeRead)
 def get_agent_runtime(_: ExperimentReader) -> AgentRuntimeRead:
     config = get_settings().agent
-    try:
-        # A Celery broadcast ping commonly takes slightly over 500 ms on Windows,
-        # especially with the solo pool. A 0.5 s window caused healthy workers to
-        # be reported as disconnected during normal startup and under light load.
-        worker_available = bool(create_celery_app().control.inspect(timeout=1.5).ping())
-    except Exception:
-        worker_available = False
     return AgentRuntimeRead(
         enabled=config.enabled,
         model=config.model or None,
         require_approval=config.require_approval,
-        worker_available=worker_available,
+        worker_available=cached_worker_status(),
     )
 
 
@@ -461,7 +474,12 @@ def stream_assistant_messages(
                 ]
             signature = json.dumps(
                 [
-                    (item["id"], item["content"], item["is_streaming"])
+                    (
+                        item["id"],
+                        item["content"],
+                        item["is_streaming"],
+                        item["ui_action"],
+                    )
                     for item in payload
                 ],
                 ensure_ascii=False,
@@ -576,6 +594,7 @@ def stream_assistant_message(
         *,
         is_streaming: bool,
         include_in_context: bool,
+        ui_action: dict[str, Any] | None = None,
         attachment: dict[str, Any] | None = None,
     ) -> None:
         with Session(get_engine()) as write_session:
@@ -590,6 +609,7 @@ def stream_assistant_message(
             message.content = content
             message.is_streaming = is_streaming
             message.include_in_context = include_in_context
+            message.ui_action = ui_action
             if attachment is not None:
                 raw_attachment_id = attachment.get("attachment_file_id")
                 message.attachment_file_id = (
@@ -699,7 +719,9 @@ def stream_assistant_message(
                 raise ValueError("Agent model did not return a configuration result")
             draft = {**current_draft, **result["draft"]}
             draft["react_trace"] = result.get("react_trace", [])
-            draft["ui_action"] = result.get("ui_action")
+            # UI actions belong to the assistant message that produced them. Keeping
+            # them in the conversation draft makes stale controls move to later replies.
+            draft.pop("ui_action", None)
             goal = str(draft.get("goal", "")).strip()
             if goal and not str(draft.get("title", "")).strip():
                 draft["title"] = derive_task_title(goal)
@@ -769,6 +791,7 @@ def stream_assistant_message(
                 reply,
                 is_streaming=False,
                 include_in_context=True,
+                ui_action=result.get("ui_action"),
                 attachment=attachment_payload,
             )
             stream_completed = True
@@ -779,6 +802,7 @@ def stream_assistant_message(
                         "content": reply,
                         "draft": draft,
                         "stage": stage,
+                        "ui_action": result.get("ui_action"),
                         **attachment_payload,
                     },
                     ensure_ascii=False,
@@ -1009,7 +1033,10 @@ def start_agent_job(job_id: UUID, _: ExperimentRunner, session: SessionDependenc
     job.error = None
     job.updated_at = datetime.now(UTC)
     is_python_job = job.input_config.get("job_type") == "python"
-    job.eval_spec = {"execution_mode": "python"} if is_python_job else {}
+    if not is_python_job:
+        job.eval_spec = {}
+    elif not job.eval_spec:
+        job.eval_spec = {"execution_mode": "agent_python"}
     job.result = {}
     job.result_file_id = None
     session.add(job)

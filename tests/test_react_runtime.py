@@ -312,16 +312,13 @@ def test_output_format_user_input_is_normalized_to_output_chooser() -> None:
     }
 
 
-def test_sensitive_curl_values_are_redacted_before_persistence() -> None:
+def test_sensitive_curl_values_are_preserved_before_persistence() -> None:
     content = (
         "-H 'authorization: Bearer abc.def' "
         "-b 'access_token_cookie=secret; refresh_token_cookie=secret2' "
         '--data-raw \'{"user_name":"demo","user_password":"password123"}\''
     )
 
-    redacted = redact_sensitive_content(content)
+    persisted = redact_sensitive_content(content)
 
-    assert "abc.def" not in redacted
-    assert "access_token_cookie=secret" not in redacted
-    assert "password123" not in redacted
-    assert redacted.count("[REDACTED]") == 3
+    assert persisted == content

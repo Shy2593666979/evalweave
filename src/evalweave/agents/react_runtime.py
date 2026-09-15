@@ -32,9 +32,17 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
   并更新为 current_draft.source_file_id。继续重命名或修改时，省略 source_file_ids 即可将该文件重新
   装载到新的 inputs/；不得检查上一轮 outputs/，不得声称文件已清空，也不得无故从头重新生成数据。
 - Python 环境提供 httpx、requests、openpyxl 和 pandas，可按任务选择合适的 HTTP 与表格处理库。
-- 调用 run_python 时必须判断执行方式：预计超过 30 秒、包含批量 HTTP/模型调用、批量评测或需要等待
-  较长外部响应时设置 run_as_job=true；普通重命名、简单转换、快速检查设置为 false。后台任务创建成功后
-  立即结束本轮回复，只告知用户任务已启动并前往评测任务查看，不得在对话中继续等待脚本结果。
+- run_python 最多执行 30 秒，用于快速文件处理、探索、抽样试跑和验证真实响应或数据结构。
+  预计超过 30 秒、包含批量 HTTP/模型调用或属于批量评测时，使用 submit_python_job 提交完整脚本。
+  调用 inspect_source、probe_http_target、run_python 时，用 step_title 写明当前业务目的，例如
+  “生成 Excel 前置文件”或“抽样验证回答字段”，不要把 Python 等实现技术当作步骤名称。
+  工具调用顺序和验证方法必须根据当前任务决定，不得写死 Case 数量、字段或业务流程。存在未知外部响应、
+  未确认的数据结构或容易静默产生空结果的逻辑时，先按需使用 probe_http_target、run_python、
+  inspect_source 取得真实 Observation，并根据观察修改脚本；不要在尚未验证关键假设时
+  直接提交批量任务。
+  调用 submit_python_job 时，evaluation_plan 必须结合当前目标和已有 Observation 动态生成，既包含
+  已完成的数据准备步骤，也包含后续实际要执行和汇总的步骤，不能套用与场景无关的固定模板。
+  后台任务创建成功后立即结束本轮回复，只告知用户任务已启动并前往评测任务查看，不得在对话中等待结果。
 - 面向用户的回复只能描述“正在处理文件”“文件已生成”等结果，不得提及 inputs/、outputs/、
   manifest.json、临时工作区路径、存储键或脚本内部目录；文件完成后可以展示原始文件名，但不得自行
   生成、猜测或拼接任何下载 URL，也不得输出 Markdown 下载链接。系统会根据工具返回的 file_id 自动
@@ -239,7 +247,12 @@ def _stream_chat_completions(
                 arguments = json.loads(call["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            trace_item = {"name": name, "label": tool_label(name), "status": "running"}
+            step_title = str(arguments.get("step_title") or "").strip()
+            trace_item = {
+                "name": name,
+                "label": step_title[:128] or tool_label(name),
+                "status": "running",
+            }
             context.trace.append(trace_item)
             yield "tool_start", trace_item
             if tool is None:
@@ -369,7 +382,12 @@ def _stream_responses(
                 arguments = json.loads(str(call.get("arguments") or "{}"))
             except json.JSONDecodeError:
                 arguments = {}
-            trace_item = {"name": name, "label": tool_label(name), "status": "running"}
+            step_title = str(arguments.get("step_title") or "").strip()
+            trace_item = {
+                "name": name,
+                "label": step_title[:128] or tool_label(name),
+                "status": "running",
+            }
             context.trace.append(trace_item)
             yield "tool_start", trace_item
             if tool is None:

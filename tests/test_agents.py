@@ -25,7 +25,11 @@ from evalweave.agents.inspection import load_source_rows
 from evalweave.agents.model_config import encrypt_secret_payload
 from evalweave.agents.planner import evaluate_target_records
 from evalweave.agents.python_workspace import run_python_workspace
-from evalweave.agents.react_tools import AssistantToolContext, RunPythonTool
+from evalweave.agents.react_tools import (
+    AssistantToolContext,
+    RunPythonTool,
+    SubmitPythonJobTool,
+)
 from evalweave.agents.workflow import (
     execute_python_job,
     plan_agent_job,
@@ -523,10 +527,23 @@ def test_long_python_tool_creates_and_executes_background_job(
         draft={"title": "批量生成文件", "goal": "在后台生成结果文件"},
         project_id=UUID(project["id"]),
         actor_id=UUID(creator["id"]),
+        trace=[
+            {
+                "name": "run_python",
+                "label": "生成 Excel 前置文件",
+                "status": "completed",
+                "summary": {"stdout": "sensitive output is not copied"},
+            },
+            {
+                "name": "submit_python_job",
+                "label": "提交后台任务",
+                "status": "running",
+            },
+        ],
     )
 
     result = json.loads(
-        RunPythonTool().run(
+        SubmitPythonJobTool().run(
             context,
             code=(
                 "from pathlib import Path\n"
@@ -534,7 +551,21 @@ def test_long_python_tool_creates_and_executes_background_job(
             ),
             source_file_ids=[],
             primary_output="result.txt",
-            run_as_job=True,
+            evaluation_plan={
+                "summary": "准备评测数据并生成整体结果",
+                "steps": [
+                    {
+                        "title": "生成 Excel 前置文件",
+                        "description": "在没有上传数据时生成评测所需的输入文件。",
+                        "phase": "preparation",
+                    },
+                    {
+                        "title": "执行回答质量评测",
+                        "description": "逐条执行并记录评测结果。",
+                        "phase": "execution",
+                    },
+                ],
+            },
         )
     )
 
@@ -546,7 +577,37 @@ def test_long_python_tool_creates_and_executes_background_job(
         "job_id": str(job_id),
         "path": f"/evaluations/{job_id}",
     }
+    with Session(get_engine()) as session:
+        queued_steps = list(
+            session.exec(select(AgentStep).where(AgentStep.job_id == job_id))
+        )
+    assert [step.status.value for step in queued_steps] == [
+        "completed",
+        "completed",
+        "pending",
+        "pending",
+    ]
 
+    observed_timeouts: list[float | None] = []
+    summary_evidence: dict[str, object] = {}
+
+    def capture_background_timeout(*args, **kwargs):
+        observed_timeouts.append(kwargs.get("timeout_seconds"))
+        return run_python_workspace(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.run_python_workspace",
+        capture_background_timeout,
+    )
+
+    def summarize_background_result(_config, _goal, execution, **_kwargs):
+        summary_evidence.update(execution)
+        return {"summary": "结果文件内容为 done，评测流程执行成功。"}
+
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.generate_summary",
+        summarize_background_result,
+    )
     execute_python_job(job_id)
 
     with Session(get_engine()) as session:
@@ -557,7 +618,51 @@ def test_long_python_tool_creates_and_executes_background_job(
     assert job.status.value == "completed"
     assert output is not None
     assert output.original_name == "result.txt"
-    assert [step.name for step in steps] == ["execute_python"]
+    assert [step.name for step in steps] == [
+        "generate_eval_spec",
+        "preflight_1_run_python",
+        "execute_eval_spec",
+        "summarize",
+    ]
+    assert steps[1].output_data == {
+        "label": "生成 Excel 前置文件",
+        "tool_name": "run_python",
+        "phase": "preparation",
+    }
+    assert job.eval_spec["data_program"]["steps"][0]["title"] == "生成 Excel 前置文件"
+    assert job.result["execution"]["execution_mode"] == "agent_python"
+    assert job.result["summary"] == "结果文件内容为 done，评测流程执行成功。"
+    assert summary_evidence["primary_result"]["content"] == "done"
+    assert observed_timeouts == [None]
+
+
+def test_dialog_python_tool_uses_30_second_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed_timeouts: list[float | None] = []
+
+    def capture_dialog_timeout(*_args, **kwargs):
+        observed_timeouts.append(kwargs.get("timeout_seconds"))
+        return ({"stdout": "", "outputs": []}, {})
+
+    monkeypatch.setattr(
+        "evalweave.agents.react_tools.run_python_workspace",
+        capture_dialog_timeout,
+    )
+    context = AssistantToolContext(
+        draft={},
+        project_id=UUID(int=1),
+        actor_id=UUID(int=2),
+    )
+
+    result = json.loads(
+        RunPythonTool().run(
+            context,
+            code="print('done')",
+            source_file_ids=[],
+        )
+    )
+
+    assert result["ok"] is True
+    assert observed_timeouts == [30]
 
 
 def test_agent_generates_cases_when_http_target_has_no_source_file(
@@ -1007,13 +1112,16 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
     ]
     assert events[-1]["content"] == "Choose a delivery format."
     assert events[-1]["stage"] == "choose_output"
+    assert events[-1]["ui_action"] == {"type": "choose_output"}
     assert events[-1]["draft"]["react_trace"][0]["status"] == "completed"
+    assert "ui_action" not in events[-1]["draft"]
     stored_messages = client.get(
         f"/api/assistant/conversations/{conversation['id']}/messages"
     ).json()
     assert stored_messages[-2]["content"] == "The endpoint is reachable."
     assert stored_messages[-2]["include_in_context"] is False
     assert stored_messages[-1]["content"] == events[-1]["content"]
+    assert stored_messages[-1]["ui_action"] == {"type": "choose_output"}
     assert stored_messages[-1]["include_in_context"] is True
     assert stored_messages[-1]["is_streaming"] is False
 
@@ -1150,11 +1258,13 @@ def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
 
     assert events[-1]["type"] == "done", events
     assert events[-1]["stage"] == "collecting"
-    assert events[-1]["draft"]["ui_action"] is None
+    assert events[-1]["ui_action"] is None
+    assert "ui_action" not in events[-1]["draft"]
     assert events[-1]["attachment_file_id"] == generated_file["id"]
     messages = client.get(
         f"/api/assistant/conversations/{conversation['id']}/messages"
     ).json()
+    assert messages[-1]["ui_action"] is None
     assert messages[-1]["attachment_file_id"] == generated_file["id"]
     assert messages[-1]["attachment_name"] == "scored_results.xlsx"
 

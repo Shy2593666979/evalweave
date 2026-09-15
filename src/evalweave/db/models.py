@@ -166,6 +166,9 @@ class AssistantMessage(TimestampMixin, table=True):
     conversation_id: UUID = Field(foreign_key="assistant_conversations.id", index=True)
     role: str = Field(max_length=16)
     content: str = Field(sa_column=Column(Text, nullable=False))
+    ui_action: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
     include_in_context: bool = Field(default=True, nullable=False)
     is_streaming: bool = Field(default=False, nullable=False)
     attachment_file_id: UUID | None = Field(

@@ -249,7 +249,16 @@ button, input, textarea, select { font: inherit; }
 .job-detail-head p { max-width: 700px; margin: 0; color: #6f829f; font-size: 14px; line-height: 1.65; }
 .job-id { color: #7691b5; font: 650 12px/1.4 monospace; }
 .job-progress { margin: 25px 0 22px; }
-.job-progress > div:last-child { display: flex; margin-top: 9px; justify-content: space-between; color: #8191a8; font-size: 12px; }
+.job-progress-line { position: relative; height: 8px; overflow: hidden; border-radius: 999px; background: #dce5f0; }
+.job-progress-line span { position: absolute; top: 0; height: 100%; }
+.job-progress-line .completed-fill { left: 0; background: #67c23a; }
+.job-progress-line .active-fill.running { background: #409eff; }
+.job-progress-line .active-fill.failed { background: #f56c6c; }
+.job-progress-labels { display: grid; margin-top: 9px; gap: 8px; color: #8191a8; font-size: 12px; text-align: center; }
+.job-progress-labels span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-progress-labels span.running { color: #337ecc; font-weight: 700; }
+.job-progress-labels span.failed { color: #d94b4b; font-weight: 700; }
+.job-progress-empty { margin-top: 9px; color: #8191a8; font-size: 12px; text-align: center; }
 .python-job-status { display: grid; margin: 25px 0 22px; grid-template-columns: repeat(3,minmax(0,1fr)); overflow: hidden; border: 1px solid #d7e5f5; border-radius: 13px; background: #f7faff; }
 .python-job-status > div { min-width: 0; padding: 14px 16px; text-align: center; }
 .python-job-status > div:not(:last-child) { border-right: 1px solid #dce8f6; }
@@ -693,7 +702,6 @@ button, input, textarea, select { font: inherit; }
 @media (max-width: 1200px) and (min-width: 761px) {
   .output-card-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
 }
-@media (max-height: 800px) and (min-width: 761px) { .sidebar-promo { display: none; } }
 @media (max-width: 760px) {
   .shell { display: block !important; }
   .sidebar { position: relative; width: 100% !important; height: auto; padding: 15px 14px 10px; }

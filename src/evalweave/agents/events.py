@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 from uuid import UUID
 
@@ -10,27 +9,9 @@ from evalweave.db.models import AgentJobEvent
 from evalweave.db.session import get_engine
 
 
-_SENSITIVE_VALUE_PATTERNS = (
-    (
-        re.compile(r"(?i)(authorization\s*[:=]\s*[\"']?bearer\s+)[^\s\"',}]+"),
-        r"\1[REDACTED]",
-    ),
-    (
-        re.compile(
-            r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
-            r"[\"']?\s*[:=]\s*[\"'])[^\"']+([\"'])"
-        ),
-        r"\1[REDACTED]\2",
-    ),
-)
-
-
 def redact_model_output(content: str) -> str:
-    """Remove common credential values before an event is persisted or streamed."""
-    redacted = content
-    for pattern, replacement in _SENSITIVE_VALUE_PATTERNS:
-        redacted = pattern.sub(replacement, redacted)
-    return redacted
+    """Keep model event content unchanged when it is persisted or streamed."""
+    return content
 
 
 def emit_job_event(

@@ -116,6 +116,7 @@ export interface AssistantMessage {
   conversation_id?: string
   role: 'user' | 'assistant'
   content: string
+  ui_action?: { type?: string, question?: string, summary?: string, options?: unknown[] } | null
   include_in_context?: boolean
   is_streaming?: boolean
   attachment_file_id?: string | null

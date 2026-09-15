@@ -4,7 +4,6 @@ import {
   Clock,
   Document,
   Download,
-  Loading,
   Plus,
   Refresh,
   VideoPlay,
@@ -21,7 +20,6 @@ import {
   ElInputNumber,
   ElMessage,
   ElOption,
-  ElProgress,
   ElRadioButton,
   ElRadioGroup,
   ElSelect,
@@ -106,59 +104,47 @@ const currentSteps = computed(() => {
   for (const step of steps.value) latest.set(step.name, step)
   return [...latest.values()]
 })
+const hasEvaluationPlan = computed(() => (
+  currentSteps.value.some((step) => (
+    step.name === 'generate_eval_spec' && step.status === 'completed'
+  ))
+  && Object.keys(selectedJob.value?.eval_spec ?? {}).length > 0
+))
+const progressSegments = computed(() => {
+  const total = currentSteps.value.length
+  if (!total) return { completed: 0, activeLeft: 0, activeWidth: 0, activeStatus: '' }
+  const completed = currentSteps.value.filter((step) => step.status === 'completed').length
+  const activeIndex = currentSteps.value.findIndex((step) => (
+    step.status === 'running' || step.status === 'failed'
+  ))
+  return {
+    completed: selectedJob.value?.status === 'completed' ? 100 : (completed / total) * 100,
+    activeLeft: activeIndex < 0 ? 0 : (activeIndex / total) * 100,
+    activeWidth: activeIndex < 0 ? 0 : 100 / total,
+    activeStatus: activeIndex < 0 ? '' : currentSteps.value[activeIndex].status,
+  }
+})
 const isActive = (status: AgentJob['status']) =>
   ['pending', 'discovering', 'planning', 'running', 'analyzing'].includes(status)
-const progress = computed(() => {
-  if (!selectedJob.value) return 0
-  return {
-    pending: 8,
-    discovering: 22,
-    planning: 42,
-    waiting_human: 58,
-    running: 72,
-    analyzing: 88,
-    completed: 100,
-    failed: 100,
-    cancelled: 100,
-  }[selectedJob.value.status]
-})
 
-const pythonJobElapsed = computed(() => {
+const executionElapsed = computed(() => {
   const job = selectedJob.value
   if (!job) return '0 秒'
-  const latestExecutionStep = currentSteps.value.find((step) => step.name === 'execute_python')
-  const executionStep = job.status === 'pending'
-    || (job.status === 'running' && latestExecutionStep?.status !== 'running')
-    ? undefined
-    : latestExecutionStep
-  const fallbackStart = ['pending', 'running'].includes(job.status)
-    ? job.updated_at
-    : job.created_at
-  const started = parseServerDateTime(executionStep?.started_at ?? fallbackStart)?.getTime()
-    ?? currentTime.value
-  const terminal = ['completed', 'failed', 'cancelled'].includes(job.status)
-  const finishedAt = executionStep?.finished_at ?? job.updated_at
-  const ended = terminal
-    ? parseServerDateTime(finishedAt)?.getTime() ?? currentTime.value
-    : currentTime.value
+  const executionStep = currentSteps.value.find((step) => step.name === 'execute_eval_spec')
+  const started = parseServerDateTime(executionStep?.started_at ?? null)?.getTime()
+  if (!started) return '0 秒'
+  const running = executionStep?.status === 'running'
+  const ended = running
+    ? currentTime.value
+    : parseServerDateTime(executionStep?.finished_at ?? null)?.getTime() ?? currentTime.value
   const totalSeconds = Math.max(0, Math.floor((ended - started) / 1000))
   if (totalSeconds < 60) return `${totalSeconds} 秒`
   const seconds = totalSeconds % 60
   const totalMinutes = Math.floor(totalSeconds / 60)
-  if (totalMinutes < 60) return `${totalMinutes} 分 ${seconds} 秒`
+  if (totalMinutes < 60) return `${totalMinutes} 分钟 ${seconds} 秒`
   const hours = Math.floor(totalMinutes / 60)
   const minutes = totalMinutes % 60
-  return `${hours} 小时 ${minutes} 分 ${seconds} 秒`
-})
-
-const pythonCurrentOperation = computed(() => {
-  const status = selectedJob.value?.status
-  if (status === 'pending') return '等待后台执行'
-  if (status === 'running') return '正在生成结果文件'
-  if (status === 'completed') return '结果文件已生成'
-  if (status === 'failed') return '执行失败'
-  if (status === 'cancelled') return '任务已取消'
-  return '正在准备任务'
+  return `${hours} 小时 ${minutes} 分钟 ${seconds} 秒`
 })
 
 const statusLabels: Record<AgentJob['status'], string> = {
@@ -181,6 +167,20 @@ const stepLabels: Record<string, string> = {
   execute_eval_spec: '执行评测任务',
   summarize: '整理评测结果',
 }
+
+function stepLabel(step: AgentStep) {
+  const dynamicLabel = step.output_data.label
+  return typeof dynamicLabel === 'string' && dynamicLabel.trim()
+    ? dynamicLabel
+    : (stepLabels[step.name] ?? step.name)
+}
+
+function stepMeta(step: AgentStep) {
+  if (step.status === 'pending') return '等待执行'
+  const prefix = step.output_data.phase === 'preparation' ? '方案准备' : `第 ${step.attempt} 次`
+  return `${prefix} · ${formatBeijingDateTime(step.started_at)}`
+}
+
 const outputLabels = { xlsx: 'Excel', jsonl: 'JSONL', markdown: 'Markdown', text: '纯文本' }
 const operationLabels: Record<string, string> = {
   normalize: '整理与标准化数据',
@@ -198,6 +198,8 @@ const operationLabels: Record<string, string> = {
   human_review: '提交人工审核',
   summarize: '总结评测结果',
   convert: '转换文件格式',
+  prepare: '准备评测数据',
+  evaluate: '执行评测任务',
   model_map: '使用模型逐行处理',
   http_map: '逐行调用接口',
 }
@@ -245,7 +247,7 @@ const readablePlan = computed(() => {
         : []
       return {
         key: `${type}-${index}`,
-        title: operationLabels[type] ?? `执行步骤 ${index + 1}`,
+        title: String(step.title ?? operationLabels[type] ?? `执行步骤 ${index + 1}`),
         description: String(step.instruction ?? step.note ?? '按照任务配置完成本步骤。'),
         detail: columns.length ? `输出字段：${columns.join('、')}` : '',
       }
@@ -464,10 +466,10 @@ watch(selectedProjectId, (value) => {
 onMounted(async () => {
   viewActive = true
   elapsedTimer = setInterval(() => { currentTime.value = Date.now() }, 1000)
+  void loadRuntime()
   try {
-    const [, , modelResponse] = await Promise.all([
+    const [, modelResponse] = await Promise.all([
       loadProjects(),
-      loadRuntime(),
       api.get<EvaluationModelOption[]>('/evaluation-models'),
     ])
     if (!viewActive) return
@@ -533,15 +535,22 @@ onBeforeUnmount(() => {
           <div class="job-head-actions"><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
         </div>
 
-        <div v-if="!isPythonJob" class="job-progress">
-          <el-progress :percentage="progress" :status="selectedJob.status === 'failed' ? 'exception' : selectedJob.status === 'completed' ? 'success' : undefined" :stroke-width="8" :show-text="false" />
-          <div><span>已上传数据</span><span>生成方案</span><span>执行评测</span><span>整理结果</span></div>
-        </div>
-
-        <div v-else class="python-job-status">
-          <div><span>状态</span><strong class="python-status-value"><el-icon v-if="isActive(selectedJob.status)" class="python-status-spinner"><Loading /></el-icon>{{ statusLabels[selectedJob.status] }}</strong></div>
-          <div><span>已耗时</span><strong>{{ pythonJobElapsed }}</strong></div>
-          <div><span>当前操作</span><strong>{{ pythonCurrentOperation }}</strong></div>
+        <div class="job-progress">
+          <div
+            class="job-progress-line"
+          >
+            <span class="completed-fill" :style="{ width: `${progressSegments.completed}%` }"></span>
+            <span
+              v-if="progressSegments.activeWidth"
+              class="active-fill"
+              :class="progressSegments.activeStatus"
+              :style="{ left: `${progressSegments.activeLeft}%`, width: `${progressSegments.activeWidth}%` }"
+            ></span>
+          </div>
+          <div v-if="currentSteps.length" class="job-progress-labels" :style="{ gridTemplateColumns: `repeat(${currentSteps.length}, minmax(0, 1fr))` }">
+            <span v-for="step in currentSteps" :key="`progress-label-${step.id}`" :class="step.status" :title="stepLabel(step)">{{ stepLabel(step) }}</span>
+          </div>
+          <div v-else class="job-progress-empty">等待任务生成运行步骤</div>
         </div>
 
         <div v-if="selectedJob.status === 'waiting_human'" class="decision-callout">
@@ -551,24 +560,25 @@ onBeforeUnmount(() => {
         <div v-if="selectedJob.error" class="error-callout"><el-icon><WarningFilled /></el-icon><div><strong>任务执行失败</strong><p>{{ selectedJob.error }}</p></div><el-button v-if="canRun" @click="restartJob">重新运行</el-button></div>
 
         <div class="job-facts">
-          <div><span>数据文件</span><strong>{{ selectedFile?.original_name ?? (isPythonJob ? '由任务生成' : '未选择') }}</strong></div>
           <div><span>创建时间（北京时间）</span><strong>{{ formatBeijingDateTime(selectedJob.created_at) }}</strong></div>
+          <div v-if="isPythonJob"><span>执行时间</span><strong>{{ executionElapsed }}</strong></div>
+          <div v-else><span>数据文件</span><strong>{{ selectedFile?.original_name ?? '未选择' }}</strong></div>
           <div><span>结果格式</span><strong>{{ outputLabels[String(selectedJob.input_config.output_format ?? 'xlsx') as keyof typeof outputLabels] ?? '文件' }}</strong></div>
         </div>
 
-        <div v-if="!isPythonJob" class="job-section">
+        <div class="job-section">
           <div class="section-heading"><h2>运行步骤</h2><span>自动刷新</span></div>
           <div v-if="currentSteps.length" class="step-list">
             <div v-for="step in currentSteps" :key="step.id" class="step-row">
               <span class="step-icon" :class="step.status"><el-icon><CircleCheck v-if="step.status === 'completed'" /><WarningFilled v-else-if="step.status === 'failed'" /><Clock v-else /></el-icon></span>
-              <div><strong>{{ stepLabels[step.name] ?? step.name }}</strong><span>第 {{ step.attempt }} 次 · {{ formatBeijingDateTime(step.started_at) }}</span><p v-if="step.error">{{ step.error }}</p></div>
-              <el-tag size="small" :type="step.status === 'completed' ? 'success' : step.status === 'failed' ? 'danger' : 'primary'">{{ step.status === 'completed' ? '完成' : step.status === 'failed' ? '失败' : '进行中' }}</el-tag>
+              <div><strong>{{ stepLabel(step) }}</strong><span>{{ stepMeta(step) }}</span><p v-if="step.error">{{ step.error }}</p></div>
+              <el-tag size="small" :type="step.status === 'completed' ? 'success' : step.status === 'failed' ? 'danger' : step.status === 'running' ? 'primary' : 'info'">{{ step.status === 'completed' ? '完成' : step.status === 'failed' ? '失败' : step.status === 'running' ? '进行中' : '未执行' }}</el-tag>
             </div>
           </div>
           <p v-else class="section-empty">任务启动后，这里会显示每一步的执行状态。</p>
         </div>
 
-        <div v-if="!isPythonJob && Object.keys(selectedJob.eval_spec).length" class="job-section">
+        <div v-if="hasEvaluationPlan" class="job-section">
           <div class="section-heading"><h2>评测方案</h2><span>Agent 生成</span></div>
           <div class="plan-readable">
             <div class="plan-intro"><strong>方案目标</strong><div class="markdown-body" v-html="renderMarkdown(selectedJob.goal)"></div></div>

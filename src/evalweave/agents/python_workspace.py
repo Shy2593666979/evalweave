@@ -18,7 +18,7 @@ from evalweave.core.config import get_settings
 from evalweave.db.models import FileObject
 from evalweave.storage import LocalFileStorage
 
-PYTHON_WORKSPACE_TIMEOUT_SECONDS = 300
+PYTHON_DIALOG_TIMEOUT_SECONDS = 30
 
 
 def _safe_name(name: str, used: set[str]) -> str:
@@ -41,6 +41,7 @@ def run_python_workspace(
     source_file_ids: list[str] | None = None,
     primary_output: str | None = None,
     created_by: UUID | None = None,
+    timeout_seconds: float | None = PYTHON_DIALOG_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if project_id is None:
         raise ValueError("Python 文件工具需要当前项目")
@@ -98,13 +99,13 @@ def run_python_workspace(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=PYTHON_WORKSPACE_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
                 creationflags=flags,
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
             raise ValueError(
-                f"Python 文件工具执行超过 {PYTHON_WORKSPACE_TIMEOUT_SECONDS} 秒"
+                f"Python 文件工具执行超过 {timeout_seconds:g} 秒"
             ) from error
         stdout = completed.stdout[-8000:].strip()
         stderr = completed.stderr[-8000:].strip()

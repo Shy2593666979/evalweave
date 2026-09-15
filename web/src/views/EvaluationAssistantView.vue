@@ -131,17 +131,12 @@ function isOutputFormatAction(action: { type?: string, options?: unknown[] } | u
     && [...outputFormatValues].every((format) => options.has(format))
 }
 
-const showOutputChoices = computed(() => {
-  const action = current.value?.draft.ui_action as { type?: string, options?: unknown[] } | undefined
-  return isOutputFormatAction(action) || current.value?.status === 'choose_output'
-})
 const canStartTask = computed(() => hasRunnableConfig.value
   && Boolean(current.value?.draft.output_format)
   && current.value?.status !== 'started'
   && !streaming.value
   && (
     current.value?.status === 'ready'
-    || (current.value?.draft.ui_action as { type?: string } | undefined)?.type === 'confirm'
     || hasCompleteHumanReviewConfig.value
   )
   && messages.value.at(-1)?.role === 'assistant'
@@ -175,14 +170,12 @@ function shouldShowStartTaskButton(index: number) {
   if (canStartTask.value) return index === lastAssistantIndex.value
   return current.value?.status === 'started' && index === confirmationAssistantIndex.value
 }
-const genericOptions = computed(() => {
-  // While a new reply is streaming, draft.ui_action still belongs to the
-  // previous turn. Do not move those stale buttons onto the new assistant bubble.
-  if (streaming.value) return []
-  const action = current.value?.draft.ui_action as { type?: string, options?: unknown[] } | undefined
+function genericOptionsForMessage(message: AssistantMessage, index: number) {
+  if (streaming.value || index !== lastAssistantIndex.value) return []
+  const action = message.ui_action ?? undefined
   if (action?.type !== 'user_input' || !Array.isArray(action.options) || isOutputFormatAction(action)) return []
   return action.options.map(String)
-})
+}
 const runHeading = computed(() => {
   if (runJob.value?.status === 'completed') return 'Agent 执行完成'
   if (runJob.value?.status === 'failed') return 'Agent 执行未完成'
@@ -322,26 +315,21 @@ function isOutputChoiceMessage(content: string) {
   ))
 }
 
-const outputSelectionMessageIndex = computed(() => {
-  for (let index = messages.value.length - 1; index >= 0; index -= 1) {
-    const message = messages.value[index]
-    if (message?.role === 'user' && isOutputChoiceMessage(message.content)) return index
-  }
-  return -1
-})
+function isOutputChoiceAction(message: AssistantMessage) {
+  return message.role === 'assistant' && isOutputFormatAction(message.ui_action ?? undefined)
+}
 
-const outputChoiceMessageIndex = computed(() => {
-  if (outputSelectionMessageIndex.value >= 0) {
-    for (let previous = outputSelectionMessageIndex.value - 1; previous >= 0; previous -= 1) {
-      if (messages.value[previous]?.role === 'assistant') return previous
-    }
-  }
-  return showOutputChoices.value ? lastAssistantIndex.value : -1
-})
-const outputChoiceSubmitted = computed(() => (
-  outputSelectionMessageIndex.value >= 0
-  || (Boolean(current.value?.draft.output_format) && current.value?.status !== 'choose_output')
-))
+function outputChoiceSubmitted(index: number) {
+  const nextMessage = messages.value[index + 1]
+  return Boolean(nextMessage?.role === 'user' && isOutputChoiceMessage(nextMessage.content))
+}
+
+function isActiveOutputChoice(index: number) {
+  return index === lastAssistantIndex.value
+    && current.value?.status === 'choose_output'
+    && !streaming.value
+    && !outputChoiceSubmitted(index)
+}
 
 async function scrollToBottom() {
   await nextTick()
@@ -657,8 +645,8 @@ function downloadAttachment(fileId?: string | null) {
   if (fileId) window.open(`/api/files/${fileId}/content`, '_blank', 'noopener,noreferrer')
 }
 
-function chooseOutput(value: string, prompt: string) {
-  if (!current.value || streaming.value || outputChoiceSubmitted.value) return
+function chooseOutput(index: number, value: string, prompt: string) {
+  if (!current.value || !isActiveOutputChoice(index)) return
   current.value.draft = { ...current.value.draft, output_format: value }
   void sendMessage(prompt)
 }
@@ -691,6 +679,7 @@ function parseStreamEvent(
     attachment_name?: string | null
     attachment_content_type?: string | null
     attachment_size_bytes?: number | null
+    ui_action?: AssistantMessage['ui_action']
   }
   if (event.type === 'delta') {
     assistant.content = sanitizeAssistantDisplay(assistant.content + (event.content ?? ''))
@@ -737,6 +726,7 @@ function parseStreamEvent(
     assistant.attachment_name = event.attachment_name ?? null
     assistant.attachment_content_type = event.attachment_content_type ?? null
     assistant.attachment_size_bytes = event.attachment_size_bytes ?? null
+    assistant.ui_action = event.ui_action ?? null
     assistant.streaming = false
   }
   return false
@@ -1032,7 +1022,7 @@ watch(
                     <i></i><i></i><i></i>
                   </span>
                 </template>
-                <div v-if="index === outputChoiceMessageIndex" class="bubble-choice-block">
+                <div v-if="isOutputChoiceAction(message)" class="bubble-choice-block">
                   <div class="choice-heading"><strong>结果交付方式</strong><span>选择最适合你的结果格式</span></div>
                   <div class="output-card-grid">
                     <button
@@ -1041,8 +1031,8 @@ watch(
                       type="button"
                       class="output-card"
                       :class="{ selected: current?.draft.output_format === choice.value, muted: current?.draft.output_format && current?.draft.output_format !== choice.value }"
-                      :disabled="outputChoiceSubmitted"
-                      @click="chooseOutput(choice.value, choice.prompt)"
+                      :disabled="!isActiveOutputChoice(index)"
+                      @click="chooseOutput(index, choice.value, choice.prompt)"
                     >
                       <span class="output-card-icon" :class="choice.tone"><component :is="choice.icon" /></span>
                       <span class="output-card-copy"><strong>{{ choice.label }}</strong><small>{{ choice.description }}</small></span>
@@ -1053,8 +1043,8 @@ watch(
                 <div v-if="shouldShowStartTaskButton(index)" class="bubble-task-ready">
                   <el-button type="primary" :loading="starting" :disabled="starting || current?.status === 'started'" @click="startTask">确认并开启</el-button>
                 </div>
-                <div v-if="index === lastAssistantIndex && genericOptions.length" class="bubble-actions react-input-actions">
-                  <button v-for="option in genericOptions" :key="option" @click="sendMessage(option)">{{ option }}</button>
+                <div v-if="genericOptionsForMessage(message, index).length" class="bubble-actions react-input-actions">
+                  <button v-for="option in genericOptionsForMessage(message, index)" :key="option" @click="sendMessage(option)">{{ option }}</button>
                 </div>
                 <button
                   v-if="message.role === 'assistant' && message.attachment_file_id && !isStoredResultMessage(message)"
