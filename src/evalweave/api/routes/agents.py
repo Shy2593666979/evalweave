@@ -1007,6 +1007,7 @@ def start_agent_job(job_id: UUID, _: ExperimentRunner, session: SessionDependenc
         raise HTTPException(status_code=409, detail="Agent job cannot be started in current state")
     job.status = AgentJobStatus.PENDING
     job.error = None
+    job.updated_at = datetime.now(UTC)
     is_python_job = job.input_config.get("job_type") == "python"
     job.eval_spec = {"execution_mode": "python"} if is_python_job else {}
     job.result = {}

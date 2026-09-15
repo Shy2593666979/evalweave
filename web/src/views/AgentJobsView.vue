@@ -4,6 +4,7 @@ import {
   Clock,
   Document,
   Download,
+  Loading,
   Plus,
   Refresh,
   VideoPlay,
@@ -34,7 +35,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api, errorMessage } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import type { AgentJob, AgentRuntime, AgentStep, EvaluationModelOption, FileObject, Project } from '../types/agent'
-import { formatBeijingDateTime } from '../utils/datetime'
+import { formatBeijingDateTime, parseServerDateTime } from '../utils/datetime'
 
 const route = useRoute()
 const router = useRouter()
@@ -125,11 +126,29 @@ const progress = computed(() => {
 const pythonJobElapsed = computed(() => {
   const job = selectedJob.value
   if (!job) return '0 秒'
-  const started = new Date(job.created_at).getTime()
-  const ended = ['completed', 'failed', 'cancelled'].includes(job.status)
-    ? new Date(job.updated_at).getTime()
+  const latestExecutionStep = currentSteps.value.find((step) => step.name === 'execute_python')
+  const executionStep = job.status === 'pending'
+    || (job.status === 'running' && latestExecutionStep?.status !== 'running')
+    ? undefined
+    : latestExecutionStep
+  const fallbackStart = ['pending', 'running'].includes(job.status)
+    ? job.updated_at
+    : job.created_at
+  const started = parseServerDateTime(executionStep?.started_at ?? fallbackStart)?.getTime()
+    ?? currentTime.value
+  const terminal = ['completed', 'failed', 'cancelled'].includes(job.status)
+  const finishedAt = executionStep?.finished_at ?? job.updated_at
+  const ended = terminal
+    ? parseServerDateTime(finishedAt)?.getTime() ?? currentTime.value
     : currentTime.value
-  return `${Math.max(0, Math.floor((ended - started) / 1000))} 秒`
+  const totalSeconds = Math.max(0, Math.floor((ended - started) / 1000))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const seconds = totalSeconds % 60
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  if (totalMinutes < 60) return `${totalMinutes} 分 ${seconds} 秒`
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return `${hours} 小时 ${minutes} 分 ${seconds} 秒`
 })
 
 const pythonCurrentOperation = computed(() => {
@@ -520,7 +539,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else class="python-job-status">
-          <div><span>状态</span><strong>{{ statusLabels[selectedJob.status] }}</strong></div>
+          <div><span>状态</span><strong class="python-status-value"><el-icon v-if="isActive(selectedJob.status)" class="python-status-spinner"><Loading /></el-icon>{{ statusLabels[selectedJob.status] }}</strong></div>
           <div><span>已耗时</span><strong>{{ pythonJobElapsed }}</strong></div>
           <div><span>当前操作</span><strong>{{ pythonCurrentOperation }}</strong></div>
         </div>

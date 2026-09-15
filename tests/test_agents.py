@@ -487,6 +487,7 @@ def test_python_workspace_creates_file_without_input(client: TestClient) -> None
 from pathlib import Path
 
 Path("outputs/generated.csv").write_text("query\\n你好\\n今天天气怎么样\\n", encoding="utf-8")
+print("✅ 文件生成完成")
 """
 
     with Session(get_engine()) as session:
@@ -505,6 +506,7 @@ Path("outputs/generated.csv").write_text("query\\n你好\\n今天天气怎么样
     assert generated.created_by == UUID(creator["id"])
     assert observation["outputs"][0]["file_name"] == "generated.csv"
     assert observation["primary_output_file_id"] == str(generated.id)
+    assert observation["stdout"] == "✅ 文件生成完成"
 
 
 def test_long_python_tool_creates_and_executes_background_job(

@@ -256,6 +256,9 @@ button, input, textarea, select { font: inherit; }
 .python-job-status span, .python-job-status strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .python-job-status span { color: #8193ac; font-size: 12px; }
 .python-job-status strong { margin-top: 5px; color: #304a6f; font-size: 14px; }
+.python-job-status .python-status-value { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.python-status-spinner { flex: 0 0 auto; animation: python-status-spin .9s linear infinite; }
+@keyframes python-status-spin { to { transform: rotate(360deg); } }
 .decision-callout, .error-callout { display: flex; margin-bottom: 18px; padding: 16px 18px; align-items: center; justify-content: space-between; gap: 20px; border-radius: 13px; }
 .decision-callout { color: #5d481e; border: 1px solid #ead396; background: #fff8e8; }
 .decision-callout strong, .decision-callout p, .error-callout strong, .error-callout p { display: block; margin: 0; }

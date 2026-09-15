@@ -91,11 +91,13 @@ def run_python_workspace(
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             completed = subprocess.run(
-                [sys.executable, "-I", str(script)],
+                [sys.executable, "-I", "-X", "utf8", str(script)],
                 cwd=workspace,
                 env=environment,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=PYTHON_WORKSPACE_TIMEOUT_SECONDS,
                 creationflags=flags,
                 check=False,
