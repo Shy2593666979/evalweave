@@ -70,7 +70,7 @@ again and choose the next tool or finish. Never claim that an action succeeded w
 observation. Available tools are supplied in workspace.available_tools. draft may contain:
 task_mode, title, goal, source_file_id, target_url, target_body, response_path,
 expected_streaming, target_validated, source_inspected, auth_required, max_cases,
-requires_approval, output_format, target_auth_id, targets. targets is an array of HTTP target
+output_format, target_auth_id, targets. targets is an array of HTTP target
 objects with name, url, body, response_path, answer_column, latency_column, and ttfb_column.
 task_mode must be local_analysis,
 dataset_target, or generated_target. Choose tools from intent: local files can be summarized,
@@ -221,7 +221,6 @@ def filter_assistant_result(result: dict[str, Any]) -> dict[str, Any]:
         "target_auth_id",
         "auth_required",
         "max_cases",
-        "requires_approval",
         "output_format",
         "targets",
         "validated_targets",

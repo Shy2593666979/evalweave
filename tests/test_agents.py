@@ -6,7 +6,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from evalweave.agents.executor import (
     _tabular_markdown_report,
@@ -25,16 +25,47 @@ from evalweave.agents.inspection import load_source_rows
 from evalweave.agents.model_config import encrypt_secret_payload
 from evalweave.agents.planner import evaluate_target_records
 from evalweave.agents.python_workspace import run_python_workspace
+from evalweave.agents.react_tools import AssistantToolContext, RunPythonTool
 from evalweave.agents.workflow import (
-    execute_agent_job,
+    execute_python_job,
     plan_agent_job,
     validate_http_target_semantics,
     validate_http_target_with_react,
 )
+from evalweave.api.routes.agents import sanitize_assistant_display
 from evalweave.core.config import AgentConfig, get_settings
-from evalweave.db.models import AgentJob, FileObject
+from evalweave.db.models import AgentJob, AgentStep, FileObject
 from evalweave.db.session import get_engine
 from evalweave.storage import LocalFileStorage
+
+
+def test_sanitize_assistant_display_hides_python_workspace_paths() -> None:
+    content = (
+        "文件在 inputs/ 里，直接复制过去并重命名：\n"
+        "文件名已改为 result.xlsx，生成在 outputs/ 目录下"
+    )
+
+    rendered = sanitize_assistant_display(content)
+
+    assert "inputs" not in rendered
+    assert "outputs" not in rendered
+    assert "result.xlsx" in rendered
+
+
+def test_sanitize_assistant_display_removes_guessed_file_download_url() -> None:
+    content = (
+        "文件正常了。\n\n"
+        "📄 **文件下载：** [结果.xlsx]"
+        "(http://example.com/dev/api/project/111/file/222)\n\n"
+        "50 条数据均已完成。"
+    )
+
+    rendered = sanitize_assistant_display(content)
+
+    assert "文件下载" not in rendered
+    assert "http://" not in rendered
+    assert "文件正常了" in rendered
+    assert "50 条数据均已完成" in rendered
 
 
 def login_as_developer(client: TestClient) -> None:
@@ -56,7 +87,7 @@ def login_as_developer(client: TestClient) -> None:
     assert response.status_code == 200
 
 
-def test_agent_plans_waits_for_human_and_resumes(client: TestClient, monkeypatch) -> None:
+def test_agent_plans_and_executes_without_scheme_approval(client: TestClient) -> None:
     login_as_developer(client)
     runtime = client.get("/api/agent/runtime")
     assert runtime.status_code == 200
@@ -88,35 +119,21 @@ def test_agent_plans_waits_for_human_and_resumes(client: TestClient, monkeypatch
 
     plan_agent_job(job_id)
     planned = client.get(f"/api/agent-jobs/{job_id}").json()
-    assert planned["status"] == "waiting_human"
+    assert planned["status"] == "completed"
     assert planned["eval_spec"]["source"]["fields"] == ["scene", "user_message"]
+    assert planned["requires_approval"] is False
 
     steps = client.get(f"/api/agent-jobs/{job_id}/steps").json()
-    assert [step["name"] for step in steps] == ["discover_source", "generate_eval_spec"]
+    assert [step["name"] for step in steps] == [
+        "discover_source",
+        "generate_eval_spec",
+        "execute_eval_spec",
+        "summarize",
+    ]
 
     tasks = client.get("/api/human-tasks?task_status=pending").json()
-    assert len(tasks) == 1
-    deliveries = client.get(f"/api/human-tasks/{tasks[0]['id']}/deliveries").json()
-    assert deliveries[0]["status"] == "failed"
-    assert "not configured" in deliveries[0]["error"]
-
-    queued: list[tuple[str, UUID]] = []
-    monkeypatch.setattr(
-        "evalweave.api.routes.agents.enqueue_agent_task",
-        lambda name, identifier: queued.append((name, identifier)),
-    )
-    decision = client.post(
-        f"/api/human-tasks/{tasks[0]['id']}/decision",
-        json={"decision": "approve", "reason": "Plan looks good"},
-    )
-    assert decision.status_code == 200
-    assert decision.json()["status"] == "approved"
-    assert queued == [("evalweave.agent.execute", job_id)]
-
-    execute_agent_job(job_id)
-    completed = client.get(f"/api/agent-jobs/{job_id}").json()
-    assert completed["status"] == "completed"
-    assert completed["result"]["execution"]["execution_mode"] == "local_data"
+    assert tasks == []
+    assert planned["result"]["execution"]["execution_mode"] == "local_data"
 
 
 def test_agent_assistant_returns_a_job_draft(client: TestClient, monkeypatch) -> None:
@@ -460,6 +477,85 @@ workbook.close()
 
     assert observation["outputs"][0]["file_name"] == "cleaned.xlsx"
     assert rows == [{"input": "你好", "output": "您好"}]
+
+
+def test_python_workspace_creates_file_without_input(client: TestClient) -> None:
+    login_as_developer(client)
+    creator = client.get("/api/auth/me").json()
+    project = client.post("/api/projects", json={"name": "Generated Python workspace"}).json()
+    code = """
+from pathlib import Path
+
+Path("outputs/generated.csv").write_text("query\\n你好\\n今天天气怎么样\\n", encoding="utf-8")
+"""
+
+    with Session(get_engine()) as session:
+        observation, updates = run_python_workspace(
+            session,
+            UUID(project["id"]),
+            {},
+            code,
+            source_file_ids=[],
+            primary_output="generated.csv",
+            created_by=UUID(creator["id"]),
+        )
+        generated = session.get(FileObject, UUID(updates["source_file_id"]))
+
+    assert generated is not None
+    assert generated.created_by == UUID(creator["id"])
+    assert observation["outputs"][0]["file_name"] == "generated.csv"
+    assert observation["primary_output_file_id"] == str(generated.id)
+
+
+def test_long_python_tool_creates_and_executes_background_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login_as_developer(client)
+    creator = client.get("/api/auth/me").json()
+    project = client.post("/api/projects", json={"name": "Python job"}).json()
+    queued: list[UUID] = []
+    monkeypatch.setattr(
+        "evalweave.agents.react_tools.enqueue_python_job", queued.append
+    )
+    context = AssistantToolContext(
+        draft={"title": "批量生成文件", "goal": "在后台生成结果文件"},
+        project_id=UUID(project["id"]),
+        actor_id=UUID(creator["id"]),
+    )
+
+    result = json.loads(
+        RunPythonTool().run(
+            context,
+            code=(
+                "from pathlib import Path\n"
+                'Path("outputs/result.txt").write_text("done", encoding="utf-8")\n'
+            ),
+            source_file_ids=[],
+            primary_output="result.txt",
+            run_as_job=True,
+        )
+    )
+
+    job_id = UUID(result["job_id"])
+    assert queued == [job_id]
+    assert result["queued"] is True
+    assert context.ui_action == {
+        "type": "background_job",
+        "job_id": str(job_id),
+        "path": f"/evaluations/{job_id}",
+    }
+
+    execute_python_job(job_id)
+
+    with Session(get_engine()) as session:
+        job = session.get(AgentJob, job_id)
+        steps = list(session.exec(select(AgentStep).where(AgentStep.job_id == job_id)))
+        output = session.get(FileObject, job.result_file_id) if job else None
+    assert job is not None
+    assert job.status.value == "completed"
+    assert output is not None
+    assert output.original_name == "result.txt"
+    assert [step.name for step in steps] == ["execute_python"]
 
 
 def test_agent_generates_cases_when_http_target_has_no_source_file(
@@ -872,6 +968,7 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
         running = {"name": "probe_http_target", "label": "验证目标接口", "status": "running"}
         completed = {**running, "status": "completed", "summary": {"status_code": 200}}
         yield "delta", "The endpoint is reachable. "
+        yield "round_end", None
         yield "tool_start", running
         yield "tool_result", completed
         yield "delta", "Choose a delivery format."
@@ -900,18 +997,55 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
     assert [event["type"] for event in events] == [
         "start",
         "delta",
+        "round_end",
         "tool_start",
         "tool_result",
         "delta",
         "done",
     ]
-    assert events[-1]["content"] == "The endpoint is reachable. Choose a delivery format."
+    assert events[-1]["content"] == "Choose a delivery format."
     assert events[-1]["stage"] == "choose_output"
     assert events[-1]["draft"]["react_trace"][0]["status"] == "completed"
     stored_messages = client.get(
         f"/api/assistant/conversations/{conversation['id']}/messages"
     ).json()
+    assert stored_messages[-2]["content"] == "The endpoint is reachable."
+    assert stored_messages[-2]["include_in_context"] is False
     assert stored_messages[-1]["content"] == events[-1]["content"]
+    assert stored_messages[-1]["include_in_context"] is True
+    assert stored_messages[-1]["is_streaming"] is False
+
+    snapshot_response = client.get(
+        f"/api/assistant/conversations/{conversation['id']}/messages/events"
+    )
+    snapshot_line = next(
+        line for line in snapshot_response.text.splitlines() if line.startswith("data: ")
+    )
+    snapshot = json.loads(snapshot_line.removeprefix("data: "))
+    assert snapshot[-2]["include_in_context"] is False
+    assert snapshot[-1]["is_streaming"] is False
+
+    captured_history = []
+
+    def capture_react(_config, messages, *_args):
+        captured_history.extend(messages)
+        yield "result", {
+            "reply": "Next final reply.",
+            "draft": {},
+            "ui_action": None,
+            "react_trace": [],
+        }
+
+    monkeypatch.setattr(
+        "evalweave.api.routes.agents.stream_react_configuration", capture_react
+    )
+    client.post(
+        f"/api/assistant/conversations/{conversation['id']}/messages/stream",
+        json={"content": "Continue"},
+    )
+    context_contents = [message["content"] for message in captured_history]
+    assert "The endpoint is reachable." not in context_contents
+    assert "Choose a delivery format." in context_contents
 
 
 def test_assistant_user_input_keeps_conversation_collecting(

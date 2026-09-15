@@ -22,7 +22,8 @@ from evalweave.agents.inspection import inspect_source
 from evalweave.agents.model_config import encrypt_secret_payload
 from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.core.config import TargetAuthFlowConfig, get_settings
-from evalweave.db.models import FileObject
+from evalweave.db.models import AgentJob, AgentJobStatus, FileObject
+from evalweave.notifications import send_wecom, send_wecom_file
 from evalweave.storage import LocalFileStorage
 
 ASSISTANT_TOOLS = [
@@ -52,6 +53,7 @@ ASSISTANT_TOOLS = [
 class AssistantToolContext:
     draft: dict[str, Any]
     project_id: UUID | None
+    actor_id: UUID | None = None
     ui_action: dict[str, Any] | None = None
     trace: list[dict[str, Any]] = field(default_factory=list)
     reviewer_type_counts: dict[str, int] | None = None
@@ -98,7 +100,6 @@ class UpdateTaskDraftTool(BaseAssistantTool):
             "expected_streaming": {"type": "boolean"},
             "auth_required": {"type": "boolean"},
             "max_cases": {"type": "integer", "minimum": 1, "maximum": 10000},
-            "requires_approval": {"type": "boolean"},
             "output_format": {"type": "string", "enum": ["xlsx", "jsonl", "markdown", "text"]},
             "reviewer_type_codes": {
                 "type": "array",
@@ -183,10 +184,14 @@ class InspectSourceTool(BaseAssistantTool):
 class RunPythonTool(BaseAssistantTool):
     name = "run_python"
     description = (
-        "在临时 Python 工作区中处理当前项目文件。输入文件位于 inputs/，manifest.json 描述文件映射；"
+        "在临时 Python 工作区中创建或处理当前项目文件。"
+        "没有输入文件时 inputs/ 为空，也可以直接运行；"
+        "有输入文件时 manifest.json 描述 inputs/ 文件映射。"
         "脚本可使用 Python 标准库和项目已安装依赖，并应把新文件写入 outputs/。"
-        "适用于任意清洗、JSON 解包、列转换、合并、拆分或格式修复。用户要求修改文件时直接调用，"
-        "不得声称没有脚本或要求用户自行修改后重传。"
+        "适用于从零生成数据，以及任意清洗、JSON 解包、列转换、合并、拆分或格式修复。"
+        "用户要求创建或修改文件时直接调用，不得要求用户先上传空白载体。"
+        "预计超过 30 秒、包含批量接口调用或属于批量评测时，设置 run_as_job=true，"
+        "任务会交给后台 Worker，避免对话一直等待。"
     )
     parameters = {
         "type": "object",
@@ -195,12 +200,22 @@ class RunPythonTool(BaseAssistantTool):
             "source_file_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "输入文件 ID；省略时使用当前 source_file_id。",
+                "description": (
+                    "输入文件 ID；省略时使用当前 source_file_id，"
+                    "传空数组表示不使用输入文件。"
+                ),
                 "maxItems": 8,
             },
             "primary_output": {
                 "type": "string",
                 "description": "outputs/ 下作为后续任务数据源的文件名；默认使用第一个输出。",
+            },
+            "run_as_job": {
+                "type": "boolean",
+                "description": (
+                    "预计耗时超过 30 秒、包含批量接口调用或属于批量评测时设为 true；"
+                    "普通重命名、格式转换和短文件处理设为 false。"
+                ),
             },
         },
         "required": ["code"],
@@ -208,14 +223,88 @@ class RunPythonTool(BaseAssistantTool):
     }
 
     def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        raw_source_file_ids = kwargs.get("source_file_ids")
+        source_file_ids = (
+            [str(item) for item in raw_source_file_ids]
+            if isinstance(raw_source_file_ids, list)
+            else None
+        )
+        if bool(kwargs.get("run_as_job")):
+            if context.project_id is None or context.actor_id is None:
+                raise ValueError("Python 后台任务需要当前项目和执行用户")
+            code = str(kwargs.get("code", ""))
+            if not code.strip():
+                raise ValueError("Python 文件工具需要可执行脚本")
+            resolved_source_ids = source_file_ids
+            if resolved_source_ids is None:
+                current_source_id = str(context.draft.get("source_file_id") or "")
+                resolved_source_ids = [current_source_id] if current_source_id else []
+            primary_output = str(kwargs.get("primary_output") or "") or None
+            extension = Path(primary_output or "").suffix.lower()
+            output_format = {
+                ".xlsx": "xlsx",
+                ".jsonl": "jsonl",
+                ".md": "markdown",
+                ".markdown": "markdown",
+                ".txt": "text",
+            }.get(extension, "file")
+            title = str(context.draft.get("title") or "Python 后台任务").strip()[:128]
+            goal = str(context.draft.get("goal") or title).strip()
+            with Session(get_settings_engine()) as session:
+                job = AgentJob(
+                    project_id=context.project_id,
+                    created_by=context.actor_id,
+                    source_file_id=(
+                        UUID(resolved_source_ids[0]) if resolved_source_ids else None
+                    ),
+                    title=title,
+                    goal=goal,
+                    status=AgentJobStatus.PENDING,
+                    input_config={
+                        "job_type": "python",
+                        "python_code": code,
+                        "source_file_ids": resolved_source_ids,
+                        "primary_output": primary_output,
+                        "output_format": output_format,
+                    },
+                    eval_spec={"execution_mode": "python"},
+                    requires_approval=False,
+                )
+                session.add(job)
+                session.commit()
+                session.refresh(job)
+                try:
+                    enqueue_python_job(job.id)
+                except Exception as error:
+                    job.status = AgentJobStatus.FAILED
+                    job.error = f"后台任务提交失败：{error}"[:4000]
+                    session.add(job)
+                    session.commit()
+                    raise ValueError(job.error) from error
+            context.draft["background_job_id"] = str(job.id)
+            context.ui_action = {
+                "type": "background_job",
+                "job_id": str(job.id),
+                "path": f"/evaluations/{job.id}",
+            }
+            return json.dumps(
+                {
+                    "ok": True,
+                    "queued": True,
+                    "job_id": str(job.id),
+                    "status": "pending",
+                },
+                ensure_ascii=False,
+            )
         with Session(get_settings_engine()) as session:
             observation, updates = run_python_workspace(
                 session,
                 context.project_id,
                 context.draft,
                 str(kwargs.get("code", "")),
-                [str(item) for item in kwargs.get("source_file_ids", [])] or None,
+                source_file_ids,
                 str(kwargs.get("primary_output") or "") or None,
+                created_by=context.actor_id,
             )
         context.draft.update(updates)
         return json.dumps({"ok": True, **observation}, ensure_ascii=False)
@@ -263,6 +352,88 @@ class ProbeHttpTargetTool(BaseAssistantTool):
             )
         context.draft.update(updates)
         return json.dumps({"ok": True, **observation}, ensure_ascii=False)
+
+
+class SendWeComMessageTool(BaseAssistantTool):
+    name = "send_wecom_message"
+    description = (
+        "仅当用户明确要求发送企业微信消息时调用企业微信群机器人。"
+        "支持 text、markdown 和当前项目中的 file，不支持图片。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "message_type": {
+                "type": "string",
+                "enum": ["text", "markdown", "file"],
+            },
+            "content": {
+                "type": "string",
+                "description": "文本或 Markdown 正文；发送文件时可省略。",
+            },
+            "recipient": {
+                "type": "string",
+                "description": "可选的企业微信用户 ID；文本消息会提醒该成员。",
+            },
+            "source_file_id": {
+                "type": "string",
+                "description": "发送文件时使用的当前项目文件 ID。",
+            },
+        },
+        "required": ["message_type"],
+        "additionalProperties": False,
+    }
+
+    def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        message_type = str(kwargs.get("message_type") or "").strip().lower()
+        if message_type == "file":
+            raw_file_id = kwargs.get("source_file_id") or context.draft.get(
+                "source_file_id"
+            )
+            if not raw_file_id:
+                raise ValueError("发送企业微信文件需要 source_file_id")
+            if context.project_id is None:
+                raise ValueError("发送企业微信文件需要先选择项目")
+            try:
+                file_id = UUID(str(raw_file_id))
+            except ValueError as error:
+                raise ValueError("企业微信文件 ID 无效") from error
+            with Session(get_settings_engine()) as session:
+                file_object = session.get(FileObject, file_id)
+                if file_object is None or file_object.project_id != context.project_id:
+                    raise ValueError("待发送文件不存在或不属于当前项目")
+                path = LocalFileStorage(
+                    get_settings().storage.local_directory
+                ).path_for(file_object.storage_key)
+                provider_message_id = send_wecom_file(path, file_object.original_name)
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "message_type": "file",
+                        "file_id": str(file_object.id),
+                        "file_name": file_object.original_name,
+                        "provider_message_id": provider_message_id,
+                    },
+                    ensure_ascii=False,
+                )
+        if message_type not in {"text", "markdown"}:
+            raise ValueError("企业微信仅支持 text、markdown、file 消息")
+        content = str(kwargs.get("content") or "").strip()
+        if not content:
+            raise ValueError("发送企业微信文本消息需要 content")
+        provider_message_id = send_wecom(
+            content,
+            str(kwargs.get("recipient") or "").strip(),
+            message_type=message_type,
+        )
+        return json.dumps(
+            {
+                "ok": True,
+                "message_type": message_type,
+                "provider_message_id": provider_message_id,
+            },
+            ensure_ascii=False,
+        )
 
 
 class RequestOutputFormatTool(BaseAssistantTool):
@@ -356,10 +527,17 @@ ASSISTANT_TOOL_REGISTRY: list[BaseAssistantTool] = [
     InspectSourceTool(),
     RunPythonTool(),
     ProbeHttpTargetTool(),
+    SendWeComMessageTool(),
     RequestOutputFormatTool(),
     RequestConfirmationTool(),
     RequestUserInputTool(),
 ]
+
+
+def enqueue_python_job(job_id: UUID) -> None:
+    from evalweave.workers.factory import create_celery_app
+
+    create_celery_app().send_task("evalweave.python.run", args=[str(job_id)])
 
 
 def _reviewer_availability_error(context: AssistantToolContext) -> str | None:
@@ -583,6 +761,7 @@ def tool_label(name: str) -> str:
         "inspect_source": "检查数据文件",
         "run_python": "运行 Python 文件处理",
         "probe_http_target": "验证目标接口",
+        "send_wecom_message": "发送企业微信消息",
         "request_output_format": "请求选择交付方式",
         "request_confirmation": "请求确认任务",
         "request_user_input": "请求补充信息",

@@ -132,7 +132,7 @@ class AgentJob(TimestampMixin, table=True):
     error: str | None = Field(default=None, sa_column=Column(Text))
     repair_attempts: int = Field(default=0, ge=0)
     max_repair_attempts: int = Field(default=3, ge=0)
-    requires_approval: bool = Field(default=True, nullable=False)
+    requires_approval: bool = Field(default=False, nullable=False)
 
 
 class EvaluationModel(TimestampMixin, table=True):
@@ -166,6 +166,8 @@ class AssistantMessage(TimestampMixin, table=True):
     conversation_id: UUID = Field(foreign_key="assistant_conversations.id", index=True)
     role: str = Field(max_length=16)
     content: str = Field(sa_column=Column(Text, nullable=False))
+    include_in_context: bool = Field(default=True, nullable=False)
+    is_streaming: bool = Field(default=False, nullable=False)
     attachment_file_id: UUID | None = Field(
         default=None, foreign_key="file_objects.id", index=True
     )

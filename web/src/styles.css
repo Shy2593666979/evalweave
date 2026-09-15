@@ -250,6 +250,12 @@ button, input, textarea, select { font: inherit; }
 .job-id { color: #7691b5; font: 650 12px/1.4 monospace; }
 .job-progress { margin: 25px 0 22px; }
 .job-progress > div:last-child { display: flex; margin-top: 9px; justify-content: space-between; color: #8191a8; font-size: 12px; }
+.python-job-status { display: grid; margin: 25px 0 22px; grid-template-columns: repeat(3,minmax(0,1fr)); overflow: hidden; border: 1px solid #d7e5f5; border-radius: 13px; background: #f7faff; }
+.python-job-status > div { min-width: 0; padding: 14px 16px; text-align: center; }
+.python-job-status > div:not(:last-child) { border-right: 1px solid #dce8f6; }
+.python-job-status span, .python-job-status strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.python-job-status span { color: #8193ac; font-size: 12px; }
+.python-job-status strong { margin-top: 5px; color: #304a6f; font-size: 14px; }
 .decision-callout, .error-callout { display: flex; margin-bottom: 18px; padding: 16px 18px; align-items: center; justify-content: space-between; gap: 20px; border-radius: 13px; }
 .decision-callout { color: #5d481e; border: 1px solid #ead396; background: #fff8e8; }
 .decision-callout strong, .decision-callout p, .error-callout strong, .error-callout p { display: block; margin: 0; }
@@ -259,11 +265,9 @@ button, input, textarea, select { font: inherit; }
 .error-callout { justify-content: flex-start; color: #873c43; border: 1px solid #efc5c8; background: #fff2f3; }
 .error-callout > div { min-width: 0; flex: 1; }
 .error-callout p { overflow-wrap: anywhere; color: #a05f64; }
-.job-facts { display: grid; margin: 20px 0 4px; grid-template-columns: repeat(2,minmax(0,1fr)); border: 1px solid #d7e5f5; border-radius: 13px; background: #f7faff; }
-.job-facts > div { min-width: 0; padding: 14px 16px; }
+.job-facts { display: grid; margin: 20px 0 4px; grid-template-columns: repeat(3,minmax(0,1fr)); border: 1px solid #d7e5f5; border-radius: 13px; background: #f7faff; }
+.job-facts > div { min-width: 0; padding: 14px 16px; text-align: center; }
 .job-facts > div:not(:last-child) { border-right: 1px solid #dce8f6; }
-.job-facts > div:nth-child(2) { border-right: 0; }
-.job-facts > div:nth-child(-n+2) { border-bottom: 1px solid #dce8f6; }
 .job-facts span, .job-facts strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-facts span { color: #8193ac; font-size: 12px; }
 .job-facts strong { margin-top: 5px; color: #304a6f; font-size: 13px; }
@@ -735,9 +739,10 @@ button, input, textarea, select { font: inherit; }
   .project-bar, .data-actions { align-items: stretch; flex-direction: column; }
   .agent-workspace { grid-template-columns: 1fr; }
   .job-detail { padding: 20px 16px; }
-  .job-facts { grid-template-columns: 1fr 1fr; }
-  .job-facts > div:nth-child(2) { border-right: 0; }
-  .job-facts > div:nth-child(-n+2) { border-bottom: 1px solid #dce8f6; }
+  .job-facts { grid-template-columns: 1fr; }
+  .job-facts > div:not(:last-child) { border-right: 0; border-bottom: 1px solid #dce8f6; }
+  .python-job-status { grid-template-columns: 1fr; }
+  .python-job-status > div:not(:last-child) { border-right: 0; border-bottom: 1px solid #dce8f6; }
   .form-grid { grid-template-columns: 1fr; gap: 0; }
   .review-summary { grid-template-columns: 1fr 1fr; }
   .review-summary p { grid-column: 1 / -1; }

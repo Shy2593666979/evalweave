@@ -18,6 +18,8 @@ from evalweave.core.config import get_settings
 from evalweave.db.models import FileObject
 from evalweave.storage import LocalFileStorage
 
+PYTHON_WORKSPACE_TIMEOUT_SECONDS = 300
+
 
 def _safe_name(name: str, used: set[str]) -> str:
     candidate = Path(name).name or "input"
@@ -38,15 +40,18 @@ def run_python_workspace(
     code: str,
     source_file_ids: list[str] | None = None,
     primary_output: str | None = None,
+    created_by: UUID | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if project_id is None:
         raise ValueError("Python 文件工具需要当前项目")
     if not code.strip():
         raise ValueError("Python 文件工具需要可执行脚本")
-    requested_ids = source_file_ids or [str(draft.get("source_file_id") or "")]
+    requested_ids = (
+        source_file_ids
+        if source_file_ids is not None
+        else [str(draft.get("source_file_id") or "")]
+    )
     requested_ids = [item for item in requested_ids if item]
-    if not requested_ids:
-        raise ValueError("Python 文件工具需要至少一个项目文件")
     sources: list[FileObject] = []
     for raw_id in requested_ids:
         try:
@@ -91,12 +96,14 @@ def run_python_workspace(
                 env=environment,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=PYTHON_WORKSPACE_TIMEOUT_SECONDS,
                 creationflags=flags,
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
-            raise ValueError("Python 文件工具执行超过 60 秒") from error
+            raise ValueError(
+                f"Python 文件工具执行超过 {PYTHON_WORKSPACE_TIMEOUT_SECONDS} 秒"
+            ) from error
         stdout = completed.stdout[-8000:].strip()
         stderr = completed.stderr[-8000:].strip()
         if completed.returncode != 0:
@@ -106,6 +113,9 @@ def run_python_workspace(
         output_paths = sorted(path for path in outputs.rglob("*") if path.is_file())
         if len(output_paths) > 16:
             raise ValueError("Python 文件工具一次最多生成 16 个文件")
+        output_owner_id = sources[0].created_by if sources else created_by
+        if output_paths and output_owner_id is None:
+            raise ValueError("Python 文件工具缺少输出文件创建者")
         created: list[FileObject] = []
         max_bytes = get_settings().evaluation.max_file_size_mb * 1024 * 1024
         for output_path in output_paths:
@@ -118,7 +128,7 @@ def run_python_workspace(
             file_object = FileObject(
                 id=file_id,
                 project_id=project_id,
-                created_by=sources[0].created_by,
+                created_by=output_owner_id,
                 category="dataset_source",
                 original_name=relative_name,
                 storage_key=storage_key,

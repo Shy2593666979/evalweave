@@ -71,6 +71,7 @@ def test_chat_completion_react_loop_dispatches_tools(monkeypatch) -> None:
 
     result = events[-1][1]
     assert [event[0] for event in events] == [
+        "round_end",
         "tool_start",
         "tool_result",
         "delta",

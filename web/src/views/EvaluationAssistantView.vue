@@ -59,6 +59,8 @@ const runEvents = ref<AgentJobEvent[]>([])
 let viewActive = false
 let runEventSource: EventSource | null = null
 let runEventJobId = ''
+let assistantMessageEventSource: EventSource | null = null
+let assistantMessageConversationId = ''
 let conversationSelectionVersion = 0
 
 function runJobRenderKey(job: AgentJob | null) {
@@ -185,7 +187,7 @@ const runHeading = computed(() => {
   if (runJob.value?.status === 'completed') return 'Agent 执行完成'
   if (runJob.value?.status === 'failed') return 'Agent 执行未完成'
   if (runJob.value?.status === 'cancelled') return 'Agent 执行已取消'
-  if (runJob.value?.status === 'waiting_human') return 'Agent 等待确认'
+  if (runJob.value?.status === 'waiting_human') return '人工评审进行中'
   return 'Agent 正在执行'
 })
 const showRunError = computed(() => Boolean(
@@ -396,6 +398,7 @@ async function selectConversation(conversation: AssistantConversation) {
   try {
   if (current.value) conversationInputDrafts.set(current.value.id, input.value)
   stopRunEventStream()
+  stopAssistantMessageEventStream()
   runJob.value = null
   runSteps.value = []
   runEvents.value = []
@@ -445,10 +448,17 @@ async function selectConversation(conversation: AssistantConversation) {
   // Commit the complete conversation in one render. Inserting the run timeline
   // after the messages were already visible caused a second layout and a jump.
   files.value = loadedFiles
-  messages.value = loadedMessages
+  messages.value = loadedMessages.map((message) => ({
+    ...message,
+    content: message.role === 'assistant' ? sanitizeAssistantDisplay(message.content) : message.content,
+    streaming: Boolean(message.is_streaming),
+  }))
   runJob.value = loadedRun?.job ?? null
   runSteps.value = loadedRun?.steps ?? []
   await scrollToBottom()
+  if (loadedMessages.some((message) => message.is_streaming)) {
+    startAssistantMessageEventStream(conversationId)
+  }
   if (selectionVersion !== conversationSelectionVersion || current.value?.id !== conversationId) return
   if (
     conversation.agent_job_id
@@ -460,6 +470,46 @@ async function selectConversation(conversation: AssistantConversation) {
   } finally {
     if (selectionVersion === conversationSelectionVersion && current.value?.id === conversationId) {
       conversationSwitching.value = false
+    }
+  }
+}
+
+function stopAssistantMessageEventStream() {
+  assistantMessageEventSource?.close()
+  assistantMessageEventSource = null
+  assistantMessageConversationId = ''
+}
+
+function startAssistantMessageEventStream(conversationId: string) {
+  if (
+    assistantMessageConversationId === conversationId
+    && assistantMessageEventSource
+  ) return
+  stopAssistantMessageEventStream()
+  assistantMessageConversationId = conversationId
+  const source = new EventSource(
+    `/api/assistant/conversations/${conversationId}/messages/events`,
+  )
+  assistantMessageEventSource = source
+  source.onmessage = (event) => {
+    if (
+      assistantMessageConversationId !== conversationId
+      || current.value?.id !== conversationId
+      || conversationMessageBuffers.has(conversationId)
+    ) return
+    try {
+      const items = JSON.parse(event.data) as AssistantMessage[]
+      messages.value = items.map((message) => ({
+        ...message,
+        content: message.role === 'assistant' ? sanitizeAssistantDisplay(message.content) : message.content,
+        streaming: Boolean(message.is_streaming),
+      }))
+      void scrollToBottom()
+      if (!items.some((message) => message.is_streaming)) {
+        stopAssistantMessageEventStream()
+      }
+    } catch {
+      // Ignore a malformed snapshot; the next server snapshot will replace it.
     }
   }
 }
@@ -594,6 +644,15 @@ function formatFileSize(size?: number | null) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
+function sanitizeAssistantDisplay(content: string) {
+  return content
+    .replace(/^[ \t]*(?:📄[ \t]*)?(?:\*\*)?文件下载[：:](?:\*\*)?[ \t]*\[[^\]\r\n]+\]\((?:https?:\/\/[^)\s]+)?[^)\r\n]*\/api\/(?:projects?|files?)\/[^)\r\n]+\)[ \t]*\r?\n?/gim, '')
+    .replace(/\[([^\]\r\n]+)\]\((?:https?:\/\/[^)\s]+)?[^)\r\n]*\/api\/(?:projects?|files?)\/[^)\r\n]+\)/gi, '$1')
+    .replace(/文件在\s*[`*]*(?:inputs?)[\\/][`*]*\s*(?:里|中)?[，,]?\s*直接复制过去并重命名[：:]?/gi, '正在重命名文件：')
+    .replace(/[，,]?\s*(?:生成|保存|写入)(?:在|到)\s*[`*]*(?:outputs?)[\\/][`*]*\s*(?:目录)?(?:下|中)?/gi, '，文件已生成')
+    .replace(/[`*]*(?:inputs?|outputs?)[\\/][`*]*/gi, '')
+}
+
 function downloadAttachment(fileId?: string | null) {
   if (fileId) window.open(`/api/files/${fileId}/content`, '_blank', 'noopener,noreferrer')
 }
@@ -619,10 +678,10 @@ function parseStreamEvent(
   line: string,
   assistant: AssistantMessage,
   conversation: AssistantConversation,
-) {
-  if (!line.trim()) return
+): boolean {
+  if (!line.trim()) return false
   const event = JSON.parse(line) as {
-    type: 'start' | 'delta' | 'tool_start' | 'tool_result' | 'done' | 'error'
+    type: 'start' | 'delta' | 'round_end' | 'tool_start' | 'tool_result' | 'done' | 'error'
     content?: string
     message?: string
     draft?: Record<string, unknown>
@@ -633,7 +692,13 @@ function parseStreamEvent(
     attachment_content_type?: string | null
     attachment_size_bytes?: number | null
   }
-  if (event.type === 'delta') assistant.content += event.content ?? ''
+  if (event.type === 'delta') {
+    assistant.content = sanitizeAssistantDisplay(assistant.content + (event.content ?? ''))
+  }
+  if (event.type === 'round_end') {
+    assistant.streaming = false
+    return true
+  }
   if (event.type === 'tool_start' && event.tool) {
     assistant.react_trace = [...(assistant.react_trace ?? []), event.tool]
   }
@@ -653,11 +718,7 @@ function parseStreamEvent(
   if (event.type === 'error') throw new Error(event.message || '助手回复失败')
   if (event.type === 'done') {
     if (typeof event.content === 'string') {
-      // New servers return the complete accumulated stream. With an older
-      // server, do not let its final-turn-only payload erase earlier deltas.
-      if (!assistant.content || event.content.startsWith(assistant.content)) {
-        assistant.content = event.content
-      }
+      assistant.content = sanitizeAssistantDisplay(event.content)
     }
     const draft = event.draft ?? {}
     const status = event.stage ?? 'collecting'
@@ -672,13 +733,13 @@ function parseStreamEvent(
       current.value.draft = draft
       current.value.status = status
     }
-    assistant.react_trace = (conversation.draft.react_trace as ReactToolStep[] | undefined) ?? assistant.react_trace
     assistant.attachment_file_id = event.attachment_file_id ?? null
     assistant.attachment_name = event.attachment_name ?? null
     assistant.attachment_content_type = event.attachment_content_type ?? null
     assistant.attachment_size_bytes = event.attachment_size_bytes ?? null
     assistant.streaming = false
   }
+  return false
 }
 
 async function sendMessage(text = input.value) {
@@ -695,7 +756,7 @@ async function sendMessage(text = input.value) {
   const conversationId = conversation.id
   const conversationMessages = messages.value
   const attachedSourceFileId = sourceFileId.value
-  const assistant = reactive<AssistantMessage>({ role: 'assistant', content: '', streaming: true })
+  let assistant = reactive<AssistantMessage>({ role: 'assistant', content: '', streaming: true })
   conversationMessages.push({
     role: 'user',
     content,
@@ -735,7 +796,18 @@ async function sendMessage(text = input.value) {
       buffer += decoder.decode(value, { stream: !done })
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
-      for (const line of lines) parseStreamEvent(line, assistant, conversation)
+      for (const line of lines) {
+        if (parseStreamEvent(line, assistant, conversation)) {
+          if (
+            !assistant.content.trim()
+            && conversationMessages.at(-1) === assistant
+          ) {
+            conversationMessages.pop()
+          }
+          assistant = reactive<AssistantMessage>({ role: 'assistant', content: '', streaming: true })
+          conversationMessages.push(assistant)
+        }
+      }
       if (current.value?.id === conversationId) await scrollToBottom()
       if (done) break
     }
@@ -748,6 +820,13 @@ async function sendMessage(text = input.value) {
   } finally {
     setConversationStreaming(conversationId, false)
     assistant.streaming = false
+    if (
+      !assistant.content.trim()
+      && !assistant.attachment_file_id
+      && conversationMessages.at(-1) === assistant
+    ) {
+      conversationMessages.pop()
+    }
     conversationMessageBuffers.delete(conversationId)
   }
 }
@@ -793,7 +872,6 @@ async function startTask() {
       title,
       goal,
       source_file_id: taskSourceFileId || null,
-      requires_approval: false,
       output_format: outputFormat,
       evaluation_model_id: modelId.value || null,
       input_config: inputConfig,
@@ -869,6 +947,7 @@ onUnmounted(() => {
   viewActive = false
   conversationSelectionVersion += 1
   stopRunEventStream()
+  stopAssistantMessageEventStream()
 })
 
 watch(
@@ -1014,7 +1093,7 @@ watch(
                   </div>
                   <div v-if="!runSteps.length" class="react-node running"><i></i><div><strong>理解任务</strong><span>执行中</span></div></div>
                 </div>
-                <div v-if="runJob.status === 'waiting_human'" class="react-review-link"><router-link to="/human-tasks">前往审核方案</router-link></div>
+                <div v-if="runJob.status === 'waiting_human'" class="react-review-link"><router-link to="/human-tasks">查看人工评审</router-link></div>
                 <div v-if="showRunError" class="react-error">{{ runJob.error }}</div>
               </div>
             </div>

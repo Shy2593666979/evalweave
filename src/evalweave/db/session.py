@@ -77,6 +77,8 @@ def _ensure_assistant_message_attachment_columns(engine: Engine) -> None:
         else "CHAR(32)"
     )
     additions = {
+        "include_in_context": "BOOLEAN NOT NULL DEFAULT 1",
+        "is_streaming": "BOOLEAN NOT NULL DEFAULT 0",
         "attachment_file_id": file_id_type,
         "attachment_name": "VARCHAR(255)",
         "attachment_content_type": "VARCHAR(255)",

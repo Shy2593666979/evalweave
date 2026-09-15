@@ -5,8 +5,10 @@ import re
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from queue import Queue
+from threading import Thread
 from typing import Annotated, Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -67,6 +69,36 @@ def redact_sensitive_content(content: str) -> str:
         redacted,
     )
     return redacted
+
+
+def sanitize_assistant_display(content: str) -> str:
+    internal_file_target = (
+        r"(?:https?://[^)\s]+)?[^)\r\n]*/api/(?:projects?|files?)/[^)\r\n]+"
+    )
+    content = re.sub(
+        rf"(?im)^[ \t]*(?:📄[ \t]*)?(?:\*\*)?文件下载[：:]"
+        rf"(?:\*\*)?[ \t]*\[[^\]\r\n]+\]\({internal_file_target}\)[ \t]*\r?\n?",
+        "",
+        content,
+    )
+    content = re.sub(
+        rf"\[([^\]\r\n]+)\]\({internal_file_target}\)",
+        r"\1",
+        content,
+    )
+    content = re.sub(
+        r"(?i)文件在\s*[`*]*(?:inputs?)[\\/][`*]*\s*(?:里|中)?[，,]?\s*"
+        r"直接复制过去并重命名[：:]?",
+        "正在重命名文件：",
+        content,
+    )
+    content = re.sub(
+        r"(?i)[，,]?\s*(?:生成|保存|写入)(?:在|到)\s*[`*]*(?:outputs?)[\\/]"
+        r"[`*]*\s*(?:目录)?(?:下|中)?",
+        "，文件已生成",
+        content,
+    )
+    return re.sub(r"(?i)[`*]*(?:inputs?|outputs?)[\\/][`*]*", "", content)
 
 
 def assistant_output_attachment(
@@ -234,6 +266,8 @@ class AssistantMessageRead(BaseModel):
     conversation_id: UUID
     role: str
     content: str
+    include_in_context: bool
+    is_streaming: bool
     attachment_file_id: UUID | None
     attachment_name: str | None
     attachment_content_type: str | None
@@ -399,6 +433,56 @@ def list_assistant_messages(
     return list(session.exec(statement).all())
 
 
+@router.get("/assistant/conversations/{conversation_id}/messages/events")
+def stream_assistant_messages(
+    conversation_id: UUID,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> StreamingResponse:
+    require_assistant_conversation(conversation_id, user, session)
+    owner_id = user.id
+
+    def produce_events() -> Iterator[str]:
+        previous_signature = ""
+        while True:
+            with Session(get_engine()) as read_session:
+                conversation = read_session.get(AssistantConversation, conversation_id)
+                if conversation is None or conversation.created_by != owner_id:
+                    return
+                statement = (
+                    select(AssistantMessage)
+                    .where(AssistantMessage.conversation_id == conversation_id)
+                    .order_by(AssistantMessage.created_at)
+                )
+                items = list(read_session.exec(statement).all())
+                payload = [
+                    AssistantMessageRead.model_validate(item).model_dump(mode="json")
+                    for item in items
+                ]
+            signature = json.dumps(
+                [
+                    (item["id"], item["content"], item["is_streaming"])
+                    for item in payload
+                ],
+                ensure_ascii=False,
+            )
+            if signature != previous_signature:
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                previous_signature = signature
+            if not any(bool(item["is_streaming"]) for item in payload):
+                return
+            time.sleep(0.25)
+
+    return StreamingResponse(
+        produce_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/assistant/conversations/{conversation_id}/messages/stream")
 def stream_assistant_message(
     conversation_id: UUID,
@@ -440,7 +524,11 @@ def stream_assistant_message(
 
     statement = (
         select(AssistantMessage)
-        .where(AssistantMessage.conversation_id == conversation.id)
+        .where(
+            AssistantMessage.conversation_id == conversation.id,
+            (AssistantMessage.role == "user")
+            | (AssistantMessage.include_in_context == True),  # noqa: E712
+        )
         .order_by(AssistantMessage.created_at)
     )
     message_history = [
@@ -469,11 +557,85 @@ def stream_assistant_message(
             code = candidate_type.code.lower()
             reviewer_type_counts[code] = reviewer_type_counts.get(code, 0) + 1
 
-    def event_stream() -> Iterator[str]:
+    initial_assistant_message_id = uuid4()
+    session.add(
+        AssistantMessage(
+            id=initial_assistant_message_id,
+            conversation_id=conversation.id,
+            role="assistant",
+            content="",
+            include_in_context=False,
+            is_streaming=True,
+        )
+    )
+    session.commit()
+
+    def persist_streaming_message(
+        message_id: UUID,
+        content: str,
+        *,
+        is_streaming: bool,
+        include_in_context: bool,
+        attachment: dict[str, Any] | None = None,
+    ) -> None:
+        with Session(get_engine()) as write_session:
+            message = write_session.get(AssistantMessage, message_id)
+            if message is None:
+                return
+            has_attachment = bool(attachment and attachment.get("attachment_file_id"))
+            if not is_streaming and not content.strip() and not has_attachment:
+                write_session.delete(message)
+                write_session.commit()
+                return
+            message.content = content
+            message.is_streaming = is_streaming
+            message.include_in_context = include_in_context
+            if attachment is not None:
+                raw_attachment_id = attachment.get("attachment_file_id")
+                message.attachment_file_id = (
+                    UUID(str(raw_attachment_id)) if raw_attachment_id else None
+                )
+                message.attachment_name = attachment.get("attachment_name")
+                message.attachment_content_type = attachment.get(
+                    "attachment_content_type"
+                )
+                message.attachment_size_bytes = attachment.get("attachment_size_bytes")
+            write_session.add(message)
+            write_session.commit()
+
+    def advance_streaming_message(message_id: UUID, content: str) -> UUID:
+        next_message_id = uuid4()
+        with Session(get_engine()) as write_session:
+            message = write_session.get(AssistantMessage, message_id)
+            if message is not None:
+                if content.strip():
+                    message.content = content
+                    message.is_streaming = False
+                    message.include_in_context = False
+                    write_session.add(message)
+                else:
+                    write_session.delete(message)
+            write_session.add(
+                AssistantMessage(
+                    id=next_message_id,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content="",
+                    include_in_context=False,
+                    is_streaming=True,
+                )
+            )
+            write_session.commit()
+        return next_message_id
+
+    def produce_events() -> Iterator[str]:
+        active_message_id = initial_assistant_message_id
+        stream_completed = False
         yield json.dumps({"type": "start"}, ensure_ascii=False) + "\n"
         try:
             result: dict[str, Any] | None = None
-            streamed_reply_parts: list[str] = []
+            current_reply_parts: list[str] = []
+            last_persisted_at = 0.0
             assistant_context = {
                 "project_id": str(project_id) if project_id else None,
                 "current_draft": current_draft,
@@ -493,19 +655,40 @@ def stream_assistant_message(
                     "ui_action": fallback.get("ui_action"),
                     "react_trace": [],
                 }
-                streamed_reply_parts.append(fallback["reply"])
+                current_reply_parts.append(fallback["reply"])
                 yield json.dumps(
                     {"type": "delta", "content": fallback["reply"]}, ensure_ascii=False
                 ) + "\n"
             else:
                 for event_type, value in stream_react_configuration(
-                    config, message_history, assistant_context, project_id
+                    config, message_history, assistant_context, project_id, owner_id
                 ):
                     if event_type == "delta":
-                        streamed_reply_parts.append(str(value))
+                        current_reply_parts.append(str(value))
+                        now = time.monotonic()
+                        if now - last_persisted_at >= 0.25:
+                            persist_streaming_message(
+                                active_message_id,
+                                sanitize_assistant_display(
+                                    "".join(current_reply_parts)
+                                ),
+                                is_streaming=True,
+                                include_in_context=False,
+                            )
+                            last_persisted_at = now
                         yield json.dumps(
                             {"type": "delta", "content": value}, ensure_ascii=False
                         ) + "\n"
+                    elif event_type == "round_end":
+                        round_reply = sanitize_assistant_display(
+                            "".join(current_reply_parts)
+                        ).strip()
+                        active_message_id = advance_streaming_message(
+                            active_message_id, round_reply
+                        )
+                        current_reply_parts = []
+                        last_persisted_at = 0.0
+                        yield json.dumps({"type": "round_end"}, ensure_ascii=False) + "\n"
                     elif event_type in {"tool_start", "tool_result"}:
                         yield json.dumps(
                             {"type": event_type, "tool": value}, ensure_ascii=False
@@ -551,10 +734,9 @@ def stream_assistant_message(
                 stage = "ready"
             else:
                 stage = "collecting"
-            # A ReAct exchange can emit useful text before and after several tool
-            # calls. Persist the same complete text that the client streamed,
-            # instead of replacing it with only the final model turn.
-            reply = "".join(streamed_reply_parts) or result["reply"]
+            # Intermediate ReAct narration remains visible as separate bubbles, but
+            # only the final answer participates in future model context.
+            reply = sanitize_assistant_display(str(result["reply"]))
 
             with Session(get_engine()) as write_session:
                 stored = write_session.get(AssistantConversation, conversation_id)
@@ -581,20 +763,15 @@ def stream_assistant_message(
                 stored.status = stage
                 stored.updated_at = datetime.now(UTC)
                 write_session.add(stored)
-                write_session.add(
-                    AssistantMessage(
-                        conversation_id=conversation_id,
-                        role="assistant",
-                        content=reply,
-                        attachment_file_id=(output_attachment.id if output_attachment else None),
-                        attachment_name=attachment_payload["attachment_name"],
-                        attachment_content_type=attachment_payload[
-                            "attachment_content_type"
-                        ],
-                        attachment_size_bytes=attachment_payload["attachment_size_bytes"],
-                    )
-                )
                 write_session.commit()
+            persist_streaming_message(
+                active_message_id,
+                reply,
+                is_streaming=False,
+                include_in_context=True,
+                attachment=attachment_payload,
+            )
+            stream_completed = True
             yield (
                 json.dumps(
                     {
@@ -609,7 +786,43 @@ def stream_assistant_message(
                 + "\n"
             )
         except Exception as error:
+            persist_streaming_message(
+                active_message_id,
+                sanitize_assistant_display("".join(current_reply_parts)),
+                is_streaming=False,
+                include_in_context=False,
+            )
             yield json.dumps({"type": "error", "message": str(error)}, ensure_ascii=False) + "\n"
+        finally:
+            if not stream_completed:
+                persist_streaming_message(
+                    active_message_id,
+                    sanitize_assistant_display("".join(current_reply_parts)),
+                    is_streaming=False,
+                    include_in_context=False,
+                )
+
+    event_queue: Queue[str | None] = Queue()
+
+    def run_in_background() -> None:
+        try:
+            for event in produce_events():
+                event_queue.put(event)
+        finally:
+            event_queue.put(None)
+
+    Thread(
+        target=run_in_background,
+        name=f"assistant-{conversation_id}",
+        daemon=True,
+    ).start()
+
+    def event_stream() -> Iterator[str]:
+        while True:
+            event = event_queue.get()
+            if event is None:
+                return
+            yield event
 
     return StreamingResponse(
         event_stream(),
@@ -687,11 +900,7 @@ def create_agent_job(
         goal=payload.goal.strip(),
         input_config=input_config,
         max_repair_attempts=agent_config.max_repair_attempts,
-        requires_approval=(
-            agent_config.require_approval
-            if payload.requires_approval is None
-            else payload.requires_approval
-        ),
+        requires_approval=False,
     )
     session.add(job)
     session.commit()
@@ -798,12 +1007,16 @@ def start_agent_job(job_id: UUID, _: ExperimentRunner, session: SessionDependenc
         raise HTTPException(status_code=409, detail="Agent job cannot be started in current state")
     job.status = AgentJobStatus.PENDING
     job.error = None
-    job.eval_spec = {}
+    is_python_job = job.input_config.get("job_type") == "python"
+    job.eval_spec = {"execution_mode": "python"} if is_python_job else {}
     job.result = {}
     job.result_file_id = None
     session.add(job)
     session.commit()
-    enqueue_agent_task("evalweave.agent.plan", job.id)
+    enqueue_agent_task(
+        "evalweave.python.run" if is_python_job else "evalweave.agent.plan",
+        job.id,
+    )
     session.refresh(job)
     return job
 

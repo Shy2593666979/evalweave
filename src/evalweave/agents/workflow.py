@@ -27,6 +27,7 @@ from evalweave.agents.planner import (
     generate_test_cases,
     model_map_rows,
 )
+from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.agents.react_runtime import stream_react_configuration
 from evalweave.core.config import get_settings
 from evalweave.db.models import (
@@ -36,11 +37,10 @@ from evalweave.db.models import (
     AssistantConversation,
     AssistantMessage,
     FileObject,
-    HumanTask,
     StepStatus,
 )
 from evalweave.db.session import get_engine
-from evalweave.notifications import notify_agent_job_completed, notify_human_task
+from evalweave.notifications import notify_agent_job_completed
 from evalweave.storage import LocalFileStorage
 
 StepCallable = Callable[[], dict[str, Any]]
@@ -163,6 +163,66 @@ def run_step_with_retries(
                 raise
             time.sleep(min(2 ** (attempt - 1), 4))
     raise last_error or RuntimeError(f"Agent step failed: {name}")
+
+
+def execute_python_job(job_id: UUID) -> None:
+    """Execute a Python workspace task created directly from the assistant."""
+    with Session(get_engine()) as session:
+        job = session.get(AgentJob, job_id)
+        if job is None or job.status in {
+            AgentJobStatus.COMPLETED,
+            AgentJobStatus.CANCELLED,
+        }:
+            return
+        if job.input_config.get("job_type") != "python":
+            raise ValueError("任务不是 Python 后台任务")
+        update_job(session, job, AgentJobStatus.RUNNING)
+        try:
+            source_file_ids = job.input_config.get("source_file_ids")
+            if not isinstance(source_file_ids, list):
+                source_file_ids = None
+            observation = run_step(
+                session,
+                job,
+                "execute_python",
+                lambda: run_python_workspace(
+                    session,
+                    job.project_id,
+                    {},
+                    str(job.input_config.get("python_code") or ""),
+                    [str(item) for item in source_file_ids]
+                    if source_file_ids is not None
+                    else None,
+                    str(job.input_config.get("primary_output") or "") or None,
+                    created_by=job.created_by,
+                )[0],
+            )
+            raw_file_id = observation.get("primary_output_file_id")
+            job.result_file_id = UUID(str(raw_file_id)) if raw_file_id else None
+            job.result = {
+                "summary": (
+                    "Python 后台任务已完成。"
+                    if raw_file_id
+                    else "Python 后台任务已完成，没有生成结果文件。"
+                ),
+                "outputs": observation.get("outputs", []),
+                "stdout": observation.get("stdout", ""),
+            }
+            job.error = None
+            update_job(session, job, AgentJobStatus.COMPLETED)
+            try:
+                notify_agent_job_completed(session, job)
+            except Exception:
+                logger.exception("Failed to notify completed Python job %s", job.id)
+        except Exception as error:
+            session.rollback()
+            job = session.get(AgentJob, job_id)
+            if job is not None:
+                job.status = AgentJobStatus.FAILED
+                job.error = str(error)[:4000]
+                job.updated_at = datetime.now(UTC)
+                session.add(job)
+                session.commit()
 
 
 def _start_react_step(
@@ -290,7 +350,7 @@ def repair_http_target_with_react(
     active_steps: list[AgentStep] = []
     result: dict[str, Any] | None = None
     for event_type, value in stream_react_configuration(
-        agent_config, messages, workspace, job.project_id
+        agent_config, messages, workspace, job.project_id, job.created_by
     ):
         if event_type == "tool_start":
             active_steps.append(
@@ -403,7 +463,6 @@ def validate_http_target_semantics(
 
 def plan_agent_job(job_id: UUID) -> None:
     settings = get_settings()
-    task_to_notify: HumanTask | None = None
     should_execute = False
     with Session(get_engine()) as session:
         job = session.get(AgentJob, job_id)
@@ -514,18 +573,9 @@ def plan_agent_job(job_id: UUID) -> None:
                 job.updated_at = datetime.now(UTC)
                 session.add(job)
 
-            if job.requires_approval:
-                task_to_notify = HumanTask(
-                    job_id=job.id,
-                    title=f"评测 Agent 等待确认：{job.title}",
-                    instructions="请检查 Agent 生成的 EvalSpec，确认后平台将继续执行。",
-                    notification_targets=job.input_config.get("notification_targets", []),
-                )
-                session.add(task_to_notify)
-                job.status = AgentJobStatus.WAITING_HUMAN
-            else:
-                job.status = AgentJobStatus.RUNNING
-                should_execute = True
+            job.status = AgentJobStatus.RUNNING
+            job.requires_approval = False
+            should_execute = True
             session.commit()
         except Exception as error:
             session.rollback()
@@ -538,10 +588,6 @@ def plan_agent_job(job_id: UUID) -> None:
                 session.commit()
                 return_error_to_assistant(session, job, error)
             return
-
-        if task_to_notify is not None:
-            session.refresh(task_to_notify)
-            notify_human_task(session, task_to_notify)
 
     if should_execute:
         execute_agent_job(job_id)

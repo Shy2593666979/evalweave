@@ -24,9 +24,21 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
 规则：
 - 先调用 update_task_draft 保存已经明确的信息。任务名由你生成，不得询问用户。
 - 有文件时按需调用 inspect_source，不要猜测文件结构。
-- 用户要求修改、清洗、展开、合并、拆分或转换项目文件时，调用 run_python 在临时工作区直接完成；
-  输入文件位于 inputs/，输出必须写入 outputs/。完成后按需 inspect_source 检查新文件。
-  不得声称不能编辑 Excel/CSV/JSON，也不得要求用户在本地处理后重新上传。
+- 用户要求创建、修改、清洗、展开、合并、拆分或转换项目文件时，调用 run_python 直接完成；
+  允许没有输入文件并从零写入 outputs/，不得要求用户先上传空白文件作为载体。
+  有输入时文件位于 inputs/，输出必须写入 outputs/。完成后按需 inspect_source 检查新文件。
+  不得声称不能创建或编辑 Excel/CSV/JSON，也不得要求用户在本地处理后重新上传。
+- 每次 run_python 都会创建新的临时执行目录，但上一轮 outputs/ 中成功生成的文件已经持久化到文件服务，
+  并更新为 current_draft.source_file_id。继续重命名或修改时，省略 source_file_ids 即可将该文件重新
+  装载到新的 inputs/；不得检查上一轮 outputs/，不得声称文件已清空，也不得无故从头重新生成数据。
+- Python 环境提供 httpx、requests、openpyxl 和 pandas，可按任务选择合适的 HTTP 与表格处理库。
+- 调用 run_python 时必须判断执行方式：预计超过 30 秒、包含批量 HTTP/模型调用、批量评测或需要等待
+  较长外部响应时设置 run_as_job=true；普通重命名、简单转换、快速检查设置为 false。后台任务创建成功后
+  立即结束本轮回复，只告知用户任务已启动并前往评测任务查看，不得在对话中继续等待脚本结果。
+- 面向用户的回复只能描述“正在处理文件”“文件已生成”等结果，不得提及 inputs/、outputs/、
+  manifest.json、临时工作区路径、存储键或脚本内部目录；文件完成后可以展示原始文件名，但不得自行
+  生成、猜测或拼接任何下载 URL，也不得输出 Markdown 下载链接。系统会根据工具返回的 file_id 自动
+  渲染文件下载入口。
 - 有 HTTP 目标和可构造的请求体后调用 probe_http_target；不要让用户提供可由预检获得的响应示例、
   response_path 或是否流式。预检失败后根据 Observation 修正参数并重试，只有无法推断的信息才询问。
   如果 current_draft.target_validated 已为 true 且 URL、请求体没有变化，不得重复预检。
@@ -46,6 +58,16 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
 - 配置检查完成且已有 output_format 时调用 request_confirmation，并在 summary 中生成针对本次任务的
   确认摘要。不得使用固定模板，不得直接开始执行。
 - 工具调用前可以输出一句简短进度；最终不要展示内部思维过程。
+"""
+
+REACT_SYSTEM_PROMPT += """
+
+企业微信发送规则：
+- 只有用户明确要求“发送到企业微信”时才调用 send_wecom_message，不得把普通回复或任务通知擅自外发。
+- 仅支持 text、markdown、file；图片不支持，也不得把图片伪装成文件发送。
+- 发送文件时使用当前项目已有的 source_file_id。若文件刚由 run_python 创建，优先使用其返回的
+  primary_output_file_id；无需让用户下载后重新上传。
+- 工具成功后向用户说明已发送；工具失败时如实说明错误，不得假称发送成功。
 """
 
 REACT_SYSTEM_PROMPT += """
@@ -90,6 +112,12 @@ def _run_tool(
 
 def _terminal_reply(context: AssistantToolContext, fallback: str) -> str:
     action = context.ui_action or {}
+    if action.get("type") == "background_job":
+        job_id = str(action.get("job_id") or "")
+        return (
+            "后台任务已启动，你可以前往"
+            f"[评测任务](/evaluations/{job_id})查看运行状态和结果。"
+        )
     if action.get("type") == "confirm":
         return str(action.get("summary") or fallback or "请确认是否开始执行。")
     if action.get("type") == "user_input":
@@ -199,6 +227,8 @@ def _stream_chat_completions(
         for call in ordered_calls:
             call.pop("visible", None)
             streamed_terminal_text[call["id"]] = call.pop("emitted", "")
+        if not any(streamed_terminal_text.values()):
+            yield "round_end", None
         history.append(
             {"role": "assistant", "content": content or None, "tool_calls": ordered_calls}
         )
@@ -221,7 +251,11 @@ def _stream_chat_completions(
             trace_item["summary"] = parsed
             yield "tool_result", trace_item
             history.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-            if tool is not None and tool.terminal and parsed.get("ok"):
+            if (
+                tool is not None
+                and (tool.terminal or parsed.get("queued"))
+                and parsed.get("ok")
+            ):
                 terminal_reply = _terminal_reply(context, content)
                 remaining = _remaining_terminal_text(
                     terminal_reply, streamed_terminal_text.get(call["id"], ""), content
@@ -325,6 +359,8 @@ def _stream_responses(
                 "react_trace": context.trace,
             }
             return
+        if not any(streamed_terminal_text.values()):
+            yield "round_end", None
         history.extend(output_items)
         for call in calls:
             name = str(call.get("name", ""))
@@ -351,7 +387,11 @@ def _stream_responses(
                     "output": result,
                 }
             )
-            if tool is not None and tool.terminal and parsed.get("ok"):
+            if (
+                tool is not None
+                and (tool.terminal or parsed.get("queued"))
+                and parsed.get("ok")
+            ):
                 terminal_reply = _terminal_reply(context, content)
                 remaining = _remaining_terminal_text(
                     terminal_reply,
@@ -375,12 +415,14 @@ def stream_react_configuration(
     messages: list[dict[str, str]],
     workspace: dict[str, Any],
     project_id: UUID | None,
+    actor_id: UUID | None = None,
 ) -> Iterator[tuple[str, Any]]:
     raw_reviewer_type_counts = workspace.get("reviewer_type_counts")
     raw_reviewer_usernames = workspace.get("available_reviewer_usernames")
     context = AssistantToolContext(
         draft=dict(workspace.get("current_draft") or {}),
         project_id=project_id,
+        actor_id=actor_id,
         reviewer_type_counts=(
             {
                 str(key).lower(): int(value)

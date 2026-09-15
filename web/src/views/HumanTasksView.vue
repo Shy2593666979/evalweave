@@ -1,37 +1,22 @@
 <script setup lang="ts">
-import { ArrowRight, CircleCheck, Clock, Document, Refresh, WarningFilled } from '@element-plus/icons-vue'
+import { ArrowRight, Clock, Refresh } from '@element-plus/icons-vue'
 import DOMPurify from 'dompurify'
-import { ElButton, ElDialog, ElEmpty, ElIcon, ElInput, ElInputNumber, ElMessage, ElMessageBox, ElProgress, ElTabPane, ElTable, ElTableColumn, ElTabs, ElTag } from 'element-plus'
+import { ElButton, ElDialog, ElEmpty, ElIcon, ElInput, ElInputNumber, ElMessage, ElProgress, ElTabPane, ElTabs, ElTag } from 'element-plus'
 import { marked } from 'marked'
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
 import { api, errorMessage } from '../api/client'
-import { useAuthStore } from '../stores/auth'
-import type { AgentJob, AgentStep, HumanReviewAssignment, HumanReviewCampaign, HumanTask } from '../types/agent'
+import type { HumanReviewAssignment, HumanReviewCampaign } from '../types/agent'
 import { formatBeijingDateTime } from '../utils/datetime'
 
-const route = useRoute()
-const router = useRouter()
-const auth = useAuthStore()
 const loading = ref(false)
-const detailLoading = ref(false)
-const deciding = ref(false)
 const submitting = ref(false)
-const detailVisible = ref(false)
 const reviewVisible = ref(false)
-const activeArea = ref<'approval' | 'review'>('review')
 const reviewRole = ref<'assigned' | 'created'>('assigned')
 const assignmentView = ref<'pending' | 'completed'>('pending')
-const tasks = ref<HumanTask[]>([])
 const assignments = ref<HumanReviewAssignment[]>([])
 const campaigns = ref<HumanReviewCampaign[]>([])
-const selectedTask = ref<HumanTask | null>(null)
-const selectedJob = ref<AgentJob | null>(null)
 const selectedAssignment = ref<HumanReviewAssignment | null>(null)
-const steps = ref<AgentStep[]>([])
 const scoreForm = reactive<{ scores: Record<string, number | undefined>; reason: string }>({ scores: {}, reason: '' })
-const focusedTaskId = computed(() => String(route.params.taskId ?? ''))
-const canApprove = computed(() => auth.hasPermission('evaluation:review'))
 interface AssignedReviewTask {
   campaignId: string
   title: string
@@ -79,18 +64,9 @@ const overallScore = computed(() => {
   return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length * 100) / 100 : 0
 })
 
-function statusType(status: HumanTask['status']) {
-  if (status === 'approved') return 'success'
-  if (status === 'rejected' || status === 'cancelled') return 'danger'
-  return 'warning'
-}
-function statusLabel(status: HumanTask['status']) {
-  return { pending: '待审核', approved: '已批准', rejected: '已拒绝', cancelled: '已取消' }[status]
-}
 function campaignStatusLabel(status: HumanReviewCampaign['status']) {
   return { active: '评审中', summarizing: '总结中', completed: '已完成', cancelled: '已取消' }[status]
 }
-function pretty(value: unknown) { return JSON.stringify(value, null, 2) }
 function renderMarkdown(value: unknown) {
   if (typeof value !== 'string' || !value.trim()) return ''
   return DOMPurify.sanitize(marked.parse(value, { async: false, breaks: true, gfm: true }) as string)
@@ -99,56 +75,11 @@ function renderMarkdown(value: unknown) {
 async function loadAll() {
   loading.value = true
   try {
-    const requests: Array<Promise<unknown>> = [
+    await Promise.all([
       api.get<HumanReviewAssignment[]>('/human-reviews/assignments/mine').then((response) => { assignments.value = response.data }),
       api.get<HumanReviewCampaign[]>('/human-reviews/campaigns/mine').then((response) => { campaigns.value = response.data }),
-    ]
-    if (canApprove.value) requests.push(api.get<HumanTask[]>('/human-tasks').then((response) => { tasks.value = response.data }))
-    await Promise.all(requests)
-    if (focusedTaskId.value && canApprove.value) {
-      activeArea.value = 'approval'
-      const focused = tasks.value.find((item) => item.id === focusedTaskId.value)
-      if (focused) await openDetail(focused)
-    }
-  } catch (error) { ElMessage.error(errorMessage(error)) } finally { loading.value = false }
-}
-
-async function openDetail(task: HumanTask) {
-  selectedTask.value = task
-  detailVisible.value = true
-  detailLoading.value = true
-  if (focusedTaskId.value !== task.id) await router.replace({ name: 'human-tasks', params: { taskId: task.id } })
-  try {
-    const [jobResponse, stepResponse] = await Promise.all([
-      api.get<AgentJob>(`/agent-jobs/${task.job_id}`), api.get<AgentStep[]>(`/agent-jobs/${task.job_id}/steps`),
     ])
-    selectedJob.value = jobResponse.data
-    steps.value = stepResponse.data
-  } catch (error) { ElMessage.error(errorMessage(error)) } finally { detailLoading.value = false }
-}
-function openTaskRow(row: unknown) { void openDetail(row as HumanTask) }
-async function closeDetail() {
-  selectedTask.value = null
-  selectedJob.value = null
-  steps.value = []
-  if (focusedTaskId.value) await router.replace({ name: 'human-tasks' })
-}
-async function decide(task: HumanTask, decision: 'approve' | 'reject') {
-  try {
-    let reason: string | undefined
-    if (decision === 'reject') {
-      const result = await ElMessageBox.prompt('请说明需要修改的内容或拒绝原因。', '拒绝评测方案', { inputType: 'textarea', inputValidator: (value) => Boolean(value.trim()) || '请输入原因', confirmButtonText: '确认拒绝', cancelButtonText: '取消' })
-      reason = result.value
-    } else await ElMessageBox.confirm('批准后，Agent 将按当前方案继续执行评测。', '批准评测方案', { confirmButtonText: '批准并继续', cancelButtonText: '取消' })
-    deciding.value = true
-    await api.post(`/human-tasks/${task.id}/decision`, { decision, reason })
-    ElMessage.success(decision === 'approve' ? '方案已批准，任务将继续执行' : '方案已拒绝')
-    detailVisible.value = false
-    await closeDetail()
-    await loadAll()
-  } catch (error) {
-    if (error !== 'cancel' && error !== 'close') ElMessage.error(errorMessage(error))
-  } finally { deciding.value = false }
+  } catch (error) { ElMessage.error(errorMessage(error)) } finally { loading.value = false }
 }
 
 function selectReviewCase(assignment: HumanReviewAssignment) {
@@ -190,32 +121,10 @@ onMounted(loadAll)
 
 <template>
   <header class="page-header">
-    <div><p class="eyebrow">人工协作</p><h1>人工评审</h1><p>审核 Agent 执行方案，或对分配给你的模型回复进行独立评分。</p></div>
+    <div><p class="eyebrow">人工协作</p><h1>人工评审</h1><p>完成分配给你的模型回复评分，或查看你发起的评审进度。</p></div>
     <div class="page-actions"><el-button :icon="Refresh" :loading="loading" @click="loadAll">刷新</el-button></div>
   </header>
 
-  <el-tabs v-model="activeArea" class="human-workspace-tabs">
-    <el-tab-pane label="方案审核" name="approval">
-      <template v-if="canApprove">
-        <section class="review-summary">
-          <div><span>待处理</span><strong>{{ tasks.filter((item) => item.status === 'pending').length }}</strong></div>
-          <div><span>已完成</span><strong>{{ tasks.filter((item) => item.status !== 'pending').length }}</strong></div>
-          <p>检查 Agent 生成的执行方案，批准后任务会自动回到执行队列。</p>
-        </section>
-        <section class="table-panel">
-          <div class="table-toolbar"><strong>方案审核记录</strong><span>共 {{ tasks.length }} 项</span></div>
-          <el-table v-loading="loading" :data="tasks" row-key="id" empty-text="当前没有方案审核任务" @row-click="openTaskRow">
-            <el-table-column label="任务" min-width="280"><template #default="scope"><strong>{{ scope.row.title }}</strong><p class="task-instructions">{{ scope.row.instructions }}</p></template></el-table-column>
-            <el-table-column label="状态" width="110"><template #default="scope"><el-tag :type="statusType(scope.row.status)">{{ statusLabel(scope.row.status) }}</el-tag></template></el-table-column>
-            <el-table-column label="创建时间（北京时间）" width="205"><template #default="scope">{{ formatBeijingDateTime(scope.row.created_at, true) }}</template></el-table-column>
-            <el-table-column label="操作" width="120" fixed="right"><template #default="scope"><el-button type="primary" link @click.stop="openTaskRow(scope.row)">{{ scope.row.status === 'pending' ? '查看并审核' : '查看详情' }}</el-button></template></el-table-column>
-          </el-table>
-        </section>
-      </template>
-      <el-empty v-else description="当前账号没有方案审核权限" />
-    </el-tab-pane>
-
-    <el-tab-pane label="人工评审" name="review">
       <section class="human-review-overview">
         <div><span>我的待评</span><strong>{{ pendingReviewTasks.length }}</strong><small>按人工评审任务展示</small></div>
         <div><span>我的已评</span><strong>{{ completedReviewTasks.length }}</strong><small>评分仅你自己可见</small></div>
@@ -268,23 +177,6 @@ onMounted(loadAll)
           <el-empty v-else description="你还没有发起人工评审任务" />
         </el-tab-pane>
       </el-tabs>
-    </el-tab-pane>
-  </el-tabs>
-
-  <el-dialog v-model="detailVisible" width="min(820px, 94vw)" class="review-dialog" destroy-on-close @closed="closeDetail">
-    <template #header><div class="review-dialog-head"><span>评测方案</span><el-tag v-if="selectedTask" :type="statusType(selectedTask.status)">{{ statusLabel(selectedTask.status) }}</el-tag></div></template>
-    <div v-loading="detailLoading" class="review-detail"><template v-if="selectedTask && selectedJob">
-      <div class="review-title"><span>任务 {{ selectedJob.id.slice(0, 8) }}</span><h2>{{ selectedJob.title }}</h2><p>{{ selectedJob.goal }}</p></div>
-      <div class="review-checks">
-        <div><el-icon><Document /></el-icon><span>数据结构</span><strong>{{ (selectedJob.eval_spec.source as Record<string, unknown>)?.format || '待识别' }}</strong></div>
-        <div><el-icon><CircleCheck /></el-icon><span>执行步骤</span><strong>{{ Array.isArray(selectedJob.eval_spec.operations) ? selectedJob.eval_spec.operations.length : 0 }} 项</strong></div>
-        <div><el-icon><WarningFilled /></el-icon><span>待配置项</span><strong>{{ Array.isArray(selectedJob.eval_spec.needs_configuration) ? selectedJob.eval_spec.needs_configuration.length : 0 }} 项</strong></div>
-      </div>
-      <div class="job-section"><div class="section-heading"><h2>Agent 生成的方案</h2><span>请重点检查目标、字段映射和评测项</span></div><pre class="json-panel review-json">{{ pretty(selectedJob.eval_spec) }}</pre></div>
-      <div v-if="selectedTask.decision_reason" class="decision-reason"><strong>处理说明</strong><p>{{ selectedTask.decision_reason }}</p><span>{{ formatBeijingDateTime(selectedTask.resolved_at, true) }}</span></div>
-    </template></div>
-    <template #footer><template v-if="selectedTask?.status === 'pending'"><el-button :disabled="deciding" @click="decide(selectedTask, 'reject')">拒绝并说明</el-button><el-button type="primary" :loading="deciding" @click="decide(selectedTask, 'approve')">批准并继续</el-button></template><el-button v-else @click="detailVisible = false">关闭</el-button></template>
-  </el-dialog>
 
   <el-dialog v-model="reviewVisible" width="min(1040px, 96vw)" class="review-score-dialog" align-center destroy-on-close>
     <template #header><div class="review-dialog-head"><span>{{ selectedAssignment?.campaign_title }}</span><el-tag v-if="selectedAssignment" :type="selectedAssignment.status === 'submitted' ? 'success' : 'warning'">{{ selectedAssignment.status === 'submitted' ? '已提交' : '匿名评审' }}</el-tag></div></template>

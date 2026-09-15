@@ -25,6 +25,12 @@ def resume_agent_job_task(job_id: str) -> None:
     execute_agent_job(UUID(job_id))
 
 
+def run_python_job_task(job_id: str) -> None:
+    from evalweave.agents.workflow import execute_python_job
+
+    execute_python_job(UUID(job_id))
+
+
 def finalize_human_review_task(campaign_id: str) -> None:
     from evalweave.human_reviews import finalize_campaign
 
@@ -35,6 +41,7 @@ celery_app = create_celery_app()
 celery_app.task(name="evalweave.healthcheck")(healthcheck)
 celery_app.task(name="evalweave.agent.plan")(run_agent_job_task)
 celery_app.task(name="evalweave.agent.execute")(resume_agent_job_task)
+celery_app.task(name="evalweave.python.run")(run_python_job_task)
 celery_app.task(name="evalweave.human_reviews.finalize")(finalize_human_review_task)
 
 
@@ -49,6 +56,7 @@ def worker_main() -> None:
     application.task(name="evalweave.healthcheck")(healthcheck)
     application.task(name="evalweave.agent.plan")(run_agent_job_task)
     application.task(name="evalweave.agent.execute")(resume_agent_job_task)
+    application.task(name="evalweave.python.run")(run_python_job_task)
     application.task(name="evalweave.human_reviews.finalize")(finalize_human_review_task)
     worker_args = ["worker", f"--loglevel={args.loglevel}"]
     if sys.platform == "win32":

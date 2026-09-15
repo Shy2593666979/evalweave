@@ -56,7 +56,6 @@ const jobForm = reactive({
   title: '',
   goal: '',
   source_file_id: '',
-  requires_approval: true,
   target_url: '',
   response_path: '',
   max_cases: 100,
@@ -67,6 +66,8 @@ let jobEventSource: EventSource | null = null
 let jobEventJobId = ''
 let viewActive = false
 let runtimeRetryTimer: ReturnType<typeof setTimeout> | null = null
+let elapsedTimer: ReturnType<typeof setInterval> | null = null
+const currentTime = ref(Date.now())
 
 async function loadRuntime() {
   try {
@@ -98,6 +99,7 @@ function stepsRenderKey(items: AgentStep[]) {
 
 const canRun = computed(() => auth.hasPermission('experiment:run'))
 const selectedFile = computed(() => files.value.find((item) => item.id === selectedJob.value?.source_file_id))
+const isPythonJob = computed(() => selectedJob.value?.input_config.job_type === 'python')
 const currentSteps = computed(() => {
   const latest = new Map<string, AgentStep>()
   for (const step of steps.value) latest.set(step.name, step)
@@ -120,11 +122,31 @@ const progress = computed(() => {
   }[selectedJob.value.status]
 })
 
+const pythonJobElapsed = computed(() => {
+  const job = selectedJob.value
+  if (!job) return '0 秒'
+  const started = new Date(job.created_at).getTime()
+  const ended = ['completed', 'failed', 'cancelled'].includes(job.status)
+    ? new Date(job.updated_at).getTime()
+    : currentTime.value
+  return `${Math.max(0, Math.floor((ended - started) / 1000))} 秒`
+})
+
+const pythonCurrentOperation = computed(() => {
+  const status = selectedJob.value?.status
+  if (status === 'pending') return '等待后台执行'
+  if (status === 'running') return '正在生成结果文件'
+  if (status === 'completed') return '结果文件已生成'
+  if (status === 'failed') return '执行失败'
+  if (status === 'cancelled') return '任务已取消'
+  return '正在准备任务'
+})
+
 const statusLabels: Record<AgentJob['status'], string> = {
   pending: '等待开始',
   discovering: '读取数据',
   planning: '生成方案',
-  waiting_human: '等待审核',
+  waiting_human: '人工评审中',
   running: '执行评测',
   analyzing: '整理结果',
   completed: '已完成',
@@ -353,7 +375,6 @@ function openCreateJob() {
   jobForm.title = ''
   jobForm.goal = ''
   jobForm.source_file_id = files.value[0]?.id ?? ''
-  jobForm.requires_approval = runtime.value?.require_approval ?? true
   jobForm.target_url = ''
   jobForm.response_path = ''
   jobForm.max_cases = 100
@@ -380,7 +401,6 @@ async function createAndStartJob() {
       title: jobForm.title.trim(),
       goal: jobForm.goal.trim(),
       source_file_id: jobForm.source_file_id,
-      requires_approval: jobForm.requires_approval,
       output_format: jobForm.output_format,
       evaluation_model_id: jobForm.evaluation_model_id || null,
       input_config: inputConfig,
@@ -424,6 +444,7 @@ watch(selectedProjectId, (value) => {
 
 onMounted(async () => {
   viewActive = true
+  elapsedTimer = setInterval(() => { currentTime.value = Date.now() }, 1000)
   try {
     const [, , modelResponse] = await Promise.all([
       loadProjects(),
@@ -442,6 +463,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   viewActive = false
   if (runtimeRetryTimer) clearTimeout(runtimeRetryTimer)
+  if (elapsedTimer) clearInterval(elapsedTimer)
   stopJobEventStream()
 })
 </script>
@@ -492,25 +514,30 @@ onBeforeUnmount(() => {
           <div class="job-head-actions"><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
         </div>
 
-        <div class="job-progress">
+        <div v-if="!isPythonJob" class="job-progress">
           <el-progress :percentage="progress" :status="selectedJob.status === 'failed' ? 'exception' : selectedJob.status === 'completed' ? 'success' : undefined" :stroke-width="8" :show-text="false" />
           <div><span>已上传数据</span><span>生成方案</span><span>执行评测</span><span>整理结果</span></div>
         </div>
 
+        <div v-else class="python-job-status">
+          <div><span>状态</span><strong>{{ statusLabels[selectedJob.status] }}</strong></div>
+          <div><span>已耗时</span><strong>{{ pythonJobElapsed }}</strong></div>
+          <div><span>当前操作</span><strong>{{ pythonCurrentOperation }}</strong></div>
+        </div>
+
         <div v-if="selectedJob.status === 'waiting_human'" class="decision-callout">
-          <div><strong>评测方案等待确认</strong><p>审核方案后，Agent 才会继续执行目标接口。</p></div>
-          <router-link :to="`/human-tasks`"><el-button type="primary">前往审核</el-button></router-link>
+          <div><strong>人工评审进行中</strong><p>评审人员完成评分后，系统会自动汇总结果。</p></div>
+          <router-link :to="`/human-tasks`"><el-button type="primary">查看人工评审</el-button></router-link>
         </div>
         <div v-if="selectedJob.error" class="error-callout"><el-icon><WarningFilled /></el-icon><div><strong>任务执行失败</strong><p>{{ selectedJob.error }}</p></div><el-button v-if="canRun" @click="restartJob">重新运行</el-button></div>
 
         <div class="job-facts">
-          <div><span>数据文件</span><strong>{{ selectedFile?.original_name ?? '未选择' }}</strong></div>
+          <div><span>数据文件</span><strong>{{ selectedFile?.original_name ?? (isPythonJob ? '由任务生成' : '未选择') }}</strong></div>
           <div><span>创建时间（北京时间）</span><strong>{{ formatBeijingDateTime(selectedJob.created_at) }}</strong></div>
-          <div><span>人工审核</span><strong>{{ selectedJob.requires_approval ? '需要' : '不需要' }}</strong></div>
-          <div><span>结果格式</span><strong>{{ outputLabels[String(selectedJob.input_config.output_format ?? 'xlsx') as keyof typeof outputLabels] ?? 'Excel' }}</strong></div>
+          <div><span>结果格式</span><strong>{{ outputLabels[String(selectedJob.input_config.output_format ?? 'xlsx') as keyof typeof outputLabels] ?? '文件' }}</strong></div>
         </div>
 
-        <div class="job-section">
+        <div v-if="!isPythonJob" class="job-section">
           <div class="section-heading"><h2>运行步骤</h2><span>自动刷新</span></div>
           <div v-if="currentSteps.length" class="step-list">
             <div v-for="step in currentSteps" :key="step.id" class="step-row">
@@ -522,7 +549,7 @@ onBeforeUnmount(() => {
           <p v-else class="section-empty">任务启动后，这里会显示每一步的执行状态。</p>
         </div>
 
-        <div v-if="Object.keys(selectedJob.eval_spec).length" class="job-section">
+        <div v-if="!isPythonJob && Object.keys(selectedJob.eval_spec).length" class="job-section">
           <div class="section-heading"><h2>评测方案</h2><span>Agent 生成</span></div>
           <div class="plan-readable">
             <div class="plan-intro"><strong>方案目标</strong><div class="markdown-body" v-html="renderMarkdown(selectedJob.goal)"></div></div>
@@ -546,7 +573,7 @@ onBeforeUnmount(() => {
         <div v-if="Object.keys(selectedJob.result).length" class="job-section result-section">
           <div class="section-heading"><h2>评测结果</h2><el-button v-if="selectedJob.result_file_id" :icon="Download" @click="downloadResult">下载逐条结果</el-button></div>
           <div v-if="typeof selectedJob.result.summary === 'string'" class="result-summary markdown-body" v-html="renderMarkdown(selectedJob.result.summary)"></div>
-          <details class="raw-data-details"><summary>查看原始结果数据</summary><pre class="json-panel">{{ pretty(selectedJob.result) }}</pre></details>
+          <details v-if="!isPythonJob" class="raw-data-details"><summary>查看原始结果数据</summary><pre class="json-panel">{{ pretty(selectedJob.result) }}</pre></details>
         </div>
       </template>
       <div v-else class="detail-empty"><el-icon><Document /></el-icon><h2>选择一个评测任务</h2><p>任务的运行步骤、方案和结果会显示在这里。</p></div>
@@ -569,10 +596,7 @@ onBeforeUnmount(() => {
         <el-form-item label="目标接口地址"><el-input v-model="jobForm.target_url" placeholder="可选，例如 https://model.example/chat" /></el-form-item>
         <el-form-item label="响应内容路径"><el-input v-model="jobForm.response_path" placeholder="可选，例如 data.reply" /></el-form-item>
       </div>
-      <div class="form-grid compact">
-        <el-form-item label="最多执行条数"><el-input-number v-model="jobForm.max_cases" :min="1" :max="10000" controls-position="right" /></el-form-item>
-        <el-form-item label="执行前人工确认"><el-switch v-model="jobForm.requires_approval" inline-prompt active-text="需要" inactive-text="跳过" /></el-form-item>
-      </div>
+      <el-form-item label="最多执行条数"><el-input-number v-model="jobForm.max_cases" :min="1" :max="10000" controls-position="right" /></el-form-item>
       <p class="form-hint">目标接口的域名需要由管理员加入服务端允许名单；请求体默认使用数据文件中的每一行。</p>
     </el-form>
     <template #footer><el-button @click="createJobVisible = false">取消</el-button><el-button type="primary" :icon="VideoPlay" :loading="starting" @click="createAndStartJob">创建并启动</el-button></template>
