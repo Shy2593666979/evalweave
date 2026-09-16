@@ -109,7 +109,8 @@ Agent 默认关闭。请在 `config/application.yaml` 中配置 OpenAI Python SD
 `config/application.example.yaml`。
 
 登录后可从“评测任务”完成项目选择、数据上传、任务启动、运行跟踪和结果下载。
-上传文件和脚本输出由本地文件服务统一管理，磁盘目录可通过 `storage.local_directory` 自定义。
+上传文件和脚本输出由本地文件服务统一管理，磁盘目录可通过 `storage.local_directory` 自定义；
+Python 脚本的隔离执行目录可通过 `storage.workspace_directory` 自定义。
 运行中的任务会自动刷新状态；API 服务之外还需要同时启动 Redis 和 Celery Worker。
 评测助手支持通过对话整理接口地址、返回示例和评测要求，任务结果可导出为 Excel、
 JSONL、Markdown 或纯文本。Admin 可在“评测模型”中维护可选模型，API Key 加密保存且不回显。

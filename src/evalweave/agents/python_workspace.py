@@ -63,8 +63,14 @@ def run_python_workspace(
             raise ValueError(f"文件不存在或不属于当前项目：{raw_id}")
         sources.append(source)
 
-    storage = LocalFileStorage(get_settings().storage.local_directory)
-    with tempfile.TemporaryDirectory(prefix="evalweave-python-") as workspace_name:
+    settings = get_settings()
+    storage = LocalFileStorage(settings.storage.local_directory)
+    workspace_root = settings.storage.workspace_directory.resolve()
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="evalweave-python-",
+        dir=workspace_root,
+    ) as workspace_name:
         workspace = Path(workspace_name)
         inputs = workspace / "inputs"
         outputs = workspace / "outputs"
@@ -110,7 +116,9 @@ def run_python_workspace(
         stdout = completed.stdout[-8000:].strip()
         stderr = completed.stderr[-8000:].strip()
         if completed.returncode != 0:
-            detail = stderr or stdout or f"退出码 {completed.returncode}"
+            raw_detail = stderr or stdout or f"退出码 {completed.returncode}"
+            detail_lines = raw_detail.splitlines()
+            detail = "\n".join(detail_lines[-24:])
             raise ValueError(f"Python 文件工具执行失败：{detail}")
 
         output_paths = sorted(path for path in outputs.rglob("*") if path.is_file())

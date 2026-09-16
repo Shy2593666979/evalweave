@@ -10,11 +10,12 @@ from threading import Lock, Thread
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
+from evalweave.agents.model_client import AgentModelClient
 from evalweave.agents.model_config import resolve_agent_config
 from evalweave.agents.planner import (
     assist_job_configuration,
@@ -43,6 +44,7 @@ from evalweave.db.models import (
 )
 from evalweave.db.session import get_engine
 from evalweave.notifications import notify_human_task
+from evalweave.project_access import project_ids_for_user, require_project_access
 from evalweave.workers.factory import create_celery_app
 
 router = APIRouter(tags=["evaluation-agent"])
@@ -56,6 +58,7 @@ _worker_probe_running = False
 ExperimentReader = Annotated[User, Depends(require_permission(Permission.EXPERIMENT_READ))]
 ExperimentRunner = Annotated[User, Depends(require_permission(Permission.EXPERIMENT_RUN))]
 EvaluationReviewer = Annotated[User, Depends(require_permission(Permission.EVALUATION_REVIEW))]
+DEFAULT_CONVERSATION_TITLE = "新的评测对话"
 
 
 def redact_sensitive_content(content: str) -> str:
@@ -91,6 +94,21 @@ def sanitize_assistant_display(content: str) -> str:
         content,
     )
     return re.sub(r"(?i)[`*]*(?:inputs?|outputs?)[\\/][`*]*", "", content)
+
+
+def infer_explicit_output_format(content: str) -> str | None:
+    """Recognize a result format only when the user states one explicitly."""
+    lowered = content.casefold()
+    patterns = (
+        ("xlsx", r"(?:\.xlsx?\b|\bexcel\b|电子表格)"),
+        ("jsonl", r"(?:\.jsonl?\b|\bjsonl\b|\bjson\s*(?:文件|格式))"),
+        ("markdown", r"(?:\.md\b|\.markdown\b|\bmarkdown\b|markdown\s*文件)"),
+        ("text", r"(?:\.txt\b|纯文本|txt\s*文件|不需要文件|直接在对话中(?:查看|展示))"),
+    )
+    for output_format, pattern in patterns:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return output_format
+    return None
 
 
 def assistant_output_attachment(
@@ -238,6 +256,10 @@ class AssistantConversationCreate(BaseModel):
     project_id: UUID | None = None
 
 
+class AssistantConversationUpdate(BaseModel):
+    title: str = Field(min_length=2, max_length=10)
+
+
 class AssistantConversationRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -315,17 +337,20 @@ def cached_worker_status() -> bool:
         return _worker_probe_available
 
 
-def require_project(project_id: UUID, session: SessionDependency) -> Project:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return project
-
-
 def require_job(job_id: UUID, session: SessionDependency) -> AgentJob:
     job = session.get(AgentJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Agent job not found")
+    return job
+
+
+def require_user_job(
+    job_id: UUID, user: User, session: SessionDependency
+) -> AgentJob:
+    job = require_job(job_id, session)
+    if user.system_role != SystemRole.ADMIN and job.created_by != user.id:
+        raise HTTPException(status_code=404, detail="评测任务不存在")
+    require_project_access(session, user, job.project_id)
     return job
 
 
@@ -342,6 +367,8 @@ def require_assistant_conversation(
     conversation = session.get(AssistantConversation, conversation_id)
     if conversation is None or conversation.created_by != user.id:
         raise HTTPException(status_code=404, detail="评测助手对话不存在")
+    if conversation.project_id:
+        require_project_access(session, user, conversation.project_id)
     return conversation
 
 
@@ -386,12 +413,22 @@ def assist_with_agent(
 def list_assistant_conversations(
     user: ExperimentRunner,
     session: SessionDependency,
+    project_id: UUID | None = None,
 ) -> list[AssistantConversation]:
     statement = (
         select(AssistantConversation)
         .where(AssistantConversation.created_by == user.id)
         .order_by(AssistantConversation.updated_at.desc())
     )
+    if project_id is not None:
+        require_project_access(session, user, project_id)
+        statement = statement.where(AssistantConversation.project_id == project_id)
+    else:
+        allowed = project_ids_for_user(session, user)
+        if allowed is not None:
+            if not allowed:
+                return []
+            statement = statement.where(AssistantConversation.project_id.in_(allowed))
     return list(session.exec(statement).all())
 
 
@@ -406,7 +443,7 @@ def create_assistant_conversation(
     session: SessionDependency,
 ) -> AssistantConversation:
     if payload.project_id:
-        require_project(payload.project_id, session)
+        require_project_access(session, user, payload.project_id)
     conversation = AssistantConversation(
         project_id=payload.project_id,
         created_by=user.id,
@@ -426,6 +463,116 @@ def create_assistant_conversation(
     )
     session.commit()
     return conversation
+
+
+def normalize_conversation_title(value: str, question: str) -> str:
+    candidate = (value.splitlines()[0] if value.strip() else "").strip()
+    candidate = re.sub(r"^(?:标题|对话名称)\s*[：:]\s*", "", candidate)
+    candidate = candidate.strip("`*_# \"'“”‘’《》<>，。！？；：,.!?;:-")
+    candidate = re.sub(r"\s+", "", candidate)
+    if len(candidate) < 2:
+        candidate = re.sub(r"\s+", "", question).strip(
+            "`*_# \"'“”‘’《》<>，。！？；：,.!?;:-"
+        )
+    candidate = candidate[:10]
+    return candidate if len(candidate) >= 2 else "新对话"
+
+
+def generate_conversation_title(
+    conversation_id: UUID,
+    owner_id: UUID,
+    question: str,
+    evaluation_model_id: UUID | None,
+) -> None:
+    generated = ""
+    try:
+        with Session(get_engine()) as session:
+            config = resolve_agent_config(session, evaluation_model_id)
+        if config.enabled and config.base_url and config.model:
+            generated = AgentModelClient(config).request_text(
+                (
+                    "根据用户的第一条问题生成简洁的中文对话名称。"
+                    "只输出名称本身，长度必须为2到10个字符，不要引号、标点或解释。"
+                ),
+                [{"role": "user", "content": question}],
+            )
+    except Exception:
+        generated = ""
+    title = normalize_conversation_title(generated, question)
+    try:
+        with Session(get_engine()) as session:
+            conversation = session.get(AssistantConversation, conversation_id)
+            if (
+                conversation is None
+                or conversation.created_by != owner_id
+                or conversation.title != DEFAULT_CONVERSATION_TITLE
+            ):
+                return
+            conversation.title = title
+            conversation.updated_at = datetime.now(UTC)
+            session.add(conversation)
+            session.commit()
+    except Exception:
+        return
+
+
+def schedule_conversation_title(
+    conversation_id: UUID,
+    owner_id: UUID,
+    question: str,
+    evaluation_model_id: UUID | None,
+) -> None:
+    Thread(
+        target=generate_conversation_title,
+        args=(conversation_id, owner_id, question, evaluation_model_id),
+        daemon=True,
+        name=f"conversation-title-{conversation_id}",
+    ).start()
+
+
+@router.patch(
+    "/assistant/conversations/{conversation_id}",
+    response_model=AssistantConversationRead,
+)
+def update_assistant_conversation(
+    conversation_id: UUID,
+    payload: AssistantConversationUpdate,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> AssistantConversation:
+    conversation = require_assistant_conversation(conversation_id, user, session)
+    conversation.title = payload.title.strip()
+    conversation.updated_at = datetime.now(UTC)
+    session.add(conversation)
+    session.commit()
+    session.refresh(conversation)
+    return conversation
+
+
+@router.delete(
+    "/assistant/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_assistant_conversation(
+    conversation_id: UUID,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> Response:
+    conversation = require_assistant_conversation(conversation_id, user, session)
+    messages = list(
+        session.exec(
+            select(AssistantMessage).where(
+                AssistantMessage.conversation_id == conversation.id
+            )
+        ).all()
+    )
+    if any(message.is_streaming for message in messages):
+        raise HTTPException(status_code=409, detail="正在回复的对话暂时不能删除")
+    for message in messages:
+        session.delete(message)
+    session.delete(conversation)
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(
@@ -501,6 +648,40 @@ def stream_assistant_messages(
     )
 
 
+@router.get("/assistant/conversations/{conversation_id}/title/events")
+def stream_assistant_conversation_title(
+    conversation_id: UUID,
+    user: ExperimentRunner,
+    session: SessionDependency,
+) -> StreamingResponse:
+    require_assistant_conversation(conversation_id, user, session)
+    owner_id = user.id
+
+    def produce_events() -> Iterator[str]:
+        while True:
+            with Session(get_engine()) as read_session:
+                conversation = read_session.get(AssistantConversation, conversation_id)
+                if conversation is None or conversation.created_by != owner_id:
+                    return
+                if conversation.title != DEFAULT_CONVERSATION_TITLE:
+                    payload = AssistantConversationRead.model_validate(
+                        conversation
+                    ).model_dump(mode="json")
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    return
+            yield ": keep-alive\n\n"
+            time.sleep(0.25)
+
+    return StreamingResponse(
+        produce_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/assistant/conversations/{conversation_id}/messages/stream")
 def stream_assistant_message(
     conversation_id: UUID,
@@ -509,11 +690,22 @@ def stream_assistant_message(
     session: SessionDependency,
 ) -> StreamingResponse:
     conversation = require_assistant_conversation(conversation_id, user, session)
+    if conversation.project_id:
+        require_project_access(session, user, conversation.project_id)
     source: FileObject | None = None
     if payload.source_file_id:
         source = session.get(FileObject, payload.source_file_id)
         if source is None or source.project_id != conversation.project_id:
             raise HTTPException(status_code=422, detail="数据文件不属于当前项目")
+    has_user_message = session.exec(
+        select(AssistantMessage).where(
+            AssistantMessage.conversation_id == conversation.id,
+            AssistantMessage.role == "user",
+        )
+    ).first() is not None
+    should_generate_title = (
+        conversation.title == DEFAULT_CONVERSATION_TITLE and not has_user_message
+    )
     user_message = AssistantMessage(
         conversation_id=conversation.id,
         role="user",
@@ -524,21 +716,29 @@ def stream_assistant_message(
         attachment_size_bytes=source.size_bytes if source else None,
     )
     session.add(user_message)
-    if conversation.title == "新的评测对话":
-        conversation.title = payload.content.strip()[:36]
     if source:
         conversation.draft = {
             **conversation.draft,
             "source_file_id": str(source.id),
         }
-    if payload.output_format:
+    explicit_output_format = payload.output_format or infer_explicit_output_format(
+        payload.content
+    )
+    if explicit_output_format:
         conversation.draft = {
             **conversation.draft,
-            "output_format": payload.output_format,
+            "output_format": explicit_output_format,
         }
     conversation.updated_at = datetime.now(UTC)
     session.add(conversation)
     session.commit()
+    if should_generate_title:
+        schedule_conversation_title(
+            conversation.id,
+            user.id,
+            payload.content.strip(),
+            payload.evaluation_model_id,
+        )
 
     statement = (
         select(AssistantMessage)
@@ -556,6 +756,7 @@ def stream_assistant_message(
         message_history[-1]["content"] = payload.content.strip()
     current_draft = dict(conversation.draft)
     project_id = conversation.project_id
+    project = session.get(Project, project_id) if project_id else None
     owner_id = user.id
     config = resolve_agent_config(session, payload.evaluation_model_id)
     user_types = {item.id: item for item in session.exec(select(UserType)).all()}
@@ -658,6 +859,14 @@ def stream_assistant_message(
             last_persisted_at = 0.0
             assistant_context = {
                 "project_id": str(project_id) if project_id else None,
+                "project": {
+                    "name": project.name,
+                    "service_url": project.service_url,
+                    "description": project.description,
+                    "agent_context": project.agent_context,
+                }
+                if project
+                else None,
                 "current_draft": current_draft,
                 "target_auth_configured": bool(
                     config.target_headers or config.target_auth_flows
@@ -681,7 +890,12 @@ def stream_assistant_message(
                 ) + "\n"
             else:
                 for event_type, value in stream_react_configuration(
-                    config, message_history, assistant_context, project_id, owner_id
+                    config,
+                    message_history,
+                    assistant_context,
+                    project_id,
+                    owner_id,
+                    conversation.id,
                 ):
                     if event_type == "delta":
                         current_reply_parts.append(str(value))
@@ -752,7 +966,7 @@ def stream_assistant_message(
                 core_ready and not draft.get("output_format")
             ):
                 stage = "choose_output"
-            elif action_type == "confirm":
+            elif action_type in {"confirm", "start_task"}:
                 stage = "ready"
             else:
                 stage = "collecting"
@@ -872,21 +1086,10 @@ def mark_assistant_conversation_started(
     job = require_job(payload.agent_job_id, session)
     if job.created_by != user.id or job.project_id != conversation.project_id:
         raise HTTPException(status_code=422, detail="评测任务与当前对话不匹配")
-    already_recorded = (
-        conversation.status == "started" and conversation.agent_job_id == job.id
-    )
     conversation.agent_job_id = job.id
     conversation.status = "started"
     conversation.updated_at = datetime.now(UTC)
     session.add(conversation)
-    if not already_recorded:
-        session.add(
-            AssistantMessage(
-                conversation_id=conversation.id,
-                role="user",
-                content="确认并开启",
-            )
-        )
     session.commit()
     session.refresh(conversation)
     return conversation
@@ -903,7 +1106,7 @@ def create_agent_job(
     user: ExperimentRunner,
     session: SessionDependency,
 ) -> AgentJob:
-    require_project(project_id, session)
+    require_project_access(session, user, project_id)
     if payload.source_file_id:
         file_object = session.get(FileObject, payload.source_file_id)
         if file_object is None or file_object.project_id != project_id:
@@ -934,23 +1137,27 @@ def create_agent_job(
 
 @router.get("/projects/{project_id}/agent-jobs", response_model=list[AgentJobRead])
 def list_agent_jobs(
-    project_id: UUID, _: ExperimentReader, session: SessionDependency
+    project_id: UUID, user: ExperimentReader, session: SessionDependency
 ) -> list[AgentJob]:
-    require_project(project_id, session)
+    require_project_access(session, user, project_id)
     statement = select(AgentJob).where(AgentJob.project_id == project_id)
+    if user.system_role != SystemRole.ADMIN:
+        statement = statement.where(AgentJob.created_by == user.id)
     return list(session.exec(statement.order_by(AgentJob.created_at.desc())).all())
 
 
 @router.get("/agent-jobs/{job_id}", response_model=AgentJobRead)
-def get_agent_job(job_id: UUID, _: ExperimentReader, session: SessionDependency) -> AgentJob:
-    return require_job(job_id, session)
+def get_agent_job(
+    job_id: UUID, user: ExperimentReader, session: SessionDependency
+) -> AgentJob:
+    return require_user_job(job_id, user, session)
 
 
 @router.get("/agent-jobs/{job_id}/steps", response_model=list[AgentStepRead])
 def list_agent_steps(
-    job_id: UUID, _: ExperimentReader, session: SessionDependency
+    job_id: UUID, user: ExperimentReader, session: SessionDependency
 ) -> list[AgentStep]:
-    require_job(job_id, session)
+    require_user_job(job_id, user, session)
     statement = select(AgentStep).where(AgentStep.job_id == job_id)
     return list(session.exec(statement.order_by(AgentStep.created_at)).all())
 
@@ -958,11 +1165,11 @@ def list_agent_steps(
 @router.get("/agent-jobs/{job_id}/events")
 def stream_agent_job_events(
     job_id: UUID,
-    _: ExperimentReader,
+    user: ExperimentReader,
     session: SessionDependency,
     after: int = 0,
 ) -> StreamingResponse:
-    require_job(job_id, session)
+    require_user_job(job_id, user, session)
 
     def event_stream() -> Iterator[str]:
         last_id = max(after, 0)
@@ -1020,8 +1227,10 @@ def stream_agent_job_events(
 
 
 @router.post("/agent-jobs/{job_id}/start", response_model=AgentJobRead)
-def start_agent_job(job_id: UUID, _: ExperimentRunner, session: SessionDependency) -> AgentJob:
-    job = require_job(job_id, session)
+def start_agent_job(
+    job_id: UUID, user: ExperimentRunner, session: SessionDependency
+) -> AgentJob:
+    job = require_user_job(job_id, user, session)
     if job.status not in {
         AgentJobStatus.PENDING,
         AgentJobStatus.FAILED,

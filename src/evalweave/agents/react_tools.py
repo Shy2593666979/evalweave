@@ -64,6 +64,8 @@ class AssistantToolContext:
     draft: dict[str, Any]
     project_id: UUID | None
     actor_id: UUID | None = None
+    conversation_id: UUID | None = None
+    repair_job_id: UUID | None = None
     ui_action: dict[str, Any] | None = None
     trace: list[dict[str, Any]] = field(default_factory=list)
     reviewer_type_counts: dict[str, int] | None = None
@@ -221,14 +223,16 @@ class RunPythonTool(BaseAssistantTool):
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "输入文件 ID；省略时使用当前 source_file_id，"
-                    "传空数组表示不使用输入文件。"
+                    "输入文件 ID；省略时使用当前 source_file_id，传空数组表示不使用输入文件。"
                 ),
                 "maxItems": 8,
             },
             "primary_output": {
                 "type": "string",
-                "description": "outputs/ 下作为后续任务数据源的文件名；默认使用第一个输出。",
+                "description": (
+                    "outputs/ 下作为后续任务数据源的文件名。用户指定文件名时必须原样采用；"
+                    "未指定时使用能表达内容的简洁中文文件名，并保留 dev、prod、test 等环境词。"
+                ),
             },
         },
         "required": ["code"],
@@ -275,14 +279,16 @@ class SubmitPythonJobTool(BaseAssistantTool):
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "输入文件 ID；省略时使用当前 source_file_id，"
-                    "传空数组表示不使用输入文件。"
+                    "输入文件 ID；省略时使用当前 source_file_id，传空数组表示不使用输入文件。"
                 ),
                 "maxItems": 8,
             },
             "primary_output": {
                 "type": "string",
-                "description": "outputs/ 下作为任务主要结果的文件名；默认使用第一个输出。",
+                "description": (
+                    "outputs/ 下作为任务主要结果的文件名。用户指定文件名时必须原样采用；"
+                    "未指定时使用能表达内容的简洁中文文件名，并保留 dev、prod、test 等环境词。"
+                ),
             },
             "evaluation_plan": {
                 "type": "object",
@@ -343,16 +349,20 @@ class SubmitPythonJobTool(BaseAssistantTool):
         raw_plan = kwargs.get("evaluation_plan")
         evaluation_plan = raw_plan if isinstance(raw_plan, dict) else {}
         raw_plan_steps = evaluation_plan.get("steps")
-        plan_steps = [
-            {
-                "title": str(item.get("title") or "评测步骤"),
-                "instruction": str(item.get("description") or "按照评测目标执行。"),
-                "phase": str(item.get("phase") or "execution"),
-                "type": "agent_step",
-            }
-            for item in raw_plan_steps
-            if isinstance(item, dict)
-        ] if isinstance(raw_plan_steps, list) else []
+        plan_steps = (
+            [
+                {
+                    "title": str(item.get("title") or "评测步骤"),
+                    "instruction": str(item.get("description") or "按照评测目标执行。"),
+                    "phase": str(item.get("phase") or "execution"),
+                    "type": "agent_step",
+                }
+                for item in raw_plan_steps
+                if isinstance(item, dict)
+            ]
+            if isinstance(raw_plan_steps, list)
+            else []
+        )
         eval_spec = {
             "execution_mode": "agent_python",
             "summary": str(evaluation_plan.get("summary") or goal),
@@ -369,9 +379,7 @@ class SubmitPythonJobTool(BaseAssistantTool):
             job = AgentJob(
                 project_id=context.project_id,
                 created_by=context.actor_id,
-                source_file_id=(
-                    UUID(resolved_source_ids[0]) if resolved_source_ids else None
-                ),
+                source_file_id=(UUID(resolved_source_ids[0]) if resolved_source_ids else None),
                 title=title,
                 goal=goal,
                 status=AgentJobStatus.PENDING,
@@ -381,6 +389,11 @@ class SubmitPythonJobTool(BaseAssistantTool):
                     "source_file_ids": resolved_source_ids,
                     "primary_output": primary_output,
                     "output_format": output_format,
+                    **(
+                        {"conversation_id": str(context.conversation_id)}
+                        if context.conversation_id
+                        else {}
+                    ),
                     **(
                         {"evaluation_model_id": str(context.draft["evaluation_model_id"])}
                         if context.draft.get("evaluation_model_id")
@@ -402,42 +415,20 @@ class SubmitPythonJobTool(BaseAssistantTool):
                     finished_at=recorded_at,
                 )
             )
-            excluded_tools = {
-                "request_confirmation",
-                "request_output_format",
-                "request_user_input",
-                "send_wecom_message",
-                "submit_python_job",
-                "update_task_draft",
-            }
-            for index, item in enumerate(context.trace, start=1):
-                tool_name = str(item.get("name") or "").strip()
-                trace_status = str(item.get("status") or "")
-                if (
-                    not tool_name
-                    or tool_name in excluded_tools
-                    or trace_status not in {"completed", "failed"}
-                ):
-                    continue
-                safe_tool_name = re.sub(r"[^a-zA-Z0-9_]+", "_", tool_name).strip("_")
-                session.add(
-                    AgentStep(
-                        job_id=job.id,
-                        name=f"preflight_{index}_{safe_tool_name or 'tool'}"[:64],
-                        status=(
-                            StepStatus.COMPLETED
-                            if trace_status == "completed"
-                            else StepStatus.FAILED
-                        ),
-                        output_data={
-                            "label": str(item.get("label") or tool_name),
-                            "tool_name": tool_name,
-                            "phase": "preparation",
-                        },
-                        started_at=recorded_at,
-                        finished_at=recorded_at,
-                    )
+            session.add(
+                AgentStep(
+                    job_id=job.id,
+                    name="prepare_data",
+                    status=StepStatus.COMPLETED,
+                    output_data={
+                        "label": "准备评测数据",
+                        "phase": "preparation",
+                        "source_file_count": len(resolved_source_ids),
+                    },
+                    started_at=recorded_at,
+                    finished_at=recorded_at,
                 )
+            )
             session.add(
                 AgentStep(
                     job_id=job.id,
@@ -475,6 +466,50 @@ class SubmitPythonJobTool(BaseAssistantTool):
                 "job_id": str(job.id),
                 "status": "pending",
             },
+            ensure_ascii=False,
+        )
+
+
+class RepairPythonJobScriptTool(BaseAssistantTool):
+    name = "repair_python_job_script"
+    description = (
+        "仅在后台 Python 任务执行修复模式中使用。根据原对话和真实错误，"
+        "用完整修复脚本替换当前任务脚本，然后由原任务继续重试。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "修复后的完整 Python 脚本。"},
+            "summary": {"type": "string", "description": "本次修复内容的简短中文说明。"},
+        },
+        "required": ["code", "summary"],
+        "additionalProperties": False,
+    }
+    terminal = True
+
+    def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        if context.repair_job_id is None or context.project_id is None:
+            raise ValueError("当前不在 Python 任务修复模式")
+        code = str(kwargs.get("code") or "").strip()
+        if not code:
+            raise ValueError("修复脚本不能为空")
+        summary = str(kwargs.get("summary") or "已修复执行脚本").strip()
+        with Session(get_settings_engine()) as session:
+            job = session.get(AgentJob, context.repair_job_id)
+            if (
+                job is None
+                or job.project_id != context.project_id
+                or (context.actor_id is not None and job.created_by != context.actor_id)
+                or job.input_config.get("job_type") != "python"
+            ):
+                raise ValueError("待修复的 Python 任务不存在")
+            job.input_config = {**job.input_config, "python_code": code}
+            job.updated_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+        context.ui_action = {"type": "python_repaired", "summary": summary}
+        return json.dumps(
+            {"ok": True, "repaired": True, "summary": summary},
             ensure_ascii=False,
         )
 
@@ -531,22 +566,27 @@ class SendWeComMessageTool(BaseAssistantTool):
     name = "send_wecom_message"
     description = (
         "仅当用户明确要求发送企业微信消息时调用企业微信群机器人。"
-        "支持 text、markdown 和当前项目中的 file，不支持图片。"
+        "支持 text、markdown、markdown_v2 和当前项目中的 file，不支持图片。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "message_type": {
                 "type": "string",
-                "enum": ["text", "markdown", "file"],
+                "enum": ["text", "markdown", "markdown_v2", "file"],
             },
             "content": {
                 "type": "string",
-                "description": "文本或 Markdown 正文；发送文件时可省略。",
+                "description": (
+                    "文本或 Markdown 正文；发送文件时作为文件前的简短说明，省略则自动生成一句说明。"
+                ),
             },
             "recipient": {
                 "type": "string",
-                "description": "可选的企业微信用户 ID；文本消息会提醒该成员。",
+                "description": (
+                    "可选的企业微信用户 ID；text 和 markdown 可提醒该成员，"
+                    "markdown_v2 不支持提醒成员。"
+                ),
             },
             "source_file_id": {
                 "type": "string",
@@ -560,9 +600,7 @@ class SendWeComMessageTool(BaseAssistantTool):
     def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
         message_type = str(kwargs.get("message_type") or "").strip().lower()
         if message_type == "file":
-            raw_file_id = kwargs.get("source_file_id") or context.draft.get(
-                "source_file_id"
-            )
+            raw_file_id = kwargs.get("source_file_id") or context.draft.get("source_file_id")
             if not raw_file_id:
                 raise ValueError("发送企业微信文件需要 source_file_id")
             if context.project_id is None:
@@ -575,9 +613,18 @@ class SendWeComMessageTool(BaseAssistantTool):
                 file_object = session.get(FileObject, file_id)
                 if file_object is None or file_object.project_id != context.project_id:
                     raise ValueError("待发送文件不存在或不属于当前项目")
-                path = LocalFileStorage(
-                    get_settings().storage.local_directory
-                ).path_for(file_object.storage_key)
+                path = LocalFileStorage(get_settings().storage.local_directory).path_for(
+                    file_object.storage_key
+                )
+                recipient = str(kwargs.get("recipient") or "").strip()
+                notice = str(kwargs.get("content") or "").strip()
+                if not notice:
+                    notice = f"{file_object.original_name} 已生成，请查收。"
+                notice_message_id = send_wecom(
+                    notice,
+                    recipient,
+                    message_type="text",
+                )
                 provider_message_id = send_wecom_file(path, file_object.original_name)
                 return json.dumps(
                     {
@@ -585,12 +632,14 @@ class SendWeComMessageTool(BaseAssistantTool):
                         "message_type": "file",
                         "file_id": str(file_object.id),
                         "file_name": file_object.original_name,
+                        "notice": notice,
+                        "notice_message_id": notice_message_id,
                         "provider_message_id": provider_message_id,
                     },
                     ensure_ascii=False,
                 )
-        if message_type not in {"text", "markdown"}:
-            raise ValueError("企业微信仅支持 text、markdown、file 消息")
+        if message_type not in {"text", "markdown", "markdown_v2"}:
+            raise ValueError("企业微信仅支持 text、markdown、markdown_v2、file 消息")
         content = str(kwargs.get("content") or "").strip()
         if not content:
             raise ValueError("发送企业微信文本消息需要 content")
@@ -621,13 +670,21 @@ class RequestOutputFormatTool(BaseAssistantTool):
                 {"ok": False, "error": "任务尚未完成必要的文件检查或接口预检"},
                 ensure_ascii=False,
             )
+        if context.draft.get("output_format"):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "用户已经明确结果格式，无需再次展示格式选择",
+                },
+                ensure_ascii=False,
+            )
         context.ui_action = {"type": "choose_output"}
         return json.dumps({"ok": True, "waiting_for": "output_format"}, ensure_ascii=False)
 
 
 class RequestConfirmationTool(BaseAssistantTool):
     name = "request_confirmation"
-    description = "任务已准备好时，生成针对本任务的确认摘要并显示确认执行按钮。"
+    description = "任务已准备好时生成启动摘要，并通知前端立即执行，无需用户再次确认。"
     parameters = {
         "type": "object",
         "properties": {
@@ -657,8 +714,8 @@ class RequestConfirmationTool(BaseAssistantTool):
         if reviewer_error:
             return json.dumps({"ok": False, "error": reviewer_error}, ensure_ascii=False)
         summary = str(kwargs.get("summary", "")).replace("\\n", "\n").strip()
-        context.ui_action = {"type": "confirm", "summary": summary}
-        return json.dumps({"ok": True, "waiting_for": "confirmation"}, ensure_ascii=False)
+        context.ui_action = {"type": "start_task", "summary": summary}
+        return json.dumps({"ok": True, "starting": True}, ensure_ascii=False)
 
 
 class RequestUserInputTool(BaseAssistantTool):
@@ -683,10 +740,16 @@ class RequestUserInputTool(BaseAssistantTool):
         options = [str(item) for item in kwargs.get("options", [])]
         normalized_options = {item.strip().casefold() for item in options}
         if normalized_options == {"xlsx", "jsonl", "markdown", "text"}:
+            if context.draft.get("output_format"):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "用户已经明确结果格式，无需再次展示格式选择",
+                    },
+                    ensure_ascii=False,
+                )
             context.ui_action = {"type": "choose_output", "question": question}
-            return json.dumps(
-                {"ok": True, "waiting_for": "output_format"}, ensure_ascii=False
-            )
+            return json.dumps({"ok": True, "waiting_for": "output_format"}, ensure_ascii=False)
         context.ui_action = {
             "type": "user_input",
             "question": question,
@@ -700,6 +763,7 @@ ASSISTANT_TOOL_REGISTRY: list[BaseAssistantTool] = [
     InspectSourceTool(),
     RunPythonTool(),
     SubmitPythonJobTool(),
+    RepairPythonJobScriptTool(),
     ProbeHttpTargetTool(),
     SendWeComMessageTool(),
     RequestOutputFormatTool(),
@@ -750,11 +814,15 @@ def _ensure_human_review_defaults(draft: dict[str, Any]) -> None:
     if str(draft.get("goal", "")).strip():
         return
     rubric = draft.get("review_rubric")
-    labels = [
-        str(item.get("label", "")).strip()
-        for item in rubric
-        if isinstance(item, dict) and str(item.get("label", "")).strip()
-    ] if isinstance(rubric, list) else []
+    labels = (
+        [
+            str(item.get("label", "")).strip()
+            for item in rubric
+            if isinstance(item, dict) and str(item.get("label", "")).strip()
+        ]
+        if isinstance(rubric, list)
+        else []
+    )
     dimensions = "、".join(labels) or "已配置的评分"
     draft["goal"] = f"由指定评审人员按{dimensions}维度对文件中的回答进行人工评分。"
 
@@ -935,9 +1003,10 @@ def tool_label(name: str) -> str:
         "inspect_source": "检查数据文件",
         "run_python": "运行 Python 文件处理",
         "submit_python_job": "提交后台评测任务",
+        "repair_python_job_script": "修复执行脚本",
         "probe_http_target": "验证目标接口",
         "send_wecom_message": "发送企业微信消息",
         "request_output_format": "请求选择交付方式",
-        "request_confirmation": "请求确认任务",
+        "request_confirmation": "启动评测任务",
         "request_user_input": "请求补充信息",
     }.get(name, name)

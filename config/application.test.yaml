@@ -28,6 +28,7 @@ celery:
 storage:
   type: local
   local_directory: ./data/test-uploads
+  workspace_directory: ./data/test-workspaces
 
 logging:
   level: DEBUG

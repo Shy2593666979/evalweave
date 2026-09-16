@@ -6,15 +6,28 @@ import {
   CopyDocument,
   Document,
   Download,
+  Delete,
+  EditPen,
   Files,
   Grid,
+  MoreFilled,
   Paperclip,
   Plus,
   Promotion,
   Search,
   UserFilled,
 } from '@element-plus/icons-vue'
-import { ElButton, ElIcon, ElMessage, ElUpload } from 'element-plus'
+import {
+  ElButton,
+  ElDialog,
+  ElDropdown,
+  ElDropdownItem,
+  ElDropdownMenu,
+  ElIcon,
+  ElInput,
+  ElMessage,
+  ElUpload,
+} from 'element-plus'
 import type { UploadRequestOptions } from 'element-plus'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
@@ -32,6 +45,7 @@ import type {
   Project,
   ReactToolStep,
 } from '../types/agent'
+import { formatBeijingDateTime } from '../utils/datetime'
 
 const router = useRouter()
 const route = useRoute()
@@ -46,9 +60,15 @@ const sourceFileId = ref('')
 const modelId = ref('')
 const input = ref('')
 const conversationSearch = ref('')
+const conversationDialogMode = ref<'rename' | 'delete' | null>(null)
+const conversationDialogTarget = ref<AssistantConversation | null>(null)
+const conversationRenameTitle = ref('')
+const conversationDialogError = ref('')
+const conversationActionSubmitting = ref(false)
 const streamingConversationIds = ref<Set<string>>(new Set())
 const conversationMessageBuffers = new Map<string, AssistantMessage[]>()
 const conversationInputDrafts = new Map<string, string>()
+const conversationTitleEventSources = new Map<string, EventSource>()
 const uploading = ref(false)
 const starting = ref(false)
 const conversationSwitching = ref(false)
@@ -81,12 +101,32 @@ const filteredConversations = computed(() => {
   if (!keyword) return conversations.value
   return conversations.value.filter((conversation) => conversation.title.toLocaleLowerCase().includes(keyword))
 })
+const conversationDialogVisible = computed({
+  get: () => conversationDialogMode.value !== null,
+  set: (visible: boolean) => {
+    if (!visible && !conversationActionSubmitting.value) closeConversationDialog()
+  },
+})
 const lastAssistantIndex = computed(() => {
   for (let index = messages.value.length - 1; index >= 0; index -= 1) {
     if (messages.value[index]?.role === 'assistant') return index
   }
   return -1
 })
+
+function startsMessageGroup(index: number) {
+  const message = messages.value[index]
+  if (!message) return false
+  return index === 0 || messages.value[index - 1]?.role !== message.role
+}
+
+function followsAssistantMessage(index: number) {
+  return messages.value[index]?.role === 'assistant'
+}
+
+const finalReplyStartsAssistantGroup = computed(
+  () => messages.value.at(-1)?.role !== 'assistant',
+)
 const hasCompleteHumanReviewConfig = computed(() => {
   const draft = current.value?.draft
   return Boolean(
@@ -102,16 +142,6 @@ const hasCompleteHumanReviewConfig = computed(() => {
     && draft.review_rubric.length
     && Number(draft.deadline_hours) > 0,
   )
-})
-const confirmationAssistantIndex = computed(() => {
-  const confirmationIndex = messages.value.findIndex(
-    (message) => message.role === 'user' && message.content.trim() === '确认并开启',
-  )
-  if (confirmationIndex < 1) return -1
-  for (let index = confirmationIndex - 1; index >= 0; index -= 1) {
-    if (messages.value[index]?.role === 'assistant') return index
-  }
-  return -1
 })
 const hasRunnableConfig = computed(() => {
   const draft = current.value?.draft
@@ -143,20 +173,6 @@ const canStartTask = computed(() => hasRunnableConfig.value
   && !messages.value.at(-1)?.streaming
   && Boolean(messages.value.at(-1)?.content.trim()))
 
-const taskStartConfirmations = new Set([
-  '确认',
-  '确认执行',
-  '确认启动',
-  '确认并开启',
-  '开始执行',
-  '立即执行',
-])
-
-function isTaskStartConfirmation(content: string) {
-  const normalized = content.trim().replace(/[\s，。！!]+/g, '')
-  return taskStartConfirmations.has(normalized)
-}
-
 function humanReviewGoal(draft: Record<string, unknown>) {
   const rubric = Array.isArray(draft.review_rubric) ? draft.review_rubric : []
   const labels = rubric
@@ -166,10 +182,6 @@ function humanReviewGoal(draft: Record<string, unknown>) {
   return `由指定评审人员按${dimensions}维度对文件中的回答进行人工评分。`
 }
 
-function shouldShowStartTaskButton(index: number) {
-  if (canStartTask.value) return index === lastAssistantIndex.value
-  return current.value?.status === 'started' && index === confirmationAssistantIndex.value
-}
 function genericOptionsForMessage(message: AssistantMessage, index: number) {
   if (streaming.value || index !== lastAssistantIndex.value) return []
   const action = message.ui_action ?? undefined
@@ -189,6 +201,7 @@ const showRunError = computed(() => Boolean(
 const stepLabels: Record<string, string> = {
   discover_source: '理解数据',
   generate_eval_spec: '制定评测方案',
+  prepare_data: '准备评测数据',
   generate_test_cases: '生成测试用例',
   validate_target: '验证目标接口',
   update_task_draft: '修正请求配置',
@@ -235,7 +248,7 @@ const runTimelineItems = computed(() => {
           : dataProgramStreams.some((stream) => stream.status === 'failed') ? 'failed' : 'completed',
       }
     : undefined
-  return runSteps.value.map((step) => ({
+  return runSteps.value.filter((step) => !step.name.startsWith('preflight_')).map((step) => ({
     step,
     stream: streams.get(step.name)
       ?? (step.name === 'execute_eval_spec' ? streams.get('evaluate_results') ?? dataProgramStream : undefined),
@@ -286,10 +299,6 @@ function isStoredResultMessage(message: AssistantMessage) {
 
 const runInsertionIndex = computed(() => {
   if (!runJob.value) return -1
-  const confirmationIndex = messages.value.findIndex(
-    (message) => message.role === 'user' && message.content.trim() === '确认并开启',
-  )
-  if (confirmationIndex >= 0) return confirmationIndex
   const resultIndex = messages.value.findIndex(isStoredResultMessage)
   return resultIndex > 0 ? resultIndex - 1 : messages.value.length - 1
 })
@@ -326,7 +335,6 @@ function outputChoiceSubmitted(index: number) {
 
 function isActiveOutputChoice(index: number) {
   return index === lastAssistantIndex.value
-    && current.value?.status === 'choose_output'
     && !streaming.value
     && !outputChoiceSubmitted(index)
 }
@@ -367,7 +375,9 @@ async function loadFiles() {
 }
 
 async function loadConversations() {
-  conversations.value = (await api.get<AssistantConversation[]>('/assistant/conversations')).data
+  conversations.value = projectId.value
+    ? (await api.get<AssistantConversation[]>('/assistant/conversations', { params: { project_id: projectId.value } })).data
+    : []
 }
 
 async function createConversation() {
@@ -377,6 +387,87 @@ async function createConversation() {
   })).data
   conversations.value.unshift(conversation)
   await selectConversation(conversation)
+}
+
+function closeConversationDialog() {
+  conversationDialogMode.value = null
+  conversationDialogTarget.value = null
+  conversationRenameTitle.value = ''
+  conversationDialogError.value = ''
+}
+
+function openConversationDialog(
+  mode: 'rename' | 'delete',
+  conversation: AssistantConversation,
+) {
+  if (isConversationStreaming(conversation.id)) {
+    return ElMessage.warning(`请等待当前回复完成后再${mode === 'rename' ? '重命名' : '删除'}`)
+  }
+  conversationDialogTarget.value = conversation
+  conversationDialogMode.value = mode
+  conversationRenameTitle.value = conversation.title
+  conversationDialogError.value = ''
+}
+
+async function submitConversationAction() {
+  const conversation = conversationDialogTarget.value
+  const mode = conversationDialogMode.value
+  if (!conversation || !mode || conversationActionSubmitting.value) return
+  const title = conversationRenameTitle.value.trim()
+  if (mode === 'rename' && title.length < 2) {
+    conversationDialogError.value = '对话名称至少需要 2 个字符'
+    return
+  }
+  if (mode === 'rename' && title.length > 10) {
+    conversationDialogError.value = '对话名称不能超过 10 个字符'
+    return
+  }
+  conversationDialogError.value = ''
+  conversationActionSubmitting.value = true
+  try {
+    if (mode === 'rename') {
+      const updated = (await api.patch<AssistantConversation>(
+        `/assistant/conversations/${conversation.id}`,
+        { title },
+      )).data
+      const index = conversations.value.findIndex((item) => item.id === conversation.id)
+      if (index >= 0) conversations.value[index] = updated
+      if (current.value?.id === conversation.id) current.value = updated
+      ElMessage.success('对话已重命名')
+    } else {
+      await api.delete(`/assistant/conversations/${conversation.id}`)
+      conversationTitleEventSources.get(conversation.id)?.close()
+      conversationTitleEventSources.delete(conversation.id)
+      conversationMessageBuffers.delete(conversation.id)
+      conversationInputDrafts.delete(conversation.id)
+      const wasCurrent = current.value?.id === conversation.id
+      conversations.value = conversations.value.filter((item) => item.id !== conversation.id)
+      if (wasCurrent) {
+        stopRunEventStream()
+        stopAssistantMessageEventStream()
+        current.value = null
+        messages.value = []
+        const nextConversation = conversations.value[0]
+        if (nextConversation) await selectConversation(nextConversation)
+        else await createConversation()
+      }
+      ElMessage.success('对话已删除')
+    }
+    closeConversationDialog()
+  } catch (error) {
+    ElMessage.error(errorMessage(error))
+  } finally {
+    conversationActionSubmitting.value = false
+  }
+}
+
+function handleConversationCommand(
+  command: string | number | object,
+  conversation: AssistantConversation,
+) {
+  if (command === 'rename' || command === 'delete') {
+    openConversationDialog(command, conversation)
+  }
 }
 
 async function selectConversation(conversation: AssistantConversation) {
@@ -466,6 +557,37 @@ function stopAssistantMessageEventStream() {
   assistantMessageEventSource?.close()
   assistantMessageEventSource = null
   assistantMessageConversationId = ''
+}
+
+function startConversationTitleEventStream(conversationId: string) {
+  conversationTitleEventSources.get(conversationId)?.close()
+  const source = new EventSource(
+    `/api/assistant/conversations/${conversationId}/title/events`,
+  )
+  conversationTitleEventSources.set(conversationId, source)
+  const close = () => {
+    source.close()
+    if (conversationTitleEventSources.get(conversationId) === source) {
+      conversationTitleEventSources.delete(conversationId)
+    }
+  }
+  source.onmessage = (event) => {
+    try {
+      const updated = JSON.parse(event.data) as AssistantConversation
+      const listed = conversations.value.find((item) => item.id === conversationId)
+      if (listed) {
+        listed.title = updated.title
+        listed.updated_at = updated.updated_at
+      }
+      if (current.value?.id === conversationId) {
+        current.value.title = updated.title
+        current.value.updated_at = updated.updated_at
+      }
+    } finally {
+      close()
+    }
+  }
+  source.onerror = close
 }
 
 function startAssistantMessageEventStream(conversationId: string) {
@@ -737,12 +859,6 @@ async function sendMessage(text = input.value) {
   const attachedFile = selectedFile.value
   const content = text.trim() || (attachedFile ? '请分析这个文件。' : '')
   if (!content || !conversation || isConversationStreaming(conversation.id)) return
-  if (canStartTask.value && isTaskStartConfirmation(content)) {
-    input.value = ''
-    conversationInputDrafts.set(conversation.id, '')
-    await startTask()
-    return
-  }
   const conversationId = conversation.id
   const conversationMessages = messages.value
   const attachedSourceFileId = sourceFileId.value
@@ -777,6 +893,9 @@ async function sendMessage(text = input.value) {
       },
     )
     if (!response.ok || !response.body) throw new Error(`助手请求失败（${response.status}）`)
+    if (conversation.title === '新的评测对话') {
+      startConversationTitleEventStream(conversationId)
+    }
     if (sourceFileId.value === attachedSourceFileId) sourceFileId.value = ''
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
@@ -818,6 +937,10 @@ async function sendMessage(text = input.value) {
       conversationMessages.pop()
     }
     conversationMessageBuffers.delete(conversationId)
+    await nextTick()
+    if (current.value?.id === conversationId && canStartTask.value) {
+      await startTask()
+    }
   }
 }
 
@@ -836,7 +959,10 @@ async function startTask() {
   }
   starting.value = true
   try {
-    const inputConfig: Record<string, unknown> = { max_cases: Number(draft.max_cases ?? 100) }
+    const inputConfig: Record<string, unknown> = {
+      max_cases: Number(draft.max_cases ?? 100),
+      conversation_id: conversation.id,
+    }
     if (Array.isArray(draft.targets) && draft.targets.length) {
       inputConfig.targets = draft.targets
     }
@@ -890,10 +1016,6 @@ async function startTask() {
     })
     conversation.agent_job_id = job.id
     conversation.status = 'started'
-    if (current.value?.id === conversation.id) {
-      messages.value.push({ role: 'user', content: '确认并开启' })
-      await scrollToBottom()
-    }
     ElMessage.success(isHumanReview ? '人工评审已发布' : '评测任务已开始')
     if (!isHumanReview) await loadRun(job.id)
   } catch (error) {
@@ -906,19 +1028,16 @@ async function startTask() {
 onMounted(async () => {
   viewActive = true
   try {
-    const [projectResponse, modelResponse, conversationResponse] = await Promise.all([
-      api.get<Project[]>('/projects'),
-      api.get<EvaluationModelOption[]>('/evaluation-models'),
-      api.get<AssistantConversation[]>('/assistant/conversations'),
-    ])
+    const projectResponse = await api.get<Project[]>('/projects')
     if (!viewActive) return
     projects.value = projectResponse.data
-    models.value = modelResponse.data
-    conversations.value = conversationResponse.data
     const rememberedProject = localStorage.getItem('evalweave-project')
     projectId.value = projects.value.some((project) => project.id === rememberedProject)
       ? String(rememberedProject)
       : projects.value[0]?.id || ''
+    const modelResponse = await api.get<EvaluationModelOption[]>('/evaluation-models')
+    models.value = modelResponse.data
+    await loadConversations()
     modelId.value = models.value[0]?.id || ''
     if (!viewActive) return
     const requested = conversations.value.find(
@@ -938,6 +1057,8 @@ onUnmounted(() => {
   conversationSelectionVersion += 1
   stopRunEventStream()
   stopAssistantMessageEventStream()
+  for (const source of conversationTitleEventSources.values()) source.close()
+  conversationTitleEventSources.clear()
 })
 
 watch(
@@ -972,17 +1093,26 @@ watch(
           <input v-model="conversationSearch" type="search" placeholder="搜索对话" aria-label="搜索对话">
         </label>
         <div class="conversation-list-items">
-          <button
+          <div
             v-for="conversation in filteredConversations"
             :key="conversation.id"
-            type="button"
             class="conversation-item"
             :class="{ active: current?.id === conversation.id, streaming: isConversationStreaming(conversation.id) }"
-            @click="selectConversation(conversation)"
           >
-            <span class="conversation-item-icon"><el-icon><ChatDotRound /></el-icon></span>
-            <span class="conversation-item-copy"><strong>{{ conversation.title }}</strong></span>
-          </button>
+            <button type="button" class="conversation-item-main" @click="selectConversation(conversation)">
+              <span class="conversation-item-icon"><el-icon><ChatDotRound /></el-icon></span>
+              <span class="conversation-item-copy"><strong>{{ conversation.title }}</strong><small>{{ formatBeijingDateTime(conversation.updated_at) }}</small></span>
+            </button>
+            <el-dropdown trigger="click" placement="bottom-end" @command="handleConversationCommand($event, conversation)" @click.stop>
+              <button type="button" class="conversation-more" title="更多操作" aria-label="更多操作"><el-icon><MoreFilled /></el-icon></button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="rename">重命名</el-dropdown-item>
+                  <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
           <div v-if="!filteredConversations.length" class="conversation-empty"><el-icon><ChatDotRound /></el-icon><span>{{ conversations.length ? '没有匹配的对话' : '还没有对话' }}</span></div>
         </div>
       </aside>
@@ -991,8 +1121,11 @@ watch(
         <div ref="messagePane" class="assistant-message-pane" :class="{ switching: conversationSwitching }">
           <div class="assistant-message-inner">
             <template v-for="(message, index) in messages" :key="message.id ?? index">
-            <div class="assistant-message-row" :class="message.role">
-              <span v-if="message.role === 'assistant'" class="message-avatar"><el-icon><ChatDotRound /></el-icon></span>
+            <div class="assistant-message-row" :class="[message.role, { continuation: !startsMessageGroup(index) }]">
+              <template v-if="message.role === 'assistant'">
+                <span v-if="startsMessageGroup(index)" class="message-avatar"><el-icon><ChatDotRound /></el-icon></span>
+                <span v-else class="message-avatar-spacer" aria-hidden="true"></span>
+              </template>
               <div class="message-stack">
                 <div class="message-bubble">
                 <button
@@ -1040,9 +1173,6 @@ watch(
                     </button>
                   </div>
                 </div>
-                <div v-if="shouldShowStartTaskButton(index)" class="bubble-task-ready">
-                  <el-button type="primary" :loading="starting" :disabled="starting || current?.status === 'started'" @click="startTask">确认并开启</el-button>
-                </div>
                 <div v-if="genericOptionsForMessage(message, index).length" class="bubble-actions react-input-actions">
                   <button v-for="option in genericOptionsForMessage(message, index)" :key="option" @click="sendMessage(option)">{{ option }}</button>
                 </div>
@@ -1059,11 +1189,15 @@ watch(
                 </button>
                 </div>
               </div>
-              <span v-if="message.role === 'user'" class="message-avatar user-message-avatar" aria-label="用户头像"><el-icon><UserFilled /></el-icon></span>
+              <template v-if="message.role === 'user'">
+                <span v-if="startsMessageGroup(index)" class="message-avatar user-message-avatar" aria-label="用户头像"><el-icon><UserFilled /></el-icon></span>
+                <span v-else class="message-avatar-spacer" aria-hidden="true"></span>
+              </template>
             </div>
 
-            <div v-if="runJob && index === runInsertionIndex" class="assistant-message-row assistant react-run-row">
-              <span class="message-avatar"><el-icon><ChatDotRound /></el-icon></span>
+            <div v-if="runJob && index === runInsertionIndex" class="assistant-message-row assistant react-run-row" :class="{ continuation: followsAssistantMessage(index) }">
+              <span v-if="!followsAssistantMessage(index)" class="message-avatar"><el-icon><ChatDotRound /></el-icon></span>
+              <span v-else class="message-avatar-spacer" aria-hidden="true"></span>
               <div class="message-bubble react-run-bubble">
                 <div class="react-run-head"><div><strong>{{ runHeading }}</strong><span>{{ runJob.title }}</span></div><em :class="runJob.status">{{ runJob.status }}</em></div>
                 <div class="react-timeline">
@@ -1089,8 +1223,9 @@ watch(
             </div>
             </template>
 
-            <div v-if="finalAssistantReply && !finalReplyStoredInMessages" class="assistant-message-row assistant final-result-row">
-              <span class="message-avatar"><el-icon><ChatDotRound /></el-icon></span>
+            <div v-if="finalAssistantReply && !finalReplyStoredInMessages" class="assistant-message-row assistant final-result-row" :class="{ continuation: !finalReplyStartsAssistantGroup }">
+              <span v-if="finalReplyStartsAssistantGroup" class="message-avatar"><el-icon><ChatDotRound /></el-icon></span>
+              <span v-else class="message-avatar-spacer" aria-hidden="true"></span>
               <div class="message-stack">
                 <div class="message-bubble">
                   <button type="button" class="message-copy-button" title="复制全部内容" aria-label="复制全部内容" @click.stop="copyMessage(finalAssistantReply.content)"><el-icon><CopyDocument /></el-icon></button>
@@ -1125,5 +1260,37 @@ watch(
         </main>
       </div>
     </section>
+
+    <el-dialog
+      v-model="conversationDialogVisible"
+      width="min(420px, calc(100vw - 32px))"
+      class="conversation-action-dialog"
+      append-to-body
+      align-center
+      :show-close="!conversationActionSubmitting"
+      :close-on-click-modal="!conversationActionSubmitting"
+      :close-on-press-escape="!conversationActionSubmitting"
+    >
+      <template #header>
+        <div class="conversation-dialog-heading">
+          <span class="conversation-dialog-icon" :class="conversationDialogMode"><el-icon><Delete v-if="conversationDialogMode === 'delete'" /><EditPen v-else /></el-icon></span>
+          <div><strong>{{ conversationDialogMode === 'delete' ? '删除对话' : '重命名对话' }}</strong><small>{{ conversationDialogMode === 'delete' ? '此操作无法撤销' : '给这段对话一个更清晰的名称' }}</small></div>
+        </div>
+      </template>
+      <div v-if="conversationDialogMode === 'rename'" class="conversation-rename-form">
+        <el-input v-model="conversationRenameTitle" maxlength="10" placeholder="输入 2–10 个字符" size="large" autofocus @keyup.enter="submitConversationAction" />
+        <p v-if="conversationDialogError" class="conversation-dialog-error">{{ conversationDialogError }}</p>
+      </div>
+      <div v-else class="conversation-delete-copy">
+        <strong>{{ conversationDialogTarget?.title }}</strong>
+        <small>对话消息将被永久删除，项目文件和评测任务不受影响。</small>
+      </div>
+      <template #footer>
+        <div class="conversation-dialog-actions">
+          <el-button :disabled="conversationActionSubmitting" @click="closeConversationDialog">取消</el-button>
+          <el-button :type="conversationDialogMode === 'delete' ? 'danger' : 'primary'" :loading="conversationActionSubmitting" @click="submitConversationAction">{{ conversationDialogMode === 'delete' ? '确认删除' : '保存名称' }}</el-button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>

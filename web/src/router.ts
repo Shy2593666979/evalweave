@@ -26,6 +26,7 @@ const router = createRouter({
       meta: { anyPermission: ['evaluation:review', 'experiment:run'] },
     },
     { path: '/admin/users', name: 'admin-users', component: () => import('./views/admin/UsersView.vue'), meta: { admin: true } },
+    { path: '/admin/projects', name: 'admin-projects', component: () => import('./views/admin/ProjectsView.vue'), meta: { admin: true } },
     { path: '/admin/user-types', name: 'admin-user-types', component: () => import('./views/admin/UserTypesView.vue'), meta: { admin: true } },
     { path: '/admin/evaluation-models', name: 'admin-evaluation-models', component: () => import('./views/admin/EvaluationModelsView.vue'), meta: { admin: true } },
   ],

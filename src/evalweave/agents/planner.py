@@ -62,6 +62,18 @@ output columns and follow their declared types. Follow the user's instruction us
 data supplied. Arrays must contain directly usable cell values. Do not omit rows, add commentary,
 or return executable code."""
 
+PYTHON_REPAIR_PROMPT = """You repair a Python data-processing or evaluation script after a real
+execution failure. Return one JSON object with a single string field named code. Preserve the
+original task, inputs, outputs, requested file name, concurrency, and result schema. Fix the actual
+root cause shown in the error instead of hiding it. The script runs with its current directory as
+the workspace and must use relative Path("inputs") and Path("outputs") paths; never invent or
+hard-code an absolute workspace path. For batch HTTP or model calls, a timeout, connection error,
+HTTP 429, rate limit, TPM limit, malformed response, or failure of one item must not terminate the
+whole batch: retry that item a small bounded number of times with backoff, then record its failed
+status and error and continue processing the remaining items. Always generate the requested result
+file even when some rows fail. Do not remove authentication, validations, measurements, or useful
+output columns. Return code only inside the JSON field, without Markdown fences."""
+
 ASSISTANT_PROMPT = """You help a Chinese-speaking user configure an AI evaluation task through
 conversation using a ReAct loop. Return one JSON object with keys reply, draft, and tool_call.
 tool_call must be null or one object with name and arguments. When a tool is needed, set reply to a
@@ -142,6 +154,27 @@ def request_text(
     if not content:
         raise ValueError("Agent model returned empty summary")
     return content
+
+
+def repair_python_script(
+    config: AgentConfig,
+    goal: str,
+    code: str,
+    error: str,
+) -> str:
+    result = request_json(
+        config,
+        PYTHON_REPAIR_PROMPT,
+        {
+            "goal": goal,
+            "code": code,
+            "error": error[-6000:],
+        },
+    )
+    repaired = str(result.get("code") or "").strip()
+    if not repaired:
+        raise ValueError("模型没有返回修复后的 Python 脚本")
+    return repaired
 
 
 def extract_partial_json_string(document: str, key: str) -> str:

@@ -23,9 +23,9 @@ def login_as_developer(client: TestClient) -> None:
 
 
 def create_project(client: TestClient) -> str:
-    response = client.post("/api/projects", json={"name": "File storage test"})
-    assert response.status_code == 201
-    return response.json()["id"]
+    response = client.get("/api/projects")
+    assert response.status_code == 200
+    return response.json()[0]["id"]
 
 
 def test_upload_list_download_and_delete_file(client: TestClient) -> None:

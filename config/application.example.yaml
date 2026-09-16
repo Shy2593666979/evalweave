@@ -28,6 +28,7 @@ celery:
 storage:
   type: local
   local_directory: ./data/storage
+  workspace_directory: ./data/workspaces
 
 logging:
   level: INFO

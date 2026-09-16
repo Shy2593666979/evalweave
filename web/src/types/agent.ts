@@ -13,6 +13,8 @@ export interface Project {
   id: string
   name: string
   description: string | null
+  service_url: string | null
+  agent_context: string | null
   created_at: string
   updated_at: string
 }

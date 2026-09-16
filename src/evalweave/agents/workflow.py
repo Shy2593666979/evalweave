@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import update as sql_update
 from sqlmodel import Session, select
 
 from evalweave.agents.events import ModelEventPublisher
@@ -27,6 +28,7 @@ from evalweave.agents.planner import (
     generate_summary,
     generate_test_cases,
     model_map_rows,
+    repair_python_script,
 )
 from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.agents.react_runtime import stream_react_configuration
@@ -38,6 +40,7 @@ from evalweave.db.models import (
     AssistantConversation,
     AssistantMessage,
     FileObject,
+    Project,
     StepStatus,
 )
 from evalweave.db.session import get_engine
@@ -190,40 +193,261 @@ def run_step_with_retries(
     raise last_error or RuntimeError(f"Agent step failed: {name}")
 
 
+def recover_interrupted_python_jobs(session: Session) -> list[UUID]:
+    """Reset Python jobs left running when the worker process exited."""
+    recovered: list[UUID] = []
+    jobs = session.exec(
+        select(AgentJob).where(AgentJob.status == AgentJobStatus.RUNNING)
+    ).all()
+    for job in jobs:
+        if job.input_config.get("job_type") != "python":
+            continue
+        running_steps = session.exec(
+            select(AgentStep).where(
+                AgentStep.job_id == job.id,
+                AgentStep.status == StepStatus.RUNNING,
+            )
+        ).all()
+        if not running_steps:
+            continue
+        for step in running_steps:
+            step.status = StepStatus.PENDING
+            step.started_at = None
+            step.finished_at = None
+            step.error = None
+            step.updated_at = datetime.now(UTC)
+            session.add(step)
+        job.status = AgentJobStatus.PENDING
+        job.updated_at = datetime.now(UTC)
+        session.add(job)
+        recovered.append(job.id)
+    session.commit()
+    return recovered
+
+
+def repair_python_job_with_react(
+    session: Session,
+    job: AgentJob,
+    agent_config: Any,
+    python_code: str,
+    error: Exception,
+    attempt: int,
+) -> str:
+    """Repair a Python job inside its original assistant conversation."""
+    conversation: AssistantConversation | None = None
+    raw_conversation_id = job.input_config.get("conversation_id")
+    if raw_conversation_id:
+        try:
+            conversation = session.get(
+                AssistantConversation,
+                UUID(str(raw_conversation_id)),
+            )
+        except (TypeError, ValueError):
+            conversation = None
+    if conversation is None:
+        conversation = session.exec(
+            select(AssistantConversation).where(
+                AssistantConversation.agent_job_id == job.id
+            )
+        ).first()
+    if (
+        conversation is None
+        or conversation.project_id != job.project_id
+        or conversation.created_by != job.created_by
+    ):
+        return repair_python_script(
+            agent_config,
+            job.goal,
+            python_code,
+            str(error),
+        )
+
+    statement = (
+        select(AssistantMessage)
+        .where(
+            AssistantMessage.conversation_id == conversation.id,
+            (AssistantMessage.role == "user")
+            | (AssistantMessage.include_in_context == True),  # noqa: E712
+        )
+        .order_by(AssistantMessage.created_at)
+    )
+    messages = [
+        {"role": item.role, "content": item.content}
+        for item in session.exec(statement).all()
+    ]
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"后台执行 Observation：同一任务第 {attempt} 次执行失败。"
+                "请结合上面的原始对话和项目配置，修复同一个任务的完整脚本后继续执行。"
+                f"\n真实错误：\n{str(error)[-6000:]}"
+            ),
+        }
+    )
+    project = session.get(Project, job.project_id)
+    workspace = {
+        "project_id": str(job.project_id),
+        "project": {
+            "name": project.name if project else "",
+            "service_url": project.service_url if project else None,
+            "description": project.description if project else None,
+            "agent_context": project.agent_context if project else None,
+        },
+        "current_draft": dict(conversation.draft),
+        "execution_repair": {
+            "job_id": str(job.id),
+            "attempt": attempt,
+            "error": str(error)[-6000:],
+            "python_code": python_code,
+            "evaluation_plan": job.eval_spec,
+            "primary_output": job.input_config.get("primary_output"),
+            "output_format": job.input_config.get("output_format"),
+            "source_file_ids": job.input_config.get("source_file_ids", []),
+        },
+    }
+    project_id = job.project_id
+    actor_id = job.created_by
+    conversation_id = conversation.id
+    job_id = job.id
+    # The repair tool writes through its own short-lived session. End this session's
+    # read transaction first so SQLite does not retain a read lock during model work.
+    session.commit()
+    result: dict[str, Any] | None = None
+    for event_type, value in stream_react_configuration(
+        agent_config,
+        messages,
+        workspace,
+        project_id,
+        actor_id,
+        conversation_id,
+        job_id,
+        {
+            "repair_python_job_script",
+            "inspect_source",
+            "probe_http_target",
+            "run_python",
+        },
+        4,
+    ):
+        if event_type == "result" and isinstance(value, dict):
+            result = value
+
+    session.expire(job)
+    session.refresh(job)
+    repaired_code = str(job.input_config.get("python_code") or "").strip()
+    action = (result or {}).get("ui_action") or {}
+    if action.get("type") != "python_repaired" or not repaired_code:
+        raise RuntimeError("Agent 未能完成原任务脚本修复")
+    return repaired_code
+
+
 def execute_python_job(job_id: UUID) -> None:
     """Execute a tool-planned evaluation whose implementation uses Python."""
     with Session(get_engine()) as session:
         job = session.get(AgentJob, job_id)
-        if job is None or job.status in {
-            AgentJobStatus.COMPLETED,
-            AgentJobStatus.CANCELLED,
-        }:
+        if job is None:
             return
         if job.input_config.get("job_type") != "python":
             raise ValueError("任务不是 Python 后台任务")
+        claim = session.exec(
+            sql_update(AgentJob)
+            .where(
+                AgentJob.id == job_id,
+                AgentJob.status == AgentJobStatus.PENDING,
+            )
+            .values(status=AgentJobStatus.RUNNING, updated_at=datetime.now(UTC))
+        )
+        session.commit()
+        if claim.rowcount != 1:  # type: ignore[attr-defined]
+            return
+        session.expire_all()
+        job = session.get(AgentJob, job_id)
+        if job is None:
+            return
         ensure_pending_steps(session, job, ["execute_eval_spec", "summarize"])
-        update_job(session, job, AgentJobStatus.RUNNING)
         try:
             source_file_ids = job.input_config.get("source_file_ids")
             if not isinstance(source_file_ids, list):
                 source_file_ids = None
-            observation = run_step(
-                session,
-                job,
-                "execute_eval_spec",
-                lambda: run_python_workspace(
-                    session,
-                    job.project_id,
-                    {},
-                    str(job.input_config.get("python_code") or ""),
-                    [str(item) for item in source_file_ids]
-                    if source_file_ids is not None
-                    else None,
-                    str(job.input_config.get("primary_output") or "") or None,
-                    created_by=job.created_by,
-                    timeout_seconds=None,
-                )[0],
+            python_code = str(job.input_config.get("python_code") or "")
+            agent_config = resolve_agent_config(
+                session, job.input_config.get("evaluation_model_id")
             )
+            observation: dict[str, Any] | None = None
+            last_execution_error: Exception | None = None
+            for attempt in range(1, job.max_repair_attempts + 2):
+                try:
+                    observation = run_step(
+                        session,
+                        job,
+                        "execute_eval_spec",
+                        lambda code=python_code: run_python_workspace(
+                            session,
+                            job.project_id,
+                            {},
+                            code,
+                            [str(item) for item in source_file_ids]
+                            if source_file_ids is not None
+                            else None,
+                            str(job.input_config.get("primary_output") or "") or None,
+                            created_by=job.created_by,
+                            timeout_seconds=None,
+                        )[0],
+                        attempt=attempt,
+                    )
+                    break
+                except Exception as error:
+                    last_execution_error = error
+                    if attempt > job.max_repair_attempts:
+                        raise
+                    failed_step = session.exec(
+                        select(AgentStep)
+                        .where(
+                            AgentStep.job_id == job.id,
+                            AgentStep.name == "execute_eval_spec",
+                            AgentStep.status == StepStatus.FAILED,
+                        )
+                        .order_by(AgentStep.created_at.desc())
+                    ).first()
+                    if failed_step is not None:
+                        failed_step.status = StepStatus.PENDING
+                        failed_step.error = None
+                        failed_step.started_at = None
+                        failed_step.finished_at = None
+                        failed_step.updated_at = datetime.now(UTC)
+                        session.add(failed_step)
+                        session.commit()
+                    if not agent_config.enabled or not agent_config.model:
+                        time.sleep(min(2 ** (attempt - 1), 4))
+                        continue
+                    try:
+                        python_code = repair_python_job_with_react(
+                            session,
+                            job,
+                            agent_config,
+                            python_code,
+                            error,
+                            attempt,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to repair Python job %s on attempt %s",
+                            job.id,
+                            attempt,
+                        )
+                        time.sleep(min(2 ** (attempt - 1), 4))
+                        continue
+                    job.input_config = {
+                        **job.input_config,
+                        "python_code": python_code,
+                    }
+                    job.repair_attempts = attempt
+                    job.updated_at = datetime.now(UTC)
+                    session.add(job)
+                    session.commit()
+            if observation is None:
+                raise last_execution_error or RuntimeError("Python 任务执行失败")
             raw_file_id = observation.get("primary_output_file_id")
             job.result_file_id = UUID(str(raw_file_id)) if raw_file_id else None
             update_job(session, job, AgentJobStatus.ANALYZING)
@@ -261,9 +485,6 @@ def execute_python_job(job_id: UUID) -> None:
                         except Exception as error:
                             preview["preview_error"] = str(error)[:500]
                         execution["primary_result"] = preview
-                agent_config = resolve_agent_config(
-                    session, job.input_config.get("evaluation_model_id")
-                )
                 summary = run_streamed_model_output(
                     job,
                     "summarize",
@@ -807,7 +1028,7 @@ def execute_agent_job(job_id: UUID) -> None:
             try:
                 notify_agent_job_completed(session, job)
             except Exception:
-                logger.exception("Failed to send completion email for agent job %s", job.id)
+                logger.exception("Failed to send completion notification for agent job %s", job.id)
         except Exception as error:
             session.rollback()
             job = session.get(AgentJob, job_id)

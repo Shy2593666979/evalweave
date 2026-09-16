@@ -4,35 +4,23 @@ import {
   Clock,
   Document,
   Download,
-  Plus,
   Refresh,
-  VideoPlay,
   WarningFilled,
 } from '@element-plus/icons-vue'
 import {
   ElButton,
-  ElDialog,
   ElEmpty,
-  ElForm,
-  ElFormItem,
   ElIcon,
-  ElInput,
-  ElInputNumber,
   ElMessage,
-  ElOption,
-  ElRadioButton,
-  ElRadioGroup,
-  ElSelect,
-  ElSwitch,
   ElTag,
 } from 'element-plus'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, errorMessage } from '../api/client'
 import { useAuthStore } from '../stores/auth'
-import type { AgentJob, AgentRuntime, AgentStep, EvaluationModelOption, FileObject, Project } from '../types/agent'
+import type { AgentJob, AgentRuntime, AgentStep, FileObject, Project } from '../types/agent'
 import { formatBeijingDateTime, parseServerDateTime } from '../utils/datetime'
 
 const route = useRoute()
@@ -40,7 +28,6 @@ const router = useRouter()
 const auth = useAuthStore()
 const loading = ref(false)
 const detailLoading = ref(false)
-const starting = ref(false)
 const projects = ref<Project[]>([])
 const selectedProjectId = ref('')
 const files = ref<FileObject[]>([])
@@ -49,18 +36,6 @@ const selectedJob = ref<AgentJob | null>(null)
 const steps = ref<AgentStep[]>([])
 const runtime = ref<AgentRuntime | null>(null)
 const workerProbeFailures = ref(0)
-const evaluationModels = ref<EvaluationModelOption[]>([])
-const createJobVisible = ref(false)
-const jobForm = reactive({
-  title: '',
-  goal: '',
-  source_file_id: '',
-  target_url: '',
-  response_path: '',
-  max_cases: 100,
-  output_format: 'xlsx' as 'xlsx' | 'jsonl' | 'markdown' | 'text',
-  evaluation_model_id: '',
-})
 let jobEventSource: EventSource | null = null
 let jobEventJobId = ''
 let viewActive = false
@@ -101,7 +76,10 @@ const selectedFile = computed(() => files.value.find((item) => item.id === selec
 const isPythonJob = computed(() => selectedJob.value?.input_config.job_type === 'python')
 const currentSteps = computed(() => {
   const latest = new Map<string, AgentStep>()
-  for (const step of steps.value) latest.set(step.name, step)
+  for (const step of steps.value) {
+    if (step.name.startsWith('preflight_')) continue
+    latest.set(step.name, step)
+  }
   return [...latest.values()]
 })
 const hasEvaluationPlan = computed(() => (
@@ -162,6 +140,7 @@ const statusLabels: Record<AgentJob['status'], string> = {
 const stepLabels: Record<string, string> = {
   discover_source: '解析评测数据',
   generate_eval_spec: '生成评测方案',
+  prepare_data: '准备评测数据',
   generate_test_cases: '生成测试用例',
   validate_target: '预检目标接口',
   execute_eval_spec: '执行评测任务',
@@ -271,12 +250,6 @@ function statusType(status: AgentJob['status']) {
   if (status === 'failed' || status === 'cancelled') return 'danger'
   if (status === 'waiting_human') return 'warning'
   return 'primary'
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
 function pretty(value: unknown) {
@@ -391,53 +364,6 @@ async function selectJob(job: AgentJob, quiet = false) {
   await loadJobDetail(job.id, quiet)
 }
 
-function openCreateJob() {
-  if (!files.value.length) return ElMessage.warning('请先在评测助手中上传评测数据')
-  jobForm.title = ''
-  jobForm.goal = ''
-  jobForm.source_file_id = files.value[0]?.id ?? ''
-  jobForm.target_url = ''
-  jobForm.response_path = ''
-  jobForm.max_cases = 100
-  jobForm.output_format = 'xlsx'
-  jobForm.evaluation_model_id = evaluationModels.value[0]?.id ?? ''
-  createJobVisible.value = true
-}
-
-async function createAndStartJob() {
-  if (!jobForm.title.trim() || !jobForm.goal.trim() || !jobForm.source_file_id) {
-    return ElMessage.warning('请填写任务名称、评测目标并选择数据文件')
-  }
-  starting.value = true
-  try {
-    const inputConfig: Record<string, unknown> = { max_cases: jobForm.max_cases }
-    if (jobForm.target_url.trim()) {
-      inputConfig.target = {
-        url: jobForm.target_url.trim(),
-        body: '{{row}}',
-        response_path: jobForm.response_path.trim(),
-      }
-    }
-    const job = (await api.post<AgentJob>(`/projects/${selectedProjectId.value}/agent-jobs`, {
-      title: jobForm.title.trim(),
-      goal: jobForm.goal.trim(),
-      source_file_id: jobForm.source_file_id,
-      output_format: jobForm.output_format,
-      evaluation_model_id: jobForm.evaluation_model_id || null,
-      input_config: inputConfig,
-    })).data
-    await api.post(`/agent-jobs/${job.id}/start`)
-    createJobVisible.value = false
-    ElMessage.success('评测任务已启动')
-    await loadProjectData()
-    await selectJob(job)
-  } catch (error) {
-    ElMessage.error(errorMessage(error))
-  } finally {
-    starting.value = false
-  }
-}
-
 async function restartJob() {
   if (!selectedJob.value) return
   try {
@@ -468,13 +394,8 @@ onMounted(async () => {
   elapsedTimer = setInterval(() => { currentTime.value = Date.now() }, 1000)
   void loadRuntime()
   try {
-    const [, modelResponse] = await Promise.all([
-      loadProjects(),
-      api.get<EvaluationModelOption[]>('/evaluation-models'),
-    ])
+    await loadProjects()
     if (!viewActive) return
-    evaluationModels.value = modelResponse.data
-    jobForm.evaluation_model_id = evaluationModels.value[0]?.id ?? ''
     await loadProjectData()
   } catch (error) {
     if (viewActive) ElMessage.error(errorMessage(error))
@@ -492,13 +413,11 @@ onBeforeUnmount(() => {
 <template>
   <header class="page-header agent-page-header">
     <div>
-      <p class="eyebrow">评测工作台</p>
       <h1>评测任务</h1>
       <p>从数据准备到结果检查，完整跟踪每一次智能评测。</p>
     </div>
     <div class="page-actions">
       <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
-      <el-button v-if="canRun" type="primary" :icon="Plus" :disabled="!selectedProjectId" @click="openCreateJob">新建评测</el-button>
     </div>
   </header>
 
@@ -511,7 +430,7 @@ onBeforeUnmount(() => {
     <div><strong>任务执行进程未连接</strong><span>请启动 Celery Worker；否则新任务会停留在等待开始状态。</span></div>
   </div>
 
-  <section class="agent-workspace" v-loading="loading">
+  <section class="agent-workspace" :class="{ 'is-empty': !jobs.length }" v-loading="loading">
     <aside class="job-list surface">
       <div class="job-list-head"><strong>任务记录</strong><span>{{ jobs.length }}</span></div>
       <button
@@ -609,25 +528,4 @@ onBeforeUnmount(() => {
     </main>
 
   </section>
-
-  <el-dialog v-model="createJobVisible" title="新建评测任务" width="min(840px, 94vw)" class="agent-dialog">
-    <el-form label-position="top">
-      <div class="form-grid">
-        <el-form-item label="任务名称"><el-input v-model="jobForm.title" maxlength="128" placeholder="例如：多轮对话质量检查" /></el-form-item>
-        <el-form-item label="数据文件"><el-select v-model="jobForm.source_file_id" placeholder="选择已上传的数据"><el-option v-for="file in files" :key="file.id" :label="`${file.original_name} · ${formatBytes(file.size_bytes)}`" :value="file.id" /></el-select></el-form-item>
-      </div>
-      <div class="form-grid">
-        <el-form-item label="评测模型"><el-select v-model="jobForm.evaluation_model_id" placeholder="使用系统默认模型"><el-option label="系统默认模型" value="" /><el-option v-for="model in evaluationModels" :key="model.id" :label="`${model.name} · ${model.model_name}`" :value="model.id" /></el-select></el-form-item>
-        <el-form-item label="结果输出"><el-radio-group v-model="jobForm.output_format"><el-radio-button value="xlsx">Excel</el-radio-button><el-radio-button value="jsonl">JSONL</el-radio-button><el-radio-button value="markdown">Markdown</el-radio-button><el-radio-button value="text">纯文本</el-radio-button></el-radio-group></el-form-item>
-      </div>
-      <el-form-item label="评测目标"><el-input v-model="jobForm.goal" type="textarea" :rows="4" maxlength="10000" show-word-limit placeholder="说明希望检查的能力、质量标准和重点风险" /></el-form-item>
-      <div class="form-grid">
-        <el-form-item label="目标接口地址"><el-input v-model="jobForm.target_url" placeholder="可选，例如 https://model.example/chat" /></el-form-item>
-        <el-form-item label="响应内容路径"><el-input v-model="jobForm.response_path" placeholder="可选，例如 data.reply" /></el-form-item>
-      </div>
-      <el-form-item label="最多执行条数"><el-input-number v-model="jobForm.max_cases" :min="1" :max="10000" controls-position="right" /></el-form-item>
-      <p class="form-hint">目标接口的域名需要由管理员加入服务端允许名单；请求体默认使用数据文件中的每一行。</p>
-    </el-form>
-    <template #footer><el-button @click="createJobVisible = false">取消</el-button><el-button type="primary" :icon="VideoPlay" :loading="starting" @click="createAndStartJob">创建并启动</el-button></template>
-  </el-dialog>
 </template>

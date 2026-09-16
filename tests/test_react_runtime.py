@@ -266,7 +266,7 @@ def test_human_review_confirmation_derives_goal_when_model_omits_it() -> None:
     confirmation = RequestConfirmationTool().run(context, summary="请确认并开启任务。")
 
     assert '"ok": true' in confirmation
-    assert context.ui_action == {"type": "confirm", "summary": "请确认并开启任务。"}
+    assert context.ui_action == {"type": "start_task", "summary": "请确认并开启任务。"}
 
 
 def test_human_review_confirmation_rejects_empty_reviewer_group() -> None:

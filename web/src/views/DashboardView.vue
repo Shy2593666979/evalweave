@@ -59,6 +59,12 @@ const auth = useAuthStore()
         <el-icon class="action-arrow"><ArrowRight /></el-icon>
       </router-link>
 
+      <router-link v-if="auth.isAdmin" to="/admin/projects" class="action-card">
+        <span class="action-icon"><NavFeatureIcon kind="admin-projects" /></span>
+        <div><strong>项目管理</strong><p>创建项目、补充项目背景并分配可访问成员。</p></div>
+        <el-icon class="action-arrow"><ArrowRight /></el-icon>
+      </router-link>
+
       <router-link v-if="auth.isAdmin" to="/admin/user-types" class="action-card">
         <span class="action-icon"><NavFeatureIcon kind="user-types" /></span>
         <div><strong>用户类型</strong><p>维护用户类型以及每类用户可使用的功能权限。</p></div>

@@ -121,7 +121,7 @@ onMounted(loadAll)
 
 <template>
   <header class="page-header">
-    <div><p class="eyebrow">人工协作</p><h1>人工评审</h1><p>完成分配给你的模型回复评分，或查看你发起的评审进度。</p></div>
+    <div><h1>人工评审</h1><p>完成分配给你的模型回复评分，或查看你发起的评审进度。</p></div>
     <div class="page-actions"><el-button :icon="Refresh" :loading="loading" @click="loadAll">刷新</el-button></div>
   </header>
 

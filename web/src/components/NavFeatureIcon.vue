@@ -5,6 +5,7 @@ defineProps<{
     | 'assistant'
     | 'evaluations'
     | 'human-tasks'
+    | 'admin-projects'
     | 'admin-users'
     | 'user-types'
     | 'evaluation-models'
@@ -35,6 +36,10 @@ defineProps<{
       <circle cx="9.2" cy="8" r="3.1"/>
       <path d="M3.4 19.5v-1.2a5.1 5.1 0 0 1 5.1-5.1h1.4a5.1 5.1 0 0 1 5.1 5.1v1.2"/>
       <path d="M15.1 5.6a2.75 2.75 0 0 1 0 5.1M16.7 13.5a4.7 4.7 0 0 1 3.9 4.65v1.35"/>
+    </template>
+    <template v-else-if="kind === 'admin-projects'">
+      <path d="M3.25 7.45h17.5v10.7a2.1 2.1 0 0 1-2.1 2.1H5.35a2.1 2.1 0 0 1-2.1-2.1V7.45Z"/>
+      <path d="M3.65 7.45V5.8a2.05 2.05 0 0 1 2.05-2.05h4.15l2.05 2.1h6.75a2.1 2.1 0 0 1 2.1 1.6"/>
     </template>
     <template v-else-if="kind === 'user-types'">
       <rect x="3.2" y="4.1" width="17.6" height="15.8" rx="3"/>

@@ -27,7 +27,7 @@ def register_and_login(client: TestClient, username: str, user_type_code: str) -
 
 def test_human_review_assignment_is_private_and_aggregates(client: TestClient) -> None:
     initiator = register_and_login(client, "review_initiator", "development")
-    project = client.post("/api/projects", json={"name": "Human review"}).json()
+    project = client.get("/api/projects").json()[0]
     job = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
         json={"title": "Blind review source", "goal": "Compare response quality"},
@@ -110,7 +110,7 @@ def test_create_human_review_from_excel_for_groups_and_named_user(
         lambda *_args, **_kwargs: None,
     )
     initiator = register_and_login(client, "file_review_owner", "development")
-    project = client.post("/api/projects", json={"name": "Excel review"}).json()
+    project = client.get("/api/projects").json()[0]
 
     workbook = Workbook()
     sheet = workbook.active

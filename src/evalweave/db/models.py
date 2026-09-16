@@ -97,6 +97,17 @@ class Project(TimestampMixin, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str = Field(index=True, max_length=128)
     description: str | None = Field(default=None, sa_column=Column(Text))
+    service_url: str | None = Field(default=None, max_length=512)
+    agent_context: str | None = Field(default=None, sa_column=Column(Text))
+
+
+class ProjectMember(TimestampMixin, table=True):
+    __tablename__ = "project_members"
+    __table_args__ = (UniqueConstraint("project_id", "user_id"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    project_id: UUID = Field(foreign_key="projects.id", index=True)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
 
 
 class FileObject(TimestampMixin, table=True):

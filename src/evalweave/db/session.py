@@ -37,8 +37,25 @@ def create_db_and_tables() -> None:
     engine = get_engine()
     SQLModel.metadata.create_all(engine)
     _ensure_user_email_column(engine)
+    _ensure_project_context_columns(engine)
     _ensure_assistant_message_attachment_columns(engine)
     _ensure_human_review_campaign_columns(engine)
+
+
+def _ensure_project_context_columns(engine: Engine) -> None:
+    """Add the optional project context fields to existing installations."""
+    inspector = inspect(engine)
+    if "projects" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("projects")}
+    additions = {
+        "service_url": "VARCHAR(512) NULL",
+        "agent_context": "TEXT NULL",
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in existing:
+                connection.execute(text(f"ALTER TABLE projects ADD COLUMN {name} {definition}"))
 
 
 def _ensure_user_email_column(engine: Engine) -> None:

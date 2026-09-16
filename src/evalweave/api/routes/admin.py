@@ -19,6 +19,7 @@ from evalweave.auth.schemas import (
 )
 from evalweave.auth.security import hash_password
 from evalweave.auth.service import (
+    assign_default_project,
     commit_or_conflict,
     ensure_user_type,
     user_to_read,
@@ -193,6 +194,7 @@ def create_user(payload: UserCreate, _: AdminUser, session: SessionDependency) -
     session.add(user)
     commit_or_conflict(session, "用户名或邮箱已存在")
     session.refresh(user)
+    assign_default_project(session, user)
     return user_to_read(session, user)
 
 

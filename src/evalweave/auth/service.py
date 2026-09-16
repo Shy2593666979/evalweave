@@ -8,7 +8,7 @@ from evalweave.auth.permissions import DEFAULT_USER_TYPES, Permission
 from evalweave.auth.schemas import UserRead
 from evalweave.auth.security import hash_password
 from evalweave.core.config import get_settings
-from evalweave.db.models import SystemRole, User, UserType
+from evalweave.db.models import Project, ProjectMember, SystemRole, User, UserType
 from evalweave.db.session import get_engine
 
 
@@ -61,6 +61,24 @@ def user_to_read(session: Session, user: User) -> UserRead:
         created_at=user.created_at,
         last_login_at=user.last_login_at,
     )
+
+
+def assign_default_project(session: Session, user: User) -> None:
+    """Place a new regular user in the oldest project so the account is immediately usable."""
+    if user.system_role != SystemRole.USER:
+        return
+    project = session.exec(select(Project).order_by(Project.created_at)).first()
+    if project is None:
+        return
+    exists = session.exec(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id == user.id,
+        )
+    ).first()
+    if exists is None:
+        session.add(ProjectMember(project_id=project.id, user_id=user.id))
+        session.commit()
 
 
 def bootstrap_identity_data() -> None:

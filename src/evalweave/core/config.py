@@ -47,6 +47,7 @@ class CeleryConfig(StrictModel):
 class StorageConfig(StrictModel):
     type: Literal["local"] = "local"
     local_directory: Path = Path("./data/uploads")
+    workspace_directory: Path = Path("./data/workspaces")
 
 
 class LoggingConfig(StrictModel):

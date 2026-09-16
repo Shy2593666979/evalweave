@@ -7,6 +7,7 @@ from evalweave.auth.dependencies import CurrentUser, SessionDependency
 from evalweave.auth.schemas import LoginRequest, RegisterRequest, UserRead, UserTypeRead
 from evalweave.auth.security import create_access_token, hash_password, verify_password
 from evalweave.auth.service import (
+    assign_default_project,
     commit_or_conflict,
     ensure_user_type,
     user_to_read,
@@ -41,6 +42,7 @@ def register(payload: RegisterRequest, session: SessionDependency) -> UserRead:
     session.add(user)
     commit_or_conflict(session, "用户名或邮箱已存在")
     session.refresh(user)
+    assign_default_project(session, user)
     return user_to_read(session, user)
 
 

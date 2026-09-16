@@ -22,6 +22,10 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
 需要用户输入或任务配置可以确认。工具及调用顺序不固定，必须由当前任务决定。
 
 规则：
+- 当当前工作区包含 execution_repair 时，表示原后台任务执行失败。必须结合原对话、项目配置、任务草稿、
+  旧脚本和失败 Observation 继续原来的 ReAct 工作，不得把它当成脱离上下文的新任务。按需检查数据、
+  探测接口或小范围试跑，最终调用 repair_python_job_script 更新同一个任务的完整脚本；不得创建新任务、
+  请求结果格式或请求确认。修复脚本必须保留原文件名、输出格式、并发数、鉴权和业务字段约定。
 - 先调用 update_task_draft 保存已经明确的信息。任务名由你生成，不得询问用户。
 - 有文件时按需调用 inspect_source，不要猜测文件结构。
 - 用户要求创建、修改、清洗、展开、合并、拆分或转换项目文件时，调用 run_python 直接完成；
@@ -32,6 +36,11 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
   并更新为 current_draft.source_file_id。继续重命名或修改时，省略 source_file_ids 即可将该文件重新
   装载到新的 inputs/；不得检查上一轮 outputs/，不得声称文件已清空，也不得无故从头重新生成数据。
 - Python 环境提供 httpx、requests、openpyxl 和 pandas，可按任务选择合适的 HTTP 与表格处理库。
+- 生成包含批量 HTTP、模型或外部接口调用的脚本时，每条数据必须独立捕获超时、连接错误、HTTP 429、
+  TPM/限流和响应解析异常；单条请求使用少量有界重试和退避，仍失败则记录状态与错误并继续后续数据，
+  不得让一条失败终止整批。无论是否存在失败行，都应尽量生成包含成功、失败和错误原因的结果文件。
+- run_python 返回失败 Observation 时，不得立即把原始异常作为最终答复。先根据真实错误修正脚本并重新
+  调用，最多进行 3 轮有效修复；只有连续修复仍失败后，才向用户简洁说明最终无法解决的原因。
 - run_python 最多执行 30 秒，用于快速文件处理、探索、抽样试跑和验证真实响应或数据结构。
   预计超过 30 秒、包含批量 HTTP/模型调用或属于批量评测时，使用 submit_python_job 提交完整脚本。
   调用 inspect_source、probe_http_target、run_python 时，用 step_title 写明当前业务目的，例如
@@ -47,6 +56,10 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
   manifest.json、临时工作区路径、存储键或脚本内部目录；文件完成后可以展示原始文件名，但不得自行
   生成、猜测或拼接任何下载 URL，也不得输出 Markdown 下载链接。系统会根据工具返回的 file_id 自动
   渲染文件下载入口。
+- 生成文件时，用户明确指定文件名就按其指定名称生成，不得擅自改名；用户没有指定时，根据内容生成
+  简洁、可读、尽量使用中文的业务文件名，dev、prod、test 等环境名称可以保留英文。不得使用
+  result.xlsx、output.xlsx、data.xlsx 等无意义名称。用户没有明确要求源代码时，不得把 .py 脚本作为
+  primary_output 或最终交付文件。
 - 有 HTTP 目标和可构造的请求体后调用 probe_http_target；不要让用户提供可由预检获得的响应示例、
   response_path 或是否流式。预检失败后根据 Observation 修正参数并重试，只有无法推断的信息才询问。
   如果 current_draft.target_validated 已为 true 且 URL、请求体没有变化，不得重复预检。
@@ -62,9 +75,12 @@ REACT_SYSTEM_PROMPT = """你是 EvalWeave 评测 Agent。你必须使用 ReAct �
   不要要求用户自行完成连通性验证。
 - HTTP 目标不需要加入白名单；不得询问用户是否允许目标主机，也不得声称主机被白名单拦截。
 - 缺少真正必要的信息时调用 request_user_input。不要在普通文本中假装请求了用户输入。
-- 配置检查完成但缺少 output_format 时调用 request_output_format。
-- 配置检查完成且已有 output_format 时调用 request_confirmation，并在 summary 中生成针对本次任务的
-  确认摘要。不得使用固定模板，不得直接开始执行。
+- 用户提到 Excel/xlsx、JSONL/JSON、Markdown/md、纯文本/txt 或“不需要文件”时，应立即将其映射为
+  xlsx、jsonl、markdown、text 并通过 update_task_draft 保存；文件名中的扩展名也视为已经明确格式。
+  已明确 output_format 时不得再询问或调用 request_output_format。
+- 配置检查完成且用户确实没有提到结果格式时，调用 request_output_format 展示选择按钮。
+- 配置检查完成且已有 output_format 时调用 request_confirmation，并在 summary 中简洁说明任务
+  即将启动。该工具会触发前端立即执行，不得询问用户是否确认，也不得要求用户再点击确认按钮。
 - 工具调用前可以输出一句简短进度；最终不要展示内部思维过程。
 """
 
@@ -72,9 +88,13 @@ REACT_SYSTEM_PROMPT += """
 
 企业微信发送规则：
 - 只有用户明确要求“发送到企业微信”时才调用 send_wecom_message，不得把普通回复或任务通知擅自外发。
-- 仅支持 text、markdown、file；图片不支持，也不得把图片伪装成文件发送。
+- 仅支持 text、markdown、markdown_v2、file；图片不支持，也不得把图片伪装成文件发送。
+- 需要表格、列表或代码块等完整 Markdown 能力时使用 markdown_v2；需要 @成员时使用 text 或 markdown。
+  markdown_v2 不支持 @成员，不得同时传 recipient。
 - 发送文件时使用当前项目已有的 source_file_id。若文件刚由 run_python 创建，优先使用其返回的
   primary_output_file_id；无需让用户下载后重新上传。
+- 发送文件时必须同时提供一句简短说明。send_wecom_message 会保证先发送说明文字、再发送文件；
+  不要只向企业微信群投递一个没有上下文的文件。
 - 工具成功后向用户说明已发送；工具失败时如实说明错误，不得假称发送成功。
 """
 
@@ -95,13 +115,20 @@ REACT_SYSTEM_PROMPT += """
 - 人工评审不需要结果文件格式，update_task_draft 会自动使用 text。信息完整后直接请求确认。
 - 当前工作区会提供 reviewer_type_counts 和 available_reviewer_usernames；
   人数为 0 的群组或不存在的用户名不得进入确认，必须说明实际可用人员并请用户重新选择。
-- 只有 request_confirmation 成功后才能告诉用户配置已完成并等待确认；
-  不得在普通文本中声称任务已经启动。
+- 只有 request_confirmation 成功后才能告诉用户配置已完成并即将启动；不得要求用户再次确认。
 """
 
 
-def _tool_map() -> dict[str, BaseAssistantTool]:
-    return {tool.name: tool for tool in ASSISTANT_TOOL_REGISTRY}
+def _tool_map(allowed_tool_names: set[str] | None = None) -> dict[str, BaseAssistantTool]:
+    return {
+        tool.name: tool
+        for tool in ASSISTANT_TOOL_REGISTRY
+        if (
+            tool.name != "repair_python_job_script"
+            if allowed_tool_names is None
+            else tool.name in allowed_tool_names
+        )
+    }
 
 
 def _run_tool(
@@ -122,12 +149,13 @@ def _terminal_reply(context: AssistantToolContext, fallback: str) -> str:
     action = context.ui_action or {}
     if action.get("type") == "background_job":
         job_id = str(action.get("job_id") or "")
-        return (
-            "后台任务已启动，你可以前往"
-            f"[评测任务](/evaluations/{job_id})查看运行状态和结果。"
-        )
+        return f"后台任务已启动，你可以前往[评测任务](/evaluations/{job_id})查看运行状态和结果。"
     if action.get("type") == "confirm":
         return str(action.get("summary") or fallback or "请确认是否开始执行。")
+    if action.get("type") == "start_task":
+        return str(action.get("summary") or fallback or "配置已完成，正在启动任务。")
+    if action.get("type") == "python_repaired":
+        return str(action.get("summary") or fallback or "脚本已修复，正在重新执行。")
     if action.get("type") == "user_input":
         return str(action.get("question") or fallback or "请补充必要信息。")
     if action.get("type") == "choose_output":
@@ -168,13 +196,15 @@ def _stream_chat_completions(
     messages: list[dict[str, Any]],
     workspace: dict[str, Any],
     context: AssistantToolContext,
+    allowed_tool_names: set[str] | None = None,
+    max_rounds: int = MAX_REACT_ROUNDS,
 ) -> Iterator[tuple[str, Any]]:
-    tools = _tool_map()
+    tools = _tool_map(allowed_tool_names)
     history: list[dict[str, Any]] = list(messages)
-    system_prompt = REACT_SYSTEM_PROMPT + "\n当前工作区状态：" + json.dumps(
-        workspace, ensure_ascii=False
+    system_prompt = (
+        REACT_SYSTEM_PROMPT + "\n当前工作区状态：" + json.dumps(workspace, ensure_ascii=False)
     )
-    for _ in range(MAX_REACT_ROUNDS):
+    for _ in range(max_rounds):
         stream = model_client.stream_tools(
             system_prompt,
             history,
@@ -223,12 +253,15 @@ def _stream_chat_completions(
                         entry["emitted"] = visible
                         yield "delta", visible_delta
         if not calls:
-            yield "result", {
-                "reply": content,
-                "draft": context.draft,
-                "ui_action": context.ui_action,
-                "react_trace": context.trace,
-            }
+            yield (
+                "result",
+                {
+                    "reply": content,
+                    "draft": context.draft,
+                    "ui_action": context.ui_action,
+                    "react_trace": context.trace,
+                },
+            )
             return
         ordered_calls = [calls[index] for index in sorted(calls)]
         streamed_terminal_text: dict[str, str] = {}
@@ -264,23 +297,22 @@ def _stream_chat_completions(
             trace_item["summary"] = parsed
             yield "tool_result", trace_item
             history.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-            if (
-                tool is not None
-                and (tool.terminal or parsed.get("queued"))
-                and parsed.get("ok")
-            ):
+            if tool is not None and (tool.terminal or parsed.get("queued")) and parsed.get("ok"):
                 terminal_reply = _terminal_reply(context, content)
                 remaining = _remaining_terminal_text(
                     terminal_reply, streamed_terminal_text.get(call["id"], ""), content
                 )
                 if remaining:
                     yield "delta", remaining
-                yield "result", {
-                    "reply": terminal_reply,
-                    "draft": context.draft,
-                    "ui_action": context.ui_action,
-                    "react_trace": context.trace,
-                }
+                yield (
+                    "result",
+                    {
+                        "reply": terminal_reply,
+                        "draft": context.draft,
+                        "ui_action": context.ui_action,
+                        "react_trace": context.trace,
+                    },
+                )
                 return
     raise ValueError("Agent 超过最大 ReAct 轮次")
 
@@ -298,13 +330,15 @@ def _stream_responses(
     messages: list[dict[str, Any]],
     workspace: dict[str, Any],
     context: AssistantToolContext,
+    allowed_tool_names: set[str] | None = None,
+    max_rounds: int = MAX_REACT_ROUNDS,
 ) -> Iterator[tuple[str, Any]]:
-    tools = _tool_map()
+    tools = _tool_map(allowed_tool_names)
     history: list[dict[str, Any]] = list(messages)
-    system_prompt = REACT_SYSTEM_PROMPT + "\n当前工作区状态：" + json.dumps(
-        workspace, ensure_ascii=False
+    system_prompt = (
+        REACT_SYSTEM_PROMPT + "\n当前工作区状态：" + json.dumps(workspace, ensure_ascii=False)
     )
-    for _ in range(MAX_REACT_ROUNDS):
+    for _ in range(max_rounds):
         stream = model_client.stream_tools(
             system_prompt,
             history,
@@ -365,12 +399,15 @@ def _stream_responses(
                 output_items.append(item)
         calls = [item for item in output_items if item.get("type") == "function_call"]
         if not calls:
-            yield "result", {
-                "reply": content,
-                "draft": context.draft,
-                "ui_action": context.ui_action,
-                "react_trace": context.trace,
-            }
+            yield (
+                "result",
+                {
+                    "reply": content,
+                    "draft": context.draft,
+                    "ui_action": context.ui_action,
+                    "react_trace": context.trace,
+                },
+            )
             return
         if not any(streamed_terminal_text.values()):
             yield "round_end", None
@@ -405,11 +442,7 @@ def _stream_responses(
                     "output": result,
                 }
             )
-            if (
-                tool is not None
-                and (tool.terminal or parsed.get("queued"))
-                and parsed.get("ok")
-            ):
+            if tool is not None and (tool.terminal or parsed.get("queued")) and parsed.get("ok"):
                 terminal_reply = _terminal_reply(context, content)
                 remaining = _remaining_terminal_text(
                     terminal_reply,
@@ -418,12 +451,15 @@ def _stream_responses(
                 )
                 if remaining:
                     yield "delta", remaining
-                yield "result", {
-                    "reply": terminal_reply,
-                    "draft": context.draft,
-                    "ui_action": context.ui_action,
-                    "react_trace": context.trace,
-                }
+                yield (
+                    "result",
+                    {
+                        "reply": terminal_reply,
+                        "draft": context.draft,
+                        "ui_action": context.ui_action,
+                        "react_trace": context.trace,
+                    },
+                )
                 return
     raise ValueError("Agent 超过最大 ReAct 轮次")
 
@@ -434,6 +470,10 @@ def stream_react_configuration(
     workspace: dict[str, Any],
     project_id: UUID | None,
     actor_id: UUID | None = None,
+    conversation_id: UUID | None = None,
+    repair_job_id: UUID | None = None,
+    allowed_tool_names: set[str] | None = None,
+    max_rounds: int = MAX_REACT_ROUNDS,
 ) -> Iterator[tuple[str, Any]]:
     raw_reviewer_type_counts = workspace.get("reviewer_type_counts")
     raw_reviewer_usernames = workspace.get("available_reviewer_usernames")
@@ -441,11 +481,10 @@ def stream_react_configuration(
         draft=dict(workspace.get("current_draft") or {}),
         project_id=project_id,
         actor_id=actor_id,
+        conversation_id=conversation_id,
+        repair_job_id=repair_job_id,
         reviewer_type_counts=(
-            {
-                str(key).lower(): int(value)
-                for key, value in raw_reviewer_type_counts.items()
-            }
+            {str(key).lower(): int(value) for key, value in raw_reviewer_type_counts.items()}
             if isinstance(raw_reviewer_type_counts, dict)
             else None
         ),
@@ -457,8 +496,20 @@ def stream_react_configuration(
     )
     model_client = AgentModelClient(config)
     if config.api_mode == "responses":
-        yield from _stream_responses(model_client, messages[-12:], workspace, context)
+        yield from _stream_responses(
+            model_client,
+            messages[-12:],
+            workspace,
+            context,
+            allowed_tool_names,
+            max_rounds,
+        )
     else:
         yield from _stream_chat_completions(
-            model_client, messages[-12:], workspace, context
+            model_client,
+            messages[-12:],
+            workspace,
+            context,
+            allowed_tool_names,
+            max_rounds,
         )

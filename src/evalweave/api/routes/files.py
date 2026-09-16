@@ -12,10 +12,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
-from evalweave.auth.dependencies import CurrentUser, SessionDependency, require_permission
+from evalweave.auth.dependencies import SessionDependency, require_permission
 from evalweave.auth.permissions import Permission
 from evalweave.core.config import get_settings
-from evalweave.db.models import FileObject, Project, User
+from evalweave.db.models import FileObject, SystemRole, User
+from evalweave.project_access import require_project_access
 from evalweave.storage import FileTooLargeError, LocalFileStorage
 
 router = APIRouter(tags=["files"])
@@ -55,13 +56,6 @@ def get_file_storage() -> LocalFileStorage:
     return LocalFileStorage(get_settings().storage.local_directory)
 
 
-def require_project(project_id: UUID, session: SessionDependency) -> Project:
-    project = session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return project
-
-
 def require_file(file_id: UUID, session: SessionDependency) -> FileObject:
     file_object = session.get(FileObject, file_id)
     if file_object is None:
@@ -83,13 +77,12 @@ def safe_filename(filename: str | None) -> str:
 )
 def upload_file(
     project_id: UUID,
-    _: DatasetWriter,
-    user: CurrentUser,
+    user: DatasetWriter,
     session: SessionDependency,
     file: UploadedFile,
     category: FileCategoryForm = FileCategory.DATASET_SOURCE,
 ) -> FileObject:
-    require_project(project_id, session)
+    require_project_access(session, user, project_id)
     settings = get_settings()
     original_name = safe_filename(file.filename)
     if category == FileCategory.DATASET_SOURCE:
@@ -147,12 +140,17 @@ def upload_file(
 @router.get("/projects/{project_id}/files", response_model=list[FileRead])
 def list_files(
     project_id: UUID,
-    _: ProjectReader,
+    user: ProjectReader,
     session: SessionDependency,
     category: FileCategory | None = None,
 ) -> list[FileObject]:
-    require_project(project_id, session)
+    require_project_access(session, user, project_id)
     statement = select(FileObject).where(FileObject.project_id == project_id)
+    if user.system_role != SystemRole.ADMIN:
+        statement = statement.where(
+            (FileObject.category == FileCategory.DATASET_SOURCE.value)
+            | (FileObject.created_by == user.id)
+        )
     if category is not None:
         statement = statement.where(FileObject.category == category.value)
     return list(session.exec(statement.order_by(FileObject.created_at.desc())).all())
@@ -161,19 +159,33 @@ def list_files(
 @router.get("/files/{file_id}", response_model=FileRead)
 def get_file_metadata(
     file_id: UUID,
-    _: ProjectReader,
+    user: ProjectReader,
     session: SessionDependency,
 ) -> FileObject:
-    return require_file(file_id, session)
+    file_object = require_file(file_id, session)
+    require_project_access(session, user, file_object.project_id)
+    require_file_access(file_object, user)
+    return file_object
+
+
+def require_file_access(file_object: FileObject, user: User) -> None:
+    if (
+        user.system_role != SystemRole.ADMIN
+        and file_object.category != FileCategory.DATASET_SOURCE.value
+        and file_object.created_by != user.id
+    ):
+        raise HTTPException(status_code=404, detail="文件不存在")
 
 
 @router.get("/files/{file_id}/content", response_class=FileResponse)
 def download_file(
     file_id: UUID,
-    _: ProjectReader,
+    user: ProjectReader,
     session: SessionDependency,
 ) -> FileResponse:
     file_object = require_file(file_id, session)
+    require_project_access(session, user, file_object.project_id)
+    require_file_access(file_object, user)
     path = get_file_storage().path_for(file_object.storage_key)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Stored file content not found")
@@ -187,10 +199,12 @@ def download_file(
 @router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_file(
     file_id: UUID,
-    _: DatasetWriter,
+    user: DatasetWriter,
     session: SessionDependency,
 ) -> Response:
     file_object = require_file(file_id, session)
+    require_project_access(session, user, file_object.project_id)
+    require_file_access(file_object, user)
     get_file_storage().delete(file_object.storage_key)
     session.delete(file_object)
     session.commit()

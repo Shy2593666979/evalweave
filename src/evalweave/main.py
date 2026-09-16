@@ -13,7 +13,7 @@ from evalweave.auth.service import bootstrap_identity_data
 from evalweave.core.config import get_settings, set_config_path
 from evalweave.core.logging import configure_logging
 from evalweave.db.session import create_db_and_tables
-from evalweave.workspace import ensure_single_workspace
+from evalweave.workspace import bootstrap_legacy_project_memberships, ensure_single_workspace
 
 
 @asynccontextmanager
@@ -21,10 +21,12 @@ async def lifespan(_: FastAPI):
     settings = get_settings()
     configure_logging(settings)
     settings.storage.local_directory.mkdir(parents=True, exist_ok=True)
+    settings.storage.workspace_directory.mkdir(parents=True, exist_ok=True)
     settings.logging.directory.mkdir(parents=True, exist_ok=True)
     create_db_and_tables()
     ensure_single_workspace()
     bootstrap_identity_data()
+    bootstrap_legacy_project_memberships()
     yield
 
 

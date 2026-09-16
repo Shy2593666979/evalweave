@@ -1,6 +1,6 @@
 import json
 from io import BytesIO
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -27,18 +27,33 @@ from evalweave.agents.planner import evaluate_target_records
 from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.agents.react_tools import (
     AssistantToolContext,
+    RequestOutputFormatTool,
     RunPythonTool,
     SubmitPythonJobTool,
 )
 from evalweave.agents.workflow import (
     execute_python_job,
     plan_agent_job,
+    recover_interrupted_python_jobs,
+    repair_python_job_with_react,
     validate_http_target_semantics,
     validate_http_target_with_react,
 )
-from evalweave.api.routes.agents import sanitize_assistant_display
+from evalweave.api.routes.agents import (
+    infer_explicit_output_format,
+    normalize_conversation_title,
+    sanitize_assistant_display,
+)
 from evalweave.core.config import AgentConfig, get_settings
-from evalweave.db.models import AgentJob, AgentStep, FileObject
+from evalweave.db.models import (
+    AgentJob,
+    AgentJobStatus,
+    AgentStep,
+    AssistantConversation,
+    AssistantMessage,
+    FileObject,
+    StepStatus,
+)
 from evalweave.db.session import get_engine
 from evalweave.storage import LocalFileStorage
 
@@ -72,6 +87,40 @@ def test_sanitize_assistant_display_removes_guessed_file_download_url() -> None:
     assert "50 条数据均已完成" in rendered
 
 
+def test_output_format_tool_does_not_ask_again_when_format_is_known() -> None:
+    context = AssistantToolContext(
+        draft={
+            "title": "回答评测",
+            "goal": "评测回答质量",
+            "source_file_id": str(uuid4()),
+            "source_inspected": True,
+            "output_format": "xlsx",
+        },
+        project_id=None,
+    )
+
+    result = json.loads(RequestOutputFormatTool().run(context))
+
+    assert result["ok"] is False
+    assert context.ui_action is None
+
+
+@pytest.mark.parametrize(
+    ("user_text", "expected"),
+    [
+        ("结果给我一个 Excel 文件", "xlsx"),
+        ("文件名就叫 dev评测结果.xlsx", "xlsx"),
+        ("导出 JSONL", "jsonl"),
+        ("生成 report.json 文件", "jsonl"),
+        ("Markdown 文件就行", "markdown"),
+        ("直接在对话中查看，不需要文件", "text"),
+        ("调用接口时 contentType 是 TEXT", None),
+    ],
+)
+def test_infer_explicit_output_format(user_text: str, expected: str | None) -> None:
+    assert infer_explicit_output_format(user_text) == expected
+
+
 def login_as_developer(client: TestClient) -> None:
     options = client.get("/api/auth/registration-options").json()
     development = next(item for item in options if item["code"] == "development")
@@ -91,12 +140,68 @@ def login_as_developer(client: TestClient) -> None:
     assert response.status_code == 200
 
 
+def current_project(client: TestClient) -> dict[str, object]:
+    projects = client.get("/api/projects")
+    assert projects.status_code == 200
+    return projects.json()[0]
+
+
+def test_agent_jobs_are_private_to_the_creator(client: TestClient) -> None:
+    login_as_developer(client)
+    project = current_project(client)
+    first_job = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={"title": "First user's task", "goal": "Private evaluation"},
+    )
+    assert first_job.status_code == 201
+
+    client.post("/api/auth/logout")
+    options = client.get("/api/auth/registration-options").json()
+    development = next(item for item in options if item["code"] == "development")
+    client.post(
+        "/api/auth/register",
+        json={
+            "username": "other_developer",
+            "email": "other_developer@example.com",
+            "password": "developer-password",
+            "user_type_id": development["id"],
+        },
+    )
+    client.post(
+        "/api/auth/login",
+        json={"username": "other_developer", "password": "developer-password"},
+    )
+    second_job = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={"title": "Second user's task", "goal": "Another private evaluation"},
+    )
+    assert second_job.status_code == 201
+
+    listing = client.get(f"/api/projects/{project['id']}/agent-jobs")
+    assert [item["id"] for item in listing.json()] == [second_job.json()["id"]]
+    first_job_id = first_job.json()["id"]
+    assert client.get(f"/api/agent-jobs/{first_job_id}").status_code == 404
+    assert client.get(f"/api/agent-jobs/{first_job_id}/steps").status_code == 404
+    assert client.post(f"/api/agent-jobs/{first_job_id}/start").status_code == 404
+
+    client.post("/api/auth/logout")
+    client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-admin-password"},
+    )
+    admin_listing = client.get(f"/api/projects/{project['id']}/agent-jobs")
+    assert {item["id"] for item in admin_listing.json()} == {
+        first_job_id,
+        second_job.json()["id"],
+    }
+
+
 def test_agent_plans_and_executes_without_scheme_approval(client: TestClient) -> None:
     login_as_developer(client)
     runtime = client.get("/api/agent/runtime")
     assert runtime.status_code == 200
     assert "api_key" not in runtime.json()
-    project = client.post("/api/projects", json={"name": "Agent workflow"}).json()
+    project = current_project(client)
     upload = client.post(
         f"/api/projects/{project['id']}/files",
         files={
@@ -320,9 +425,7 @@ def test_target_record_evaluation_accepts_dynamic_dimensions(monkeypatch) -> Non
     assert evaluations[0]["dimensions"][0]["score"] == 8
 
 
-def test_agent_executes_http_target_without_host_allowlist(
-    client: TestClient, monkeypatch
-) -> None:
+def test_agent_executes_http_target_without_host_allowlist(client: TestClient, monkeypatch) -> None:
     class FakeResponse:
         headers = {"content-type": "application/json"}
 
@@ -346,7 +449,7 @@ def test_agent_executes_http_target_without_host_allowlist(
             return FakeResponse()
 
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Target execution"}).json()
+    project = current_project(client)
     upload = client.post(
         f"/api/projects/{project['id']}/files",
         files={"file": ("cases.json", b'[{"message":"hello"}]', "application/json")},
@@ -410,9 +513,7 @@ def test_task_credentials_run_login_and_inject_token(client: TestClient) -> None
         }
     )
 
-    _, headers = validate_target(
-        {"url": "https://target.test/chat", "credentials": credentials}
-    )
+    _, headers = validate_target({"url": "https://target.test/chat", "credentials": credentials})
     authentication = authenticate_target(
         LoginClient(), "https://target.test/chat", headers, credentials
     )
@@ -428,7 +529,7 @@ def test_task_credentials_run_login_and_inject_token(client: TestClient) -> None
 
 def test_python_workspace_registers_transformed_file(client: TestClient) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Python workspace"}).json()
+    project = current_project(client)
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(["input", "output"])
@@ -486,7 +587,7 @@ workbook.close()
 def test_python_workspace_creates_file_without_input(client: TestClient) -> None:
     login_as_developer(client)
     creator = client.get("/api/auth/me").json()
-    project = client.post("/api/projects", json={"name": "Generated Python workspace"}).json()
+    project = current_project(client)
     code = """
 from pathlib import Path
 
@@ -518,11 +619,9 @@ def test_long_python_tool_creates_and_executes_background_job(
 ) -> None:
     login_as_developer(client)
     creator = client.get("/api/auth/me").json()
-    project = client.post("/api/projects", json={"name": "Python job"}).json()
+    project = current_project(client)
     queued: list[UUID] = []
-    monkeypatch.setattr(
-        "evalweave.agents.react_tools.enqueue_python_job", queued.append
-    )
+    monkeypatch.setattr("evalweave.agents.react_tools.enqueue_python_job", queued.append)
     context = AssistantToolContext(
         draft={"title": "批量生成文件", "goal": "在后台生成结果文件"},
         project_id=UUID(project["id"]),
@@ -578,9 +677,7 @@ def test_long_python_tool_creates_and_executes_background_job(
         "path": f"/evaluations/{job_id}",
     }
     with Session(get_engine()) as session:
-        queued_steps = list(
-            session.exec(select(AgentStep).where(AgentStep.job_id == job_id))
-        )
+        queued_steps = list(session.exec(select(AgentStep).where(AgentStep.job_id == job_id)))
     assert [step.status.value for step in queued_steps] == [
         "completed",
         "completed",
@@ -620,14 +717,14 @@ def test_long_python_tool_creates_and_executes_background_job(
     assert output.original_name == "result.txt"
     assert [step.name for step in steps] == [
         "generate_eval_spec",
-        "preflight_1_run_python",
+        "prepare_data",
         "execute_eval_spec",
         "summarize",
     ]
     assert steps[1].output_data == {
-        "label": "生成 Excel 前置文件",
-        "tool_name": "run_python",
+        "label": "准备评测数据",
         "phase": "preparation",
+        "source_file_count": 0,
     }
     assert job.eval_spec["data_program"]["steps"][0]["title"] == "生成 Excel 前置文件"
     assert job.result["execution"]["execution_mode"] == "agent_python"
@@ -665,6 +762,214 @@ def test_dialog_python_tool_uses_30_second_timeout(monkeypatch: pytest.MonkeyPat
     assert observed_timeouts == [30]
 
 
+def test_background_python_job_repairs_script_before_failing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login_as_developer(client)
+    creator = client.get("/api/auth/me").json()
+    project = current_project(client)
+    with Session(get_engine()) as session:
+        job = AgentJob(
+            project_id=UUID(project["id"]),
+            created_by=UUID(creator["id"]),
+            title="批量接口评测",
+            goal="超时数据记录失败后继续执行",
+            status=AgentJobStatus.PENDING,
+            input_config={
+                "job_type": "python",
+                "python_code": "raise TimeoutError('timed out')",
+                "source_file_ids": [],
+                "output_format": "file",
+            },
+            eval_spec={},
+            requires_approval=False,
+            max_repair_attempts=2,
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+
+    executed_codes: list[str] = []
+
+    def fake_workspace(_session, _project_id, _draft, code, *_args, **_kwargs):
+        executed_codes.append(code)
+        if len(executed_codes) == 1:
+            raise ValueError("ReadTimeout: timed out")
+        return ({"stdout": "已跳过 1 条超时数据", "outputs": []}, {})
+
+    monkeypatch.setattr("evalweave.agents.workflow.run_python_workspace", fake_workspace)
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.resolve_agent_config",
+        lambda *_args: AgentConfig(
+            enabled=True,
+            base_url="https://model.test/v1",
+            model="repair-model",
+        ),
+    )
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.repair_python_script",
+        lambda _config, _goal, _code, _error: "print('continue after timeout')",
+    )
+    monkeypatch.setattr(
+        "evalweave.agents.workflow.generate_summary",
+        lambda *_args, **_kwargs: {"summary": "执行完成，1 条超时数据已记录为失败。"},
+    )
+
+    execute_python_job(job_id)
+
+    with Session(get_engine()) as session:
+        repaired_job = session.get(AgentJob, job_id)
+        steps = list(
+            session.exec(
+                select(AgentStep)
+                .where(AgentStep.job_id == job_id)
+                .order_by(AgentStep.created_at)
+            )
+        )
+
+    assert repaired_job is not None
+    assert repaired_job.status == AgentJobStatus.COMPLETED
+    assert repaired_job.repair_attempts == 1
+    assert repaired_job.input_config["python_code"] == "print('continue after timeout')"
+    assert executed_codes == [
+        "raise TimeoutError('timed out')",
+        "print('continue after timeout')",
+    ]
+    assert [step.status for step in steps if step.name == "execute_eval_spec"] == [
+        StepStatus.COMPLETED,
+    ]
+    assert next(step for step in steps if step.name == "execute_eval_spec").attempt == 2
+
+
+def test_worker_restart_recovers_interrupted_python_job(client: TestClient) -> None:
+    login_as_developer(client)
+    creator = client.get("/api/auth/me").json()
+    project = current_project(client)
+    with Session(get_engine()) as session:
+        job = AgentJob(
+            project_id=UUID(project["id"]),
+            created_by=UUID(creator["id"]),
+            title="中断任务",
+            goal="恢复中断任务",
+            status=AgentJobStatus.RUNNING,
+            input_config={"job_type": "python", "python_code": "print('ok')"},
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        step = AgentStep(
+            job_id=job.id,
+            name="execute_eval_spec",
+            status=StepStatus.RUNNING,
+        )
+        session.add(step)
+        session.commit()
+
+        recovered = recover_interrupted_python_jobs(session)
+        session.refresh(job)
+        session.refresh(step)
+
+        assert recovered == [job.id]
+        assert job.status == AgentJobStatus.PENDING
+        assert step.status == StepStatus.PENDING
+        assert step.started_at is None
+
+
+def test_python_job_repair_reuses_original_conversation_context(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login_as_developer(client)
+    creator = client.get("/api/auth/me").json()
+    project = current_project(client)
+    captured: dict[str, object] = {}
+    with Session(get_engine()) as session:
+        conversation = AssistantConversation(
+            project_id=UUID(project["id"]),
+            created_by=UUID(creator["id"]),
+            draft={"output_format": "xlsx", "concurrency": 5},
+        )
+        session.add(conversation)
+        session.commit()
+        session.refresh(conversation)
+        session.add(
+            AssistantMessage(
+                conversation_id=conversation.id,
+                role="user",
+                content="生成 50 条日常问答，并发 5，结果保存为中文名 Excel",
+            )
+        )
+        job = AgentJob(
+            project_id=UUID(project["id"]),
+            created_by=UUID(creator["id"]),
+            title="日常问答评测",
+            goal="生成并评测 50 条日常问答",
+            input_config={
+                "job_type": "python",
+                "conversation_id": str(conversation.id),
+                "python_code": "requests.post(url, timeout=60)",
+                "output_format": "xlsx",
+                "primary_output": "日常问答评测.xlsx",
+                "source_file_ids": [],
+            },
+            eval_spec={"summary": "批量调用接口"},
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        conversation_id = conversation.id
+        job_id = job.id
+
+        def fake_react(*args, **_kwargs):
+            captured["messages"] = args[1]
+            captured["workspace"] = args[2]
+            captured["conversation_id"] = args[5]
+            captured["repair_job_id"] = args[6]
+            captured["allowed_tools"] = args[7]
+            job.input_config = {
+                **job.input_config,
+                "python_code": "# repaired\ncontinue_on_timeout()",
+            }
+            session.add(job)
+            session.commit()
+            yield (
+                "result",
+                {"ui_action": {"type": "python_repaired", "summary": "已修复超时处理"}},
+            )
+
+        monkeypatch.setattr(
+            "evalweave.agents.workflow.stream_react_configuration",
+            fake_react,
+        )
+        repaired = repair_python_job_with_react(
+            session,
+            job,
+            AgentConfig(enabled=True, base_url="https://model.test/v1", model="repair"),
+            "requests.post(url, timeout=60)",
+            TimeoutError("Read timed out"),
+            1,
+        )
+
+    assert repaired == "# repaired\ncontinue_on_timeout()"
+    assert captured["conversation_id"] == conversation_id
+    assert captured["repair_job_id"] == job_id
+    assert captured["allowed_tools"] == {
+        "repair_python_job_script",
+        "inspect_source",
+        "probe_http_target",
+        "run_python",
+    }
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert "生成 50 条日常问答" in messages[0]["content"]
+    assert "Read timed out" in messages[-1]["content"]
+    workspace = captured["workspace"]
+    assert isinstance(workspace, dict)
+    assert workspace["current_draft"]["concurrency"] == 5
+    assert workspace["execution_repair"]["python_code"] == "requests.post(url, timeout=60)"
+    assert workspace["execution_repair"]["primary_output"] == "日常问答评测.xlsx"
+
+
 def test_agent_generates_cases_when_http_target_has_no_source_file(
     client: TestClient, monkeypatch
 ) -> None:
@@ -691,7 +996,7 @@ def test_agent_generates_cases_when_http_target_has_no_source_file(
             return FakeResponse()
 
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Generated cases"}).json()
+    project = current_project(client)
     monkeypatch.setattr("evalweave.agents.executor.httpx.Client", FakeClient)
     monkeypatch.setattr(
         "evalweave.agents.workflow.generate_test_cases",
@@ -748,7 +1053,7 @@ def test_target_preflight_failure_returns_to_react_and_retries(
     client: TestClient, monkeypatch
 ) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Target repair"}).json()
+    project = current_project(client)
     created = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
         json={
@@ -775,20 +1080,26 @@ def test_target_preflight_failure_returns_to_react_and_retries(
     def fake_react(*_args):
         running = {"name": "update_task_draft", "status": "running"}
         yield "tool_start", running
-        yield "tool_result", {
-            **running,
-            "status": "completed",
-            "summary": {"ok": True, "updated_fields": ["target_body"]},
-        }
-        yield "result", {
-            "draft": {
-                "target_url": "https://model.test/chat",
-                "target_body": {"query": "{{generated_query}}"},
-                "target_validated": True,
-                "expected_streaming": True,
+        yield (
+            "tool_result",
+            {
+                **running,
+                "status": "completed",
+                "summary": {"ok": True, "updated_fields": ["target_body"]},
             },
-            "ui_action": None,
-        }
+        )
+        yield (
+            "result",
+            {
+                "draft": {
+                    "target_url": "https://model.test/chat",
+                    "target_body": {"query": "{{generated_query}}"},
+                    "target_validated": True,
+                    "expected_streaming": True,
+                },
+                "ui_action": None,
+            },
+        )
 
     monkeypatch.setattr("evalweave.agents.workflow.validate_http_target", fake_validate)
     monkeypatch.setattr("evalweave.agents.workflow.stream_react_configuration", fake_react)
@@ -796,18 +1107,14 @@ def test_target_preflight_failure_returns_to_react_and_retries(
     with Session(get_engine()) as session:
         job = session.get(AgentJob, UUID(created["id"]))
         assert job is not None
-        job.eval_spec = {
-            "generated_cases": [{"input": {"generated_query": "hello"}}]
-        }
+        job.eval_spec = {"generated_cases": [{"input": {"generated_query": "hello"}}]}
         session.add(job)
         session.commit()
         result = validate_http_target_with_react(session, job, config)
         session.refresh(job)
         assert result["validated"] is True
         assert job.repair_attempts == 1
-        assert job.input_config["target"]["body"] == {
-            "query": "{{generated_query}}"
-        }
+        assert job.input_config["target"]["body"] == {"query": "{{generated_query}}"}
     steps = client.get(f"/api/agent-jobs/{created['id']}/steps").json()
     assert [(step["name"], step["status"]) for step in steps] == [
         ("validate_target", "failed"),
@@ -820,7 +1127,7 @@ def test_semantic_preflight_rejects_when_all_sample_responses_are_wrong(
     client: TestClient, monkeypatch
 ) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Semantic preflight"}).json()
+    project = current_project(client)
     created = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
         json={
@@ -892,9 +1199,7 @@ def test_parse_target_response_supports_stream_wildcard_path() -> None:
             "data: [DONE]\n"
         )
 
-    output, response_mode = parse_target_response(
-        StreamingResponse(), "events[*].data.message"
-    )
+    output, response_mode = parse_target_response(StreamingResponse(), "events[*].data.message")
 
     assert response_mode == "streaming"
     assert output == "hello world"
@@ -954,9 +1259,38 @@ def test_application_error_detector_allows_success_envelope() -> None:
     assert detect_application_error(response) is None
 
 
+def test_assistant_conversation_can_be_renamed_and_deleted(client: TestClient) -> None:
+    login_as_developer(client)
+    project = current_project(client)
+    created = client.post("/api/assistant/conversations", json={"project_id": project["id"]})
+    conversation_id = created.json()["id"]
+
+    renamed = client.patch(
+        f"/api/assistant/conversations/{conversation_id}",
+        json={"title": "  新的对话名称  "},
+    )
+
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "新的对话名称"
+    assert client.delete(f"/api/assistant/conversations/{conversation_id}").status_code == 204
+    assert client.get(f"/api/assistant/conversations/{conversation_id}/messages").status_code == 404
+    assert all(
+        item["id"] != conversation_id for item in client.get("/api/assistant/conversations").json()
+    )
+
+
+def test_conversation_title_is_normalized_to_two_to_ten_characters() -> None:
+    assert (
+        normalize_conversation_title("标题：批量接口质量评测方案", "帮我测试接口")
+        == "批量接口质量评测方案"
+    )
+    assert normalize_conversation_title("？", "天气") == "天气"
+    assert normalize_conversation_title("", "啊") == "新对话"
+
+
 def test_assistant_conversation_streams_and_persists_draft(client: TestClient, monkeypatch) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Assistant project"}).json()
+    project = current_project(client)
     conversation = client.post("/api/assistant/conversations", json={"project_id": project["id"]})
     assert conversation.status_code == 201
     conversation_id = conversation.json()["id"]
@@ -975,6 +1309,11 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
         },
     )
     assert uploaded.status_code == 201
+    scheduled_titles: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "evalweave.api.routes.agents.schedule_conversation_title",
+        lambda *args: scheduled_titles.append(args),
+    )
 
     monkeypatch.setattr(
         "evalweave.api.routes.agents.assist_job_configuration",
@@ -1005,6 +1344,8 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
     assert events[-1]["type"] == "done"
     assert events[-1]["stage"] == "choose_output"
     assert events[-1]["content"] == "已收到需求。"
+    assert len(scheduled_titles) == 1
+    assert scheduled_titles[0][2] == "比较成绩"
 
     stored = client.get("/api/assistant/conversations").json()[0]
     assert stored["draft"]["goal"] == "比较综合成绩和各项排名"
@@ -1040,6 +1381,7 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
     assert ready_events[-1]["content"] == (
         "将使用上传的数据比较成绩并生成 Excel 结果，是否开始执行？"
     )
+    assert len(scheduled_titles) == 1
 
     job = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
@@ -1058,13 +1400,15 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
     assert started.json()["status"] == "started"
     assert started.json()["agent_job_id"] == job["id"]
     messages = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()
-    assert messages[-1]["role"] == "user"
-    assert messages[-1]["content"] == "确认并开启"
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == (
+        "将使用上传的数据比较成绩并生成 Excel 结果，是否开始执行？"
+    )
 
 
 def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeypatch) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "ReAct project"}).json()
+    project = current_project(client)
     conversation = client.post(
         "/api/assistant/conversations", json={"project_id": project["id"]}
     ).json()
@@ -1079,22 +1423,23 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
         yield "tool_start", running
         yield "tool_result", completed
         yield "delta", "Choose a delivery format."
-        yield "result", {
-            "reply": "Choose a delivery format.",
-            "draft": {
-                "title": "接口评测",
-                "goal": "验证接口质量",
-                "target_url": "https://model.test/chat",
-                "target_body": {"query": "{{query}}"},
-                "target_validated": True,
+        yield (
+            "result",
+            {
+                "reply": "Choose a delivery format.",
+                "draft": {
+                    "title": "接口评测",
+                    "goal": "验证接口质量",
+                    "target_url": "https://model.test/chat",
+                    "target_body": {"query": "{{query}}"},
+                    "target_validated": True,
+                },
+                "ui_action": {"type": "choose_output"},
+                "react_trace": [completed],
             },
-            "ui_action": {"type": "choose_output"},
-            "react_trace": [completed],
-        }
+        )
 
-    monkeypatch.setattr(
-        "evalweave.api.routes.agents.stream_react_configuration", fake_react
-    )
+    monkeypatch.setattr("evalweave.api.routes.agents.stream_react_configuration", fake_react)
     response = client.post(
         f"/api/assistant/conversations/{conversation['id']}/messages/stream",
         json={"content": "评测这个接口"},
@@ -1139,16 +1484,17 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
 
     def capture_react(_config, messages, *_args):
         captured_history.extend(messages)
-        yield "result", {
-            "reply": "Next final reply.",
-            "draft": {},
-            "ui_action": None,
-            "react_trace": [],
-        }
+        yield (
+            "result",
+            {
+                "reply": "Next final reply.",
+                "draft": {},
+                "ui_action": None,
+                "react_trace": [],
+            },
+        )
 
-    monkeypatch.setattr(
-        "evalweave.api.routes.agents.stream_react_configuration", capture_react
-    )
+    monkeypatch.setattr("evalweave.api.routes.agents.stream_react_configuration", capture_react)
     client.post(
         f"/api/assistant/conversations/{conversation['id']}/messages/stream",
         json={"content": "Continue"},
@@ -1162,7 +1508,7 @@ def test_assistant_user_input_keeps_conversation_collecting(
     client: TestClient, monkeypatch
 ) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Input required"}).json()
+    project = current_project(client)
     conversation = client.post(
         "/api/assistant/conversations", json={"project_id": project["id"]}
     ).json()
@@ -1170,27 +1516,28 @@ def test_assistant_user_input_keeps_conversation_collecting(
     monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
 
     def fake_react(*_):
-        yield "result", {
-            "reply": "Please provide the missing request field.",
-            "draft": {
-                "title": "API evaluation",
-                "goal": "Evaluate answer quality",
-                "target_url": "https://model.test/chat",
-                "target_body": {"query": "{{query}}"},
-                "target_validated": True,
-                "output_format": "xlsx",
+        yield (
+            "result",
+            {
+                "reply": "Please provide the missing request field.",
+                "draft": {
+                    "title": "API evaluation",
+                    "goal": "Evaluate answer quality",
+                    "target_url": "https://model.test/chat",
+                    "target_body": {"query": "{{query}}"},
+                    "target_validated": True,
+                    "output_format": "xlsx",
+                },
+                "ui_action": {
+                    "type": "user_input",
+                    "question": "Please provide the missing request field.",
+                    "options": [],
+                },
+                "react_trace": [],
             },
-            "ui_action": {
-                "type": "user_input",
-                "question": "Please provide the missing request field.",
-                "options": [],
-            },
-            "react_trace": [],
-        }
+        )
 
-    monkeypatch.setattr(
-        "evalweave.api.routes.agents.stream_react_configuration", fake_react
-    )
+    monkeypatch.setattr("evalweave.api.routes.agents.stream_react_configuration", fake_react)
     response = client.post(
         f"/api/assistant/conversations/{conversation['id']}/messages/stream",
         json={"content": "Continue configuring"},
@@ -1204,7 +1551,7 @@ def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
     client: TestClient, monkeypatch
 ) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Completed file operation"}).json()
+    project = current_project(client)
     conversation = client.post(
         "/api/assistant/conversations", json={"project_id": project["id"]}
     ).json()
@@ -1217,39 +1564,40 @@ def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
     monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
 
     def fake_react(*_):
-        yield "result", {
-            "reply": "文件已经重新评分并生成，可以直接下载。",
-            "draft": {
-                "title": "模型回答质量评分",
-                "goal": "重新评估回答相关性",
-                "task_mode": "local_analysis",
-                "source_file_id": generated_file["id"],
-                "source_inspected": True,
-                "output_format": "xlsx",
+        yield (
+            "result",
+            {
+                "reply": "文件已经重新评分并生成，可以直接下载。",
+                "draft": {
+                    "title": "模型回答质量评分",
+                    "goal": "重新评估回答相关性",
+                    "task_mode": "local_analysis",
+                    "source_file_id": generated_file["id"],
+                    "source_inspected": True,
+                    "output_format": "xlsx",
+                },
+                "ui_action": None,
+                "react_trace": [
+                    {
+                        "name": "run_python",
+                        "label": "运行 Python 文件处理",
+                        "status": "completed",
+                        "summary": {
+                            "ok": True,
+                            "primary_output_file_id": generated_file["id"],
+                            "outputs": [
+                                {
+                                    "file_id": generated_file["id"],
+                                    "file_name": "scored_results.xlsx",
+                                }
+                            ],
+                        },
+                    }
+                ],
             },
-            "ui_action": None,
-            "react_trace": [
-                {
-                    "name": "run_python",
-                    "label": "运行 Python 文件处理",
-                    "status": "completed",
-                    "summary": {
-                        "ok": True,
-                        "primary_output_file_id": generated_file["id"],
-                        "outputs": [
-                            {
-                                "file_id": generated_file["id"],
-                                "file_name": "scored_results.xlsx",
-                            }
-                        ],
-                    },
-                }
-            ],
-        }
+        )
 
-    monkeypatch.setattr(
-        "evalweave.api.routes.agents.stream_react_configuration", fake_react
-    )
+    monkeypatch.setattr("evalweave.api.routes.agents.stream_react_configuration", fake_react)
     response = client.post(
         f"/api/assistant/conversations/{conversation['id']}/messages/stream",
         json={"content": "重新评分这个文件"},
@@ -1261,9 +1609,7 @@ def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
     assert events[-1]["ui_action"] is None
     assert "ui_action" not in events[-1]["draft"]
     assert events[-1]["attachment_file_id"] == generated_file["id"]
-    messages = client.get(
-        f"/api/assistant/conversations/{conversation['id']}/messages"
-    ).json()
+    messages = client.get(f"/api/assistant/conversations/{conversation['id']}/messages").json()
     assert messages[-1]["ui_action"] is None
     assert messages[-1]["attachment_file_id"] == generated_file["id"]
     assert messages[-1]["attachment_name"] == "scored_results.xlsx"
@@ -1273,7 +1619,7 @@ def test_generic_data_program_combines_model_and_multiple_http_targets(
     client: TestClient, monkeypatch
 ) -> None:
     login_as_developer(client)
-    project = client.post("/api/projects", json={"name": "Generic data program"}).json()
+    project = current_project(client)
     source = client.post(
         f"/api/projects/{project['id']}/files",
         files={
