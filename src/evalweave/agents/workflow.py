@@ -393,6 +393,7 @@ def execute_python_job(job_id: UUID) -> None:
                             str(job.input_config.get("primary_output") or "") or None,
                             created_by=job.created_by,
                             timeout_seconds=None,
+                            model_config=agent_config,
                         )[0],
                         attempt=attempt,
                     )

@@ -27,6 +27,7 @@ from evalweave.agents.planner import evaluate_target_records
 from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.agents.react_tools import (
     AssistantToolContext,
+    InspectAgentJobTool,
     RequestOutputFormatTool,
     RunPythonTool,
     SubmitPythonJobTool,
@@ -614,6 +615,83 @@ print("✅ 文件生成完成")
     assert observation["stdout"] == "✅ 文件生成完成"
 
 
+def test_python_workspace_injects_selected_model_and_redacts_secret(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    login_as_developer(client)
+    project = current_project(client)
+    monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "must-not-be-inherited")
+    code = """
+import os
+
+print(os.environ["EVALWEAVE_MODEL_BASE_URL"])
+print(os.environ["EVALWEAVE_MODEL_NAME"])
+print(os.environ["EVALWEAVE_MODEL_API_MODE"])
+print(os.environ["EVALWEAVE_MODEL_API_KEY"])
+print(os.environ.get("UNRELATED_PRIVATE_VALUE", "not-inherited"))
+"""
+    model_config = AgentConfig(
+        enabled=True,
+        api_mode="chat_completions",
+        base_url="https://model.example/v1",
+        model="followup-model",
+        api_key="secret-model-key",
+    )
+
+    with Session(get_engine()) as session:
+        observation, _ = run_python_workspace(
+            session,
+            UUID(project["id"]),
+            {},
+            code,
+            source_file_ids=[],
+            model_config=model_config,
+        )
+
+    assert observation["stdout"].splitlines() == [
+        "https://model.example/v1",
+        "followup-model",
+        "chat_completions",
+        "[REDACTED]",
+        "not-inherited",
+    ]
+
+
+def test_python_workspace_rejects_output_containing_model_secret(
+    client: TestClient,
+) -> None:
+    login_as_developer(client)
+    project = current_project(client)
+    model_config = AgentConfig(
+        enabled=True,
+        base_url="https://model.example/v1",
+        model="followup-model",
+        api_key="secret-model-key",
+    )
+    code = """
+import os
+from pathlib import Path
+
+Path("outputs/leaked.txt").write_text(
+    os.environ["EVALWEAVE_MODEL_API_KEY"],
+    encoding="utf-8",
+)
+"""
+
+    with Session(get_engine()) as session, pytest.raises(
+        ValueError,
+        match="生成文件包含受保护的模型凭据",
+    ):
+        run_python_workspace(
+            session,
+            UUID(project["id"]),
+            {},
+            code,
+            source_file_ids=[],
+            model_config=model_config,
+        )
+
+
 def test_long_python_tool_creates_and_executes_background_job(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -760,6 +838,53 @@ def test_dialog_python_tool_uses_30_second_timeout(monkeypatch: pytest.MonkeyPat
 
     assert result["ok"] is True
     assert observed_timeouts == [30]
+
+
+def test_agent_can_inspect_existing_background_job_before_recreating(
+    client: TestClient,
+) -> None:
+    login_as_developer(client)
+    creator = client.get("/api/auth/me").json()
+    project = current_project(client)
+    with Session(get_engine()) as session:
+        job = AgentJob(
+            project_id=UUID(project["id"]),
+            created_by=UUID(creator["id"]),
+            title="十轮连续对话评测",
+            goal="执行十轮连续对话并生成 Excel",
+            status=AgentJobStatus.FAILED,
+            input_config={"job_type": "python", "python_code": "raise TimeoutError()"},
+            error="目标接口连续三次读取超时",
+            repair_attempts=3,
+            max_repair_attempts=3,
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        session.add(
+            AgentStep(
+                job_id=job.id,
+                name="execute_eval_spec",
+                status=StepStatus.FAILED,
+                attempt=3,
+                error="ReadTimeout",
+            )
+        )
+        session.commit()
+        job_id = job.id
+
+    context = AssistantToolContext(
+        draft={"background_job_id": str(job_id)},
+        project_id=UUID(project["id"]),
+        actor_id=UUID(creator["id"]),
+    )
+    result = json.loads(InspectAgentJobTool().run(context))
+
+    assert result["job_id"] == str(job_id)
+    assert result["status"] == "failed"
+    assert result["error"] == "目标接口连续三次读取超时"
+    assert result["steps"][0]["status"] == "failed"
+    assert result["repair_attempts"] == 3
 
 
 def test_background_python_job_repairs_script_before_failing(

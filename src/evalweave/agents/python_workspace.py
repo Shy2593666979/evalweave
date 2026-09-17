@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -14,11 +15,53 @@ from uuid import UUID, uuid4
 
 from sqlmodel import Session
 
-from evalweave.core.config import get_settings
+from evalweave.core.config import AgentConfig, get_settings
 from evalweave.db.models import FileObject
 from evalweave.storage import LocalFileStorage
 
 PYTHON_DIALOG_TIMEOUT_SECONDS = 30
+PYTHON_ENVIRONMENT_ALLOWLIST = {
+    "ALL_PROXY",
+    "COMSPEC",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "WINDIR",
+}
+
+
+def _redact_secrets(value: str, secrets: list[str]) -> str:
+    redacted = value
+    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def _file_contains_secret(path: Path, secrets: list[str]) -> bool:
+    encoded = [secret.encode("utf-8") for secret in secrets if secret]
+    if not encoded:
+        return False
+    raw = path.read_bytes()
+    if any(secret in raw for secret in encoded):
+        return True
+    if not zipfile.is_zipfile(path):
+        return False
+    inspected_bytes = 0
+    with zipfile.ZipFile(path) as archive:
+        for item in archive.infolist():
+            inspected_bytes += item.file_size
+            if inspected_bytes > 64 * 1024 * 1024:
+                break
+            if any(secret in archive.read(item) for secret in encoded):
+                return True
+    return False
 
 
 def _safe_name(name: str, used: set[str]) -> str:
@@ -42,6 +85,7 @@ def run_python_workspace(
     primary_output: str | None = None,
     created_by: UUID | None = None,
     timeout_seconds: float | None = PYTHON_DIALOG_TIMEOUT_SECONDS,
+    model_config: AgentConfig | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if project_id is None:
         raise ValueError("Python 文件工具需要当前项目")
@@ -93,8 +137,24 @@ def run_python_workspace(
         )
         script = workspace / "script.py"
         script.write_text(code, encoding="utf-8")
-        environment = dict(os.environ)
+        environment = {
+            name: value
+            for name, value in os.environ.items()
+            if name.upper() in PYTHON_ENVIRONMENT_ALLOWLIST
+        }
         environment["PYTHONIOENCODING"] = "utf-8"
+        injected_secrets: list[str] = []
+        if model_config and model_config.enabled and model_config.model:
+            environment.update(
+                {
+                    "EVALWEAVE_MODEL_BASE_URL": model_config.base_url,
+                    "EVALWEAVE_MODEL_NAME": model_config.model,
+                    "EVALWEAVE_MODEL_API_MODE": model_config.api_mode,
+                    "EVALWEAVE_MODEL_API_KEY": model_config.api_key,
+                }
+            )
+            if model_config.api_key:
+                injected_secrets.append(model_config.api_key)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             completed = subprocess.run(
@@ -113,8 +173,8 @@ def run_python_workspace(
             raise ValueError(
                 f"Python 文件工具执行超过 {timeout_seconds:g} 秒"
             ) from error
-        stdout = completed.stdout[-8000:].strip()
-        stderr = completed.stderr[-8000:].strip()
+        stdout = _redact_secrets(completed.stdout[-8000:].strip(), injected_secrets)
+        stderr = _redact_secrets(completed.stderr[-8000:].strip(), injected_secrets)
         if completed.returncode != 0:
             raw_detail = stderr or stdout or f"退出码 {completed.returncode}"
             detail_lines = raw_detail.splitlines()
@@ -124,6 +184,8 @@ def run_python_workspace(
         output_paths = sorted(path for path in outputs.rglob("*") if path.is_file())
         if len(output_paths) > 16:
             raise ValueError("Python 文件工具一次最多生成 16 个文件")
+        if any(_file_contains_secret(path, injected_secrets) for path in output_paths):
+            raise ValueError("生成文件包含受保护的模型凭据，已拒绝保存")
         output_owner_id = sources[0].created_by if sources else created_by
         if output_paths and output_owner_id is None:
             raise ValueError("Python 文件工具缺少输出文件创建者")

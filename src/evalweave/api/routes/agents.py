@@ -121,7 +121,10 @@ def assistant_output_attachment(
     if not isinstance(trace, list):
         return None
     for item in reversed(trace):
-        if not isinstance(item, dict) or item.get("name") != "run_python":
+        if not isinstance(item, dict) or item.get("name") not in {
+            "run_python",
+            "inspect_agent_job",
+        }:
             continue
         if item.get("status") != "completed" or not isinstance(item.get("summary"), dict):
             continue
@@ -728,6 +731,11 @@ def stream_assistant_message(
         conversation.draft = {
             **conversation.draft,
             "output_format": explicit_output_format,
+        }
+    if payload.evaluation_model_id:
+        conversation.draft = {
+            **conversation.draft,
+            "evaluation_model_id": str(payload.evaluation_model_id),
         }
     conversation.updated_at = datetime.now(UTC)
     session.add(conversation)

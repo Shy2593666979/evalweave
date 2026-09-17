@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from evalweave.agents.executor import (
     authenticate_target,
@@ -20,7 +20,7 @@ from evalweave.agents.executor import (
     validate_target,
 )
 from evalweave.agents.inspection import inspect_source
-from evalweave.agents.model_config import encrypt_secret_payload
+from evalweave.agents.model_config import encrypt_secret_payload, resolve_agent_config
 from evalweave.agents.python_workspace import (
     PYTHON_DIALOG_TIMEOUT_SECONDS,
     run_python_workspace,
@@ -247,6 +247,10 @@ class RunPythonTool(BaseAssistantTool):
             else None
         )
         with Session(get_settings_engine()) as session:
+            model_config = resolve_agent_config(
+                session,
+                context.draft.get("evaluation_model_id"),
+            )
             observation, updates = run_python_workspace(
                 session,
                 context.project_id,
@@ -256,9 +260,134 @@ class RunPythonTool(BaseAssistantTool):
                 str(kwargs.get("primary_output") or "") or None,
                 created_by=context.actor_id,
                 timeout_seconds=PYTHON_DIALOG_TIMEOUT_SECONDS,
+                model_config=model_config,
             )
         context.draft.update(updates)
         return json.dumps({"ok": True, **observation}, ensure_ascii=False)
+
+
+class InspectAgentJobTool(BaseAssistantTool):
+    name = "inspect_agent_job"
+    description = (
+        "查询当前对话已提交的后台评测任务，返回真实状态、当前步骤、失败原因、"
+        "结果摘要和结果文件。用户询问进度、是否失败、为什么没有文件或要求重试时，"
+        "必须先调用本工具，不能猜测任务状态或直接新建任务。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "可选任务 ID；省略时查询当前对话最近提交的后台任务。",
+            }
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        if context.project_id is None or context.actor_id is None:
+            raise ValueError("查看评测任务需要当前项目和用户")
+        raw_job_id = str(
+            kwargs.get("job_id") or context.draft.get("background_job_id") or ""
+        ).strip()
+        with Session(get_settings_engine()) as session:
+            job: AgentJob | None = None
+            if raw_job_id:
+                try:
+                    job = session.get(AgentJob, UUID(raw_job_id))
+                except ValueError as error:
+                    raise ValueError("评测任务 ID 无效") from error
+            elif context.conversation_id is not None:
+                candidates = session.exec(
+                    select(AgentJob)
+                    .where(
+                        AgentJob.project_id == context.project_id,
+                        AgentJob.created_by == context.actor_id,
+                    )
+                    .order_by(AgentJob.created_at.desc())
+                ).all()
+                job = next(
+                    (
+                        item
+                        for item in candidates
+                        if str(item.input_config.get("conversation_id") or "")
+                        == str(context.conversation_id)
+                    ),
+                    None,
+                )
+            if (
+                job is None
+                or job.project_id != context.project_id
+                or job.created_by != context.actor_id
+            ):
+                raise ValueError("当前对话没有可查看的评测任务")
+
+            steps = session.exec(
+                select(AgentStep)
+                .where(AgentStep.job_id == job.id)
+                .order_by(AgentStep.created_at)
+            ).all()
+            step_labels = {
+                "generate_eval_spec": "生成评测方案",
+                "prepare_data": "准备评测数据",
+                "execute_eval_spec": "执行评测",
+                "summarize": "整理评测结果",
+            }
+            step_items = []
+            for step in steps:
+                label = step.output_data.get("label") if step.output_data else None
+                step_items.append(
+                    {
+                        "name": step.name,
+                        "label": str(label or step_labels.get(step.name) or step.name),
+                        "status": step.status.value,
+                        "attempt": step.attempt,
+                        "error": step.error if step.status == StepStatus.FAILED else None,
+                    }
+                )
+            current_step = next(
+                (item for item in step_items if item["status"] == StepStatus.RUNNING.value),
+                None,
+            ) or next(
+                (item for item in step_items if item["status"] == StepStatus.PENDING.value),
+                None,
+            )
+            result_file = (
+                session.get(FileObject, job.result_file_id) if job.result_file_id else None
+            )
+            if result_file is not None:
+                context.draft.update(
+                    {
+                        "source_file_id": str(result_file.id),
+                        "source_file_name": result_file.original_name,
+                        "source_inspected": False,
+                    }
+                )
+            context.draft["background_job_id"] = str(job.id)
+            summary = job.result.get("summary") if isinstance(job.result, dict) else None
+            return json.dumps(
+                {
+                    "ok": True,
+                    "job_id": str(job.id),
+                    "title": job.title,
+                    "status": job.status.value,
+                    "current_step": current_step,
+                    "steps": step_items,
+                    "repair_attempts": job.repair_attempts,
+                    "max_repair_attempts": job.max_repair_attempts,
+                    "error": job.error if job.status == AgentJobStatus.FAILED else None,
+                    "summary": summary,
+                    "primary_output_file_id": (
+                        str(result_file.id) if result_file is not None else None
+                    ),
+                    "output_file_name": (
+                        result_file.original_name if result_file is not None else None
+                    ),
+                    "created_at": job.created_at.isoformat(),
+                    "updated_at": job.updated_at.isoformat(),
+                },
+                ensure_ascii=False,
+            )
 
 
 class SubmitPythonJobTool(BaseAssistantTool):
@@ -762,6 +891,7 @@ ASSISTANT_TOOL_REGISTRY: list[BaseAssistantTool] = [
     UpdateTaskDraftTool(),
     InspectSourceTool(),
     RunPythonTool(),
+    InspectAgentJobTool(),
     SubmitPythonJobTool(),
     RepairPythonJobScriptTool(),
     ProbeHttpTargetTool(),
@@ -1002,6 +1132,7 @@ def tool_label(name: str) -> str:
         "update_task_draft": "整理任务信息",
         "inspect_source": "检查数据文件",
         "run_python": "运行 Python 文件处理",
+        "inspect_agent_job": "查看评测任务状态",
         "submit_python_job": "提交后台评测任务",
         "repair_python_job_script": "修复执行脚本",
         "probe_http_target": "验证目标接口",
