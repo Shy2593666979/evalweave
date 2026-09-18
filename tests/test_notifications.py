@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from evalweave.agents.react_tools import AssistantToolContext, SendWeComMessageTool
+from evalweave.agents.tools import AssistantToolContext, SendWeComMessageTool
 from evalweave.notifications.service import (
     notify_agent_job_completed,
     send_wecom,
@@ -115,7 +115,7 @@ def test_wecom_tool_exposes_only_supported_message_types(monkeypatch) -> None:
         sent.append((content, recipient, message_type))
         return "message-1"
 
-    monkeypatch.setattr("evalweave.agents.react_tools.send_wecom", fake_send)
+    monkeypatch.setattr("evalweave.agents.tools.send_wecom", fake_send)
     tool = SendWeComMessageTool()
     context = AssistantToolContext(draft={}, project_id=None)
 
@@ -176,15 +176,15 @@ def test_wecom_file_tool_sends_notice_before_file(monkeypatch, tmp_path: Path) -
         assert path == source
         return "media-1"
 
-    monkeypatch.setattr("evalweave.agents.react_tools.Session", lambda _engine: FakeSession())
-    monkeypatch.setattr("evalweave.agents.react_tools.get_settings_engine", lambda: object())
+    monkeypatch.setattr("evalweave.agents.tools.Session", lambda _engine: FakeSession())
+    monkeypatch.setattr("evalweave.agents.tools.get_settings_engine", lambda: object())
     monkeypatch.setattr(
-        "evalweave.agents.react_tools.get_settings",
+        "evalweave.agents.tools.get_settings",
         lambda: SimpleNamespace(storage=SimpleNamespace(local_directory=tmp_path)),
     )
-    monkeypatch.setattr("evalweave.agents.react_tools.LocalFileStorage", FakeStorage)
-    monkeypatch.setattr("evalweave.agents.react_tools.send_wecom", fake_send)
-    monkeypatch.setattr("evalweave.agents.react_tools.send_wecom_file", fake_send_file)
+    monkeypatch.setattr("evalweave.agents.tools.LocalFileStorage", FakeStorage)
+    monkeypatch.setattr("evalweave.agents.tools.send_wecom", fake_send)
+    monkeypatch.setattr("evalweave.agents.tools.send_wecom_file", fake_send_file)
 
     result = json.loads(
         SendWeComMessageTool().run(

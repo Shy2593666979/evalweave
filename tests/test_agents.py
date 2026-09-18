@@ -25,7 +25,7 @@ from evalweave.agents.inspection import load_source_rows
 from evalweave.agents.model_config import encrypt_secret_payload
 from evalweave.agents.planner import evaluate_target_records
 from evalweave.agents.python_workspace import run_python_workspace
-from evalweave.agents.react_tools import (
+from evalweave.agents.tools import (
     AssistantToolContext,
     InspectAgentJobTool,
     RequestOutputFormatTool,
@@ -123,7 +123,7 @@ def test_infer_explicit_output_format(user_text: str, expected: str | None) -> N
 
 
 def login_as_developer(client: TestClient) -> None:
-    options = client.get("/api/auth/registration-options").json()
+    options = client.get("/api/auth/registration-options").json()["data"]
     development = next(item for item in options if item["code"] == "development")
     client.post(
         "/api/auth/register",
@@ -144,7 +144,7 @@ def login_as_developer(client: TestClient) -> None:
 def current_project(client: TestClient) -> dict[str, object]:
     projects = client.get("/api/projects")
     assert projects.status_code == 200
-    return projects.json()[0]
+    return projects.json()["data"][0]
 
 
 def test_agent_jobs_are_private_to_the_creator(client: TestClient) -> None:
@@ -157,7 +157,7 @@ def test_agent_jobs_are_private_to_the_creator(client: TestClient) -> None:
     assert first_job.status_code == 201
 
     client.post("/api/auth/logout")
-    options = client.get("/api/auth/registration-options").json()
+    options = client.get("/api/auth/registration-options").json()["data"]
     development = next(item for item in options if item["code"] == "development")
     client.post(
         "/api/auth/register",
@@ -179,8 +179,8 @@ def test_agent_jobs_are_private_to_the_creator(client: TestClient) -> None:
     assert second_job.status_code == 201
 
     listing = client.get(f"/api/projects/{project['id']}/agent-jobs")
-    assert [item["id"] for item in listing.json()] == [second_job.json()["id"]]
-    first_job_id = first_job.json()["id"]
+    assert [item["id"] for item in listing.json()["data"]] == [second_job.json()["data"]["id"]]
+    first_job_id = first_job.json()["data"]["id"]
     assert client.get(f"/api/agent-jobs/{first_job_id}").status_code == 404
     assert client.get(f"/api/agent-jobs/{first_job_id}/steps").status_code == 404
     assert client.post(f"/api/agent-jobs/{first_job_id}/start").status_code == 404
@@ -191,9 +191,9 @@ def test_agent_jobs_are_private_to_the_creator(client: TestClient) -> None:
         json={"username": "admin", "password": "test-admin-password"},
     )
     admin_listing = client.get(f"/api/projects/{project['id']}/agent-jobs")
-    assert {item["id"] for item in admin_listing.json()} == {
+    assert {item["id"] for item in admin_listing.json()["data"]} == {
         first_job_id,
-        second_job.json()["id"],
+        second_job.json()["data"]["id"],
     }
 
 
@@ -201,7 +201,7 @@ def test_agent_plans_and_executes_without_scheme_approval(client: TestClient) ->
     login_as_developer(client)
     runtime = client.get("/api/agent/runtime")
     assert runtime.status_code == 200
-    assert "api_key" not in runtime.json()
+    assert "api_key" not in runtime.json()["data"]
     project = current_project(client)
     upload = client.post(
         f"/api/projects/{project['id']}/files",
@@ -220,20 +220,20 @@ def test_agent_plans_and_executes_without_scheme_approval(client: TestClient) ->
         json={
             "title": "Companion evaluation",
             "goal": "Evaluate conversation quality, tools and latency",
-            "source_file_id": upload.json()["id"],
+            "source_file_id": upload.json()["data"]["id"],
             "notification_targets": [{"channel": "email", "recipient": "reviewer@example.com"}],
         },
     )
     assert created.status_code == 201
-    job_id = UUID(created.json()["id"])
+    job_id = UUID(created.json()["data"]["id"])
 
     plan_agent_job(job_id)
-    planned = client.get(f"/api/agent-jobs/{job_id}").json()
+    planned = client.get(f"/api/agent-jobs/{job_id}").json()["data"]
     assert planned["status"] == "completed"
     assert planned["eval_spec"]["source"]["fields"] == ["scene", "user_message"]
     assert planned["requires_approval"] is False
 
-    steps = client.get(f"/api/agent-jobs/{job_id}/steps").json()
+    steps = client.get(f"/api/agent-jobs/{job_id}/steps").json()["data"]
     assert [step["name"] for step in steps] == [
         "discover_source",
         "generate_eval_spec",
@@ -241,7 +241,7 @@ def test_agent_plans_and_executes_without_scheme_approval(client: TestClient) ->
         "summarize",
     ]
 
-    tasks = client.get("/api/human-tasks?task_status=pending").json()
+    tasks = client.get("/api/human-tasks?task_status=pending").json()["data"]
     assert tasks == []
     assert planned["result"]["execution"]["execution_mode"] == "local_data"
 
@@ -265,7 +265,7 @@ def test_agent_assistant_returns_a_job_draft(client: TestClient, monkeypatch) ->
         json={"messages": [{"role": "user", "content": "评测这个接口并导出 Excel"}]},
     )
     assert response.status_code == 200
-    assert response.json()["draft"]["output_format"] == "xlsx"
+    assert response.json()["data"]["draft"]["output_format"] == "xlsx"
 
 
 def test_source_parsing_options_accepts_model_field_mapping_shape() -> None:
@@ -454,7 +454,7 @@ def test_agent_executes_http_target_without_host_allowlist(client: TestClient, m
     upload = client.post(
         f"/api/projects/{project['id']}/files",
         files={"file": ("cases.json", b'[{"message":"hello"}]', "application/json")},
-    ).json()
+    ).json()["data"]
     monkeypatch.setattr("evalweave.agents.executor.httpx.Client", FakeClient)
     created = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
@@ -471,10 +471,10 @@ def test_agent_executes_http_target_without_host_allowlist(client: TestClient, m
                 }
             },
         },
-    ).json()
+    ).json()["data"]
     plan_agent_job(UUID(created["id"]))
 
-    completed = client.get(f"/api/agent-jobs/{created['id']}").json()
+    completed = client.get(f"/api/agent-jobs/{created['id']}").json()["data"]
     target = completed["result"]["execution"]["target"]
     assert target["executed"] is True
     assert target["succeeded"] == 1
@@ -552,7 +552,7 @@ def test_python_workspace_registers_transformed_file(client: TestClient) -> None
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         },
-    ).json()
+    ).json()["data"]
     code = """
 import json
 from pathlib import Path
@@ -587,7 +587,7 @@ workbook.close()
 
 def test_python_workspace_creates_file_without_input(client: TestClient) -> None:
     login_as_developer(client)
-    creator = client.get("/api/auth/me").json()
+    creator = client.get("/api/auth/me").json()["data"]
     project = current_project(client)
     code = """
 from pathlib import Path
@@ -678,9 +678,12 @@ Path("outputs/leaked.txt").write_text(
 )
 """
 
-    with Session(get_engine()) as session, pytest.raises(
-        ValueError,
-        match="生成文件包含受保护的模型凭据",
+    with (
+        Session(get_engine()) as session,
+        pytest.raises(
+            ValueError,
+            match="生成文件包含受保护的模型凭据",
+        ),
     ):
         run_python_workspace(
             session,
@@ -696,10 +699,10 @@ def test_long_python_tool_creates_and_executes_background_job(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     login_as_developer(client)
-    creator = client.get("/api/auth/me").json()
+    creator = client.get("/api/auth/me").json()["data"]
     project = current_project(client)
     queued: list[UUID] = []
-    monkeypatch.setattr("evalweave.agents.react_tools.enqueue_python_job", queued.append)
+    monkeypatch.setattr("evalweave.agents.tools.enqueue_python_job", queued.append)
     context = AssistantToolContext(
         draft={"title": "批量生成文件", "goal": "在后台生成结果文件"},
         project_id=UUID(project["id"]),
@@ -819,7 +822,7 @@ def test_dialog_python_tool_uses_30_second_timeout(monkeypatch: pytest.MonkeyPat
         return ({"stdout": "", "outputs": []}, {})
 
     monkeypatch.setattr(
-        "evalweave.agents.react_tools.run_python_workspace",
+        "evalweave.agents.tools.run_python_workspace",
         capture_dialog_timeout,
     )
     context = AssistantToolContext(
@@ -844,7 +847,7 @@ def test_agent_can_inspect_existing_background_job_before_recreating(
     client: TestClient,
 ) -> None:
     login_as_developer(client)
-    creator = client.get("/api/auth/me").json()
+    creator = client.get("/api/auth/me").json()["data"]
     project = current_project(client)
     with Session(get_engine()) as session:
         job = AgentJob(
@@ -891,7 +894,7 @@ def test_background_python_job_repairs_script_before_failing(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     login_as_developer(client)
-    creator = client.get("/api/auth/me").json()
+    creator = client.get("/api/auth/me").json()["data"]
     project = current_project(client)
     with Session(get_engine()) as session:
         job = AgentJob(
@@ -947,9 +950,7 @@ def test_background_python_job_repairs_script_before_failing(
         repaired_job = session.get(AgentJob, job_id)
         steps = list(
             session.exec(
-                select(AgentStep)
-                .where(AgentStep.job_id == job_id)
-                .order_by(AgentStep.created_at)
+                select(AgentStep).where(AgentStep.job_id == job_id).order_by(AgentStep.created_at)
             )
         )
 
@@ -969,7 +970,7 @@ def test_background_python_job_repairs_script_before_failing(
 
 def test_worker_restart_recovers_interrupted_python_job(client: TestClient) -> None:
     login_as_developer(client)
-    creator = client.get("/api/auth/me").json()
+    creator = client.get("/api/auth/me").json()["data"]
     project = current_project(client)
     with Session(get_engine()) as session:
         job = AgentJob(
@@ -1005,7 +1006,7 @@ def test_python_job_repair_reuses_original_conversation_context(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     login_as_developer(client)
-    creator = client.get("/api/auth/me").json()
+    creator = client.get("/api/auth/me").json()["data"]
     project = current_project(client)
     captured: dict[str, object] = {}
     with Session(get_engine()) as session:
@@ -1148,16 +1149,16 @@ def test_agent_generates_cases_when_http_target_has_no_source_file(
                 },
             },
         },
-    ).json()
+    ).json()["data"]
     plan_agent_job(UUID(created["id"]))
 
-    completed = client.get(f"/api/agent-jobs/{created['id']}").json()
+    completed = client.get(f"/api/agent-jobs/{created['id']}").json()["data"]
     target = completed["result"]["execution"]["target"]
     assert completed["status"] == "completed"
     assert target["case_source"] == "ai_generated"
     assert target["total_cases"] == 2
     assert completed["eval_spec"]["source"]["case_count"] == 2
-    steps = client.get(f"/api/agent-jobs/{created['id']}/steps").json()
+    steps = client.get(f"/api/agent-jobs/{created['id']}/steps").json()["data"]
     assert [step["name"] for step in steps] == [
         "generate_eval_spec",
         "generate_test_cases",
@@ -1192,7 +1193,7 @@ def test_target_preflight_failure_returns_to_react_and_retries(
                 }
             },
         },
-    ).json()
+    ).json()["data"]
     attempts = 0
 
     def fake_validate(_session, _job):
@@ -1240,7 +1241,7 @@ def test_target_preflight_failure_returns_to_react_and_retries(
         assert result["validated"] is True
         assert job.repair_attempts == 1
         assert job.input_config["target"]["body"] == {"query": "{{generated_query}}"}
-    steps = client.get(f"/api/agent-jobs/{created['id']}/steps").json()
+    steps = client.get(f"/api/agent-jobs/{created['id']}/steps").json()["data"]
     assert [(step["name"], step["status"]) for step in steps] == [
         ("validate_target", "failed"),
         ("update_task_draft", "completed"),
@@ -1261,7 +1262,7 @@ def test_semantic_preflight_rejects_when_all_sample_responses_are_wrong(
             "requires_approval": False,
             "input_config": {"target": {"url": "https://model.test/chat"}},
         },
-    ).json()
+    ).json()["data"]
     records = [
         {
             "case_index": 0,
@@ -1388,7 +1389,7 @@ def test_assistant_conversation_can_be_renamed_and_deleted(client: TestClient) -
     login_as_developer(client)
     project = current_project(client)
     created = client.post("/api/assistant/conversations", json={"project_id": project["id"]})
-    conversation_id = created.json()["id"]
+    conversation_id = created.json()["data"]["id"]
 
     renamed = client.patch(
         f"/api/assistant/conversations/{conversation_id}",
@@ -1396,12 +1397,11 @@ def test_assistant_conversation_can_be_renamed_and_deleted(client: TestClient) -
     )
 
     assert renamed.status_code == 200
-    assert renamed.json()["title"] == "新的对话名称"
+    assert renamed.json()["data"]["title"] == "新的对话名称"
     assert client.delete(f"/api/assistant/conversations/{conversation_id}").status_code == 204
     assert client.get(f"/api/assistant/conversations/{conversation_id}/messages").status_code == 404
-    assert all(
-        item["id"] != conversation_id for item in client.get("/api/assistant/conversations").json()
-    )
+    conversations = client.get("/api/assistant/conversations").json()["data"]
+    assert all(item["id"] != conversation_id for item in conversations)
 
 
 def test_conversation_title_is_normalized_to_two_to_ten_characters() -> None:
@@ -1418,8 +1418,8 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
     project = current_project(client)
     conversation = client.post("/api/assistant/conversations", json={"project_id": project["id"]})
     assert conversation.status_code == 201
-    conversation_id = conversation.json()["id"]
-    greeting = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()
+    conversation_id = conversation.json()["data"]["id"]
+    greeting = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()["data"]
     assert greeting[0]["role"] == "assistant"
 
     uploaded = client.post(
@@ -1458,7 +1458,7 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
         f"/api/assistant/conversations/{conversation_id}/messages/stream",
         json={
             "content": "比较成绩",
-            "source_file_id": uploaded.json()["id"],
+            "source_file_id": uploaded.json()["data"]["id"],
         },
     )
     events = [json.loads(line) for line in response.text.splitlines()]
@@ -1472,16 +1472,16 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
     assert len(scheduled_titles) == 1
     assert scheduled_titles[0][2] == "比较成绩"
 
-    stored = client.get("/api/assistant/conversations").json()[0]
+    stored = client.get("/api/assistant/conversations").json()["data"][0]
     assert stored["draft"]["goal"] == "比较综合成绩和各项排名"
     assert stored["status"] == "choose_output"
-    messages = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()
+    messages = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()["data"]
     assert [message["role"] for message in messages] == [
         "assistant",
         "user",
         "assistant",
     ]
-    assert messages[1]["attachment_file_id"] == uploaded.json()["id"]
+    assert messages[1]["attachment_file_id"] == uploaded.json()["data"]["id"]
     assert messages[1]["attachment_name"] == "cases.xlsx"
     assert messages[1]["attachment_content_type"] == (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1516,19 +1516,17 @@ def test_assistant_conversation_streams_and_persists_draft(client: TestClient, m
             "output_format": "xlsx",
             "input_config": {"target": {"url": "https://model.test/scores"}},
         },
-    ).json()
+    ).json()["data"]
     started = client.post(
         f"/api/assistant/conversations/{conversation_id}/started",
         json={"agent_job_id": job["id"]},
     )
     assert started.status_code == 200
-    assert started.json()["status"] == "started"
-    assert started.json()["agent_job_id"] == job["id"]
-    messages = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()
+    assert started.json()["data"]["status"] == "started"
+    assert started.json()["data"]["agent_job_id"] == job["id"]
+    messages = client.get(f"/api/assistant/conversations/{conversation_id}/messages").json()["data"]
     assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"] == (
-        "将使用上传的数据比较成绩并生成 Excel 结果，是否开始执行？"
-    )
+    assert messages[-1]["content"] == ("将使用上传的数据比较成绩并生成 Excel 结果，是否开始执行？")
 
 
 def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeypatch) -> None:
@@ -1536,7 +1534,7 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
     project = current_project(client)
     conversation = client.post(
         "/api/assistant/conversations", json={"project_id": project["id"]}
-    ).json()
+    ).json()["data"]
     config = AgentConfig(enabled=True, base_url="https://model.test", model="test-model")
     monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
 
@@ -1587,7 +1585,7 @@ def test_assistant_stream_forwards_react_tool_events(client: TestClient, monkeyp
     assert "ui_action" not in events[-1]["draft"]
     stored_messages = client.get(
         f"/api/assistant/conversations/{conversation['id']}/messages"
-    ).json()
+    ).json()["data"]
     assert stored_messages[-2]["content"] == "The endpoint is reachable."
     assert stored_messages[-2]["include_in_context"] is False
     assert stored_messages[-1]["content"] == events[-1]["content"]
@@ -1636,7 +1634,7 @@ def test_assistant_user_input_keeps_conversation_collecting(
     project = current_project(client)
     conversation = client.post(
         "/api/assistant/conversations", json={"project_id": project["id"]}
-    ).json()
+    ).json()["data"]
     config = AgentConfig(enabled=True, base_url="https://model.test", model="test-model")
     monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
 
@@ -1679,12 +1677,12 @@ def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
     project = current_project(client)
     conversation = client.post(
         "/api/assistant/conversations", json={"project_id": project["id"]}
-    ).json()
+    ).json()["data"]
     generated_file = client.post(
         f"/api/projects/{project['id']}/files",
         data={"category": "dataset_source"},
         files={"file": ("scored_results.xlsx", b"generated workbook", "application/xlsx")},
-    ).json()
+    ).json()["data"]
     config = AgentConfig(enabled=True, base_url="https://model.test", model="test-model")
     monkeypatch.setattr("evalweave.api.routes.agents.resolve_agent_config", lambda *_: config)
 
@@ -1734,7 +1732,8 @@ def test_assistant_completed_tool_reply_does_not_request_task_confirmation(
     assert events[-1]["ui_action"] is None
     assert "ui_action" not in events[-1]["draft"]
     assert events[-1]["attachment_file_id"] == generated_file["id"]
-    messages = client.get(f"/api/assistant/conversations/{conversation['id']}/messages").json()
+    response = client.get(f"/api/assistant/conversations/{conversation['id']}/messages")
+    messages = response.json()["data"]
     assert messages[-1]["ui_action"] is None
     assert messages[-1]["attachment_file_id"] == generated_file["id"]
     assert messages[-1]["attachment_name"] == "scored_results.xlsx"
@@ -1754,7 +1753,7 @@ def test_generic_data_program_combines_model_and_multiple_http_targets(
                 "application/json",
             )
         },
-    ).json()
+    ).json()["data"]
     created = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
         json={
@@ -1778,7 +1777,7 @@ def test_generic_data_program_combines_model_and_multiple_http_targets(
                 ]
             },
         },
-    ).json()
+    ).json()["data"]
     monkeypatch.setattr(
         "evalweave.agents.executor.authenticate_target", lambda *_args, **_kwargs: "none"
     )

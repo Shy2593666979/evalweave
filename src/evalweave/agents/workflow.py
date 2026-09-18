@@ -31,7 +31,7 @@ from evalweave.agents.planner import (
     repair_python_script,
 )
 from evalweave.agents.python_workspace import run_python_workspace
-from evalweave.agents.react_runtime import stream_react_configuration
+from evalweave.agents.runtime import stream_react_configuration
 from evalweave.core.config import get_settings
 from evalweave.db.models import (
     AgentJob,

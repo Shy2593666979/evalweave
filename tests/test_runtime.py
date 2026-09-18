@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from evalweave.agents.react_runtime import stream_react_configuration
-from evalweave.agents.react_tools import (
+from evalweave.agents.runtime import stream_react_configuration
+from evalweave.agents.tools import (
     AssistantToolContext,
     RequestConfirmationTool,
     RequestUserInputTool,

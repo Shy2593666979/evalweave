@@ -1,8 +1,8 @@
-from fastapi.testclient import TestClient
+﻿from fastapi.testclient import TestClient
 
 
 def test_admin_creates_and_assigns_project(client: TestClient) -> None:
-    options = client.get("/api/auth/registration-options").json()
+    options = client.get("/api/auth/registration-options").json()["data"]
     development = next(item for item in options if item["code"] == "development")
     client.post(
         "/api/auth/register",
@@ -20,9 +20,9 @@ def test_admin_creates_and_assigns_project(client: TestClient) -> None:
     assert login_response.status_code == 200
 
     assert client.post("/api/projects", json={"name": "Forbidden"}).status_code == 403
-    default_projects = client.get("/api/projects").json()
+    default_projects = client.get("/api/projects").json()["data"]
     assert len(default_projects) == 1
-    developer_id = client.get("/api/auth/me").json()["id"]
+    developer_id = client.get("/api/auth/me").json()["data"]["id"]
 
     client.post("/api/auth/logout")
     admin_login = client.post(
@@ -40,7 +40,7 @@ def test_admin_creates_and_assigns_project(client: TestClient) -> None:
         },
     )
     assert create_response.status_code == 201
-    project = create_response.json()
+    project = create_response.json()["data"]
     assert project["name"] == "Companion Evaluation"
     assert project["service_url"] == "https://companion.example.com"
     assigned = client.put(
@@ -53,7 +53,7 @@ def test_admin_creates_and_assigns_project(client: TestClient) -> None:
         json={"user_ids": [developer_id]},
     )
     assert reassigned.status_code == 200
-    assert reassigned.json() == [developer_id]
+    assert reassigned.json()["data"] == [developer_id]
 
     client.post("/api/auth/logout")
     client.post(
@@ -62,7 +62,7 @@ def test_admin_creates_and_assigns_project(client: TestClient) -> None:
     )
     list_response = client.get("/api/projects")
     assert list_response.status_code == 200
-    assert {item["id"] for item in list_response.json()} == {
+    assert {item["id"] for item in list_response.json()["data"]} == {
         default_projects[0]["id"],
         project["id"],
     }

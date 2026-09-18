@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from evalweave.agents.inspection import load_source_rows
+from evalweave.api.response import APIResponse
 from evalweave.auth.dependencies import CurrentUser, SessionDependency, require_permission
 from evalweave.auth.permissions import Permission
 from evalweave.core.config import get_settings
@@ -169,10 +170,10 @@ def enqueue_campaign_finalization(campaign_id: UUID, deadline_at: datetime | Non
         return
 
 
-@router.post("/campaigns", response_model=dict[str, Any])
+@router.post("/campaigns", response_model=APIResponse[dict[str, Any]])
 def create_campaign(
     payload: ReviewCampaignCreate, user: ExperimentRunner, session: SessionDependency
-) -> dict[str, Any]:
+) -> APIResponse[dict[str, Any]]:
     job = session.get(AgentJob, payload.job_id)
     if job is None or (job.created_by != user.id and user.system_role != SystemRole.ADMIN):
         raise HTTPException(status_code=404, detail="评测任务不存在")
@@ -231,7 +232,7 @@ def create_campaign(
     session.refresh(campaign)
     if deadline_at:
         enqueue_campaign_finalization(campaign.id, deadline_at)
-    return campaign_read(campaign)
+    return APIResponse.success(campaign_read(campaign))
 
 
 def _resolve_reviewer_ids(
@@ -272,10 +273,10 @@ def _find_column(
     return next((lookup[alias.lower()] for alias in aliases if alias.lower() in lookup), None)
 
 
-@router.post("/campaigns/from-file", response_model=dict[str, Any])
+@router.post("/campaigns/from-file", response_model=APIResponse[dict[str, Any]])
 def create_campaign_from_file(
     payload: ReviewCampaignFromFileCreate, user: ExperimentRunner, session: SessionDependency
-) -> dict[str, Any]:
+) -> APIResponse[dict[str, Any]]:
     job = session.get(AgentJob, payload.job_id)
     if job is None or (job.created_by != user.id and user.system_role != SystemRole.ADMIN):
         raise HTTPException(status_code=404, detail="评测任务不存在")
@@ -373,8 +374,13 @@ def _enqueue_expired(campaigns: list[HumanReviewCampaign]) -> None:
             enqueue_campaign_finalization(campaign.id)
 
 
-@router.get("/assignments/mine", response_model=list[dict[str, Any]])
-def list_my_assignments(user: CurrentUser, session: SessionDependency) -> list[dict[str, Any]]:
+@router.get(
+    "/assignments/mine",
+    response_model=APIResponse[list[dict[str, Any]]],
+)
+def list_my_assignments(
+    user: CurrentUser, session: SessionDependency
+) -> APIResponse[list[dict[str, Any]]]:
     _enqueue_expired(
         list(
             session.exec(
@@ -389,11 +395,15 @@ def list_my_assignments(user: CurrentUser, session: SessionDependency) -> list[d
         .where(HumanReviewAssignment.reviewer_id == user.id)
         .order_by(HumanReviewAssignment.status, HumanReviewAssignment.created_at)
     ).all()
-    return [assignment_read(assignment, item, campaign) for assignment, item, campaign in rows]
+    return APIResponse.success(
+        [assignment_read(assignment, item, campaign) for assignment, item, campaign in rows]
+    )
 
 
-@router.get("/campaigns/mine", response_model=list[dict[str, Any]])
-def list_my_campaigns(user: CurrentUser, session: SessionDependency) -> list[dict[str, Any]]:
+@router.get("/campaigns/mine", response_model=APIResponse[list[dict[str, Any]]])
+def list_my_campaigns(
+    user: CurrentUser, session: SessionDependency
+) -> APIResponse[list[dict[str, Any]]]:
     campaigns = list(
         session.exec(
             select(HumanReviewCampaign)
@@ -402,7 +412,7 @@ def list_my_campaigns(user: CurrentUser, session: SessionDependency) -> list[dic
         ).all()
     )
     _enqueue_expired(campaigns)
-    return [campaign_read(item) for item in campaigns]
+    return APIResponse.success([campaign_read(item) for item in campaigns])
 
 
 def update_campaign_progress(session: Session, campaign: HumanReviewCampaign) -> bool:
@@ -417,10 +427,13 @@ def update_campaign_progress(session: Session, campaign: HumanReviewCampaign) ->
     return campaign.completed_assignments >= campaign.total_assignments
 
 
-@router.post("/assignments/{assignment_id}/submit", response_model=dict[str, Any])
+@router.post(
+    "/assignments/{assignment_id}/submit",
+    response_model=APIResponse[dict[str, Any]],
+)
 def submit_review(
     assignment_id: UUID, payload: ReviewSubmission, user: CurrentUser, session: SessionDependency
-) -> dict[str, Any]:
+) -> APIResponse[dict[str, Any]]:
     assignment = session.get(HumanReviewAssignment, assignment_id)
     if assignment is None or assignment.reviewer_id != user.id:
         raise HTTPException(status_code=404, detail="待评样本不存在")
@@ -467,4 +480,4 @@ def submit_review(
     session.refresh(assignment)
     if all_submitted:
         finalize_campaign(campaign.id)
-    return assignment_read(assignment, item, campaign)
+    return APIResponse.success(assignment_read(assignment, item, campaign))

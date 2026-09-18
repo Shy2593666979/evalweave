@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Response, status
 from sqlmodel import select
 
+from evalweave.api.response import APIResponse
 from evalweave.auth.dependencies import CurrentUser, SessionDependency
 from evalweave.auth.schemas import LoginRequest, RegisterRequest, UserRead, UserTypeRead
 from evalweave.auth.security import create_access_token, hash_password, verify_password
@@ -18,17 +19,21 @@ from evalweave.db.models import SystemRole, User, UserType
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
 
-@router.get("/registration-options", response_model=list[UserTypeRead])
-def registration_options(session: SessionDependency) -> list[UserType]:
+@router.get("/registration-options", response_model=APIResponse[list[UserTypeRead]])
+def registration_options(session: SessionDependency) -> APIResponse[list[UserType]]:
     statement = select(UserType).where(
         UserType.is_active.is_(True),
         UserType.selectable_on_registration.is_(True),
     )
-    return list(session.exec(statement.order_by(UserType.name)).all())
+    return APIResponse.success(list(session.exec(statement.order_by(UserType.name)).all()))
 
 
-@router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, session: SessionDependency) -> UserRead:
+@router.post(
+    "/register",
+    response_model=APIResponse[UserRead],
+    status_code=status.HTTP_201_CREATED,
+)
+def register(payload: RegisterRequest, session: SessionDependency) -> APIResponse[UserRead]:
     if not get_settings().auth.allow_registration:
         raise HTTPException(status_code=403, detail="系统已关闭公开注册")
     ensure_user_type(session, payload.user_type_id, registration=True)
@@ -43,11 +48,15 @@ def register(payload: RegisterRequest, session: SessionDependency) -> UserRead:
     commit_or_conflict(session, "用户名或邮箱已存在")
     session.refresh(user)
     assign_default_project(session, user)
-    return user_to_read(session, user)
+    return APIResponse.success(user_to_read(session, user))
 
 
-@router.post("/login", response_model=UserRead)
-def login(payload: LoginRequest, response: Response, session: SessionDependency) -> UserRead:
+@router.post("/login", response_model=APIResponse[UserRead])
+def login(
+    payload: LoginRequest,
+    response: Response,
+    session: SessionDependency,
+) -> APIResponse[UserRead]:
     username = payload.username.strip()
     user = session.exec(select(User).where(User.username == username)).first()
     if user is None or not verify_password(payload.password, user.password_hash):
@@ -70,7 +79,7 @@ def login(payload: LoginRequest, response: Response, session: SessionDependency)
         max_age=auth.token_expire_minutes * 60,
         path="/",
     )
-    return user_to_read(session, user)
+    return APIResponse.success(user_to_read(session, user))
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -78,6 +87,6 @@ def logout(response: Response) -> None:
     response.delete_cookie(get_settings().auth.cookie_name, path="/")
 
 
-@router.get("/me", response_model=UserRead)
-def me(user: CurrentUser, session: SessionDependency) -> UserRead:
-    return user_to_read(session, user)
+@router.get("/me", response_model=APIResponse[UserRead])
+def me(user: CurrentUser, session: SessionDependency) -> APIResponse[UserRead]:
+    return APIResponse.success(user_to_read(session, user))

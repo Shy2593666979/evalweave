@@ -1,10 +1,10 @@
-from fastapi.testclient import TestClient
+﻿from fastapi.testclient import TestClient
 
 
 def test_registration_login_and_permissions(client: TestClient) -> None:
     options = client.get("/api/auth/registration-options")
     assert options.status_code == 200
-    product = next(item for item in options.json() if item["code"] == "product")
+    product = next(item for item in options.json()["data"] if item["code"] == "product")
 
     registration = client.post(
         "/api/auth/register",
@@ -16,20 +16,20 @@ def test_registration_login_and_permissions(client: TestClient) -> None:
         },
     )
     assert registration.status_code == 201
-    assert registration.json()["email"] == "product_user@example.com"
-    assert registration.json()["user_type_name"] == "产品同学"
+    assert registration.json()["data"]["email"] == "product_user@example.com"
+    assert registration.json()["data"]["user_type_name"] == "产品同学"
 
     login = client.post(
         "/api/auth/login",
         json={"username": "product_user", "password": "strong-password"},
     )
     assert login.status_code == 200
-    assert client.get("/api/auth/me").json()["username"] == "product_user"
+    assert client.get("/api/auth/me").json()["data"]["username"] == "product_user"
     assert client.post("/api/projects", json={"name": "Forbidden"}).status_code == 403
 
 
 def test_registration_rejects_invalid_email(client: TestClient) -> None:
-    options = client.get("/api/auth/registration-options").json()
+    options = client.get("/api/auth/registration-options").json()["data"]
     product = next(item for item in options if item["code"] == "product")
     response = client.post(
         "/api/auth/register",
@@ -68,12 +68,12 @@ def test_admin_can_create_user_type_and_user(client: TestClient) -> None:
             "email": "operator@example.com",
             "password": "operator-password",
             "system_role": "user",
-            "user_type_id": created_type.json()["id"],
+            "user_type_id": created_type.json()["data"]["id"],
             "is_active": True,
         },
     )
     assert created_user.status_code == 201
-    assert created_user.json()["user_type_name"] == "运营同学"
+    assert created_user.json()["data"]["user_type_name"] == "运营同学"
 
 
 def test_admin_can_manage_evaluation_models_without_exposing_key(client: TestClient) -> None:
@@ -92,9 +92,9 @@ def test_admin_can_manage_evaluation_models_without_exposing_key(client: TestCli
         },
     )
     assert created.status_code == 201
-    assert created.json()["base_url"] == "https://model.example/v1"
-    assert "api_key" not in created.json()
+    assert created.json()["data"]["base_url"] == "https://model.example/v1"
+    assert "api_key" not in created.json()["data"]
 
     listing = client.get("/api/evaluation-models")
     assert listing.status_code == 200
-    assert listing.json()[0]["name"] == "测试模型"
+    assert listing.json()["data"][0]["name"] == "测试模型"

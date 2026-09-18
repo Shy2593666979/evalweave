@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import select
 
 from evalweave.agents.model_config import encrypt_api_key
+from evalweave.api.response import APIResponse
 from evalweave.auth.dependencies import AdminUser, SessionDependency
 from evalweave.auth.permissions import permission_catalog
 from evalweave.auth.schemas import (
@@ -62,27 +63,32 @@ class EvaluationModelRead(BaseModel):
     updated_at: datetime
 
 
-@router.get("/permissions")
-def list_permissions(_: AdminUser) -> list[dict[str, str]]:
-    return permission_catalog()
+@router.get("/permissions", response_model=APIResponse[list[dict[str, str]]])
+def list_permissions(_: AdminUser) -> APIResponse[list[dict[str, str]]]:
+    return APIResponse.success(permission_catalog())
 
 
-@router.get("/evaluation-models", response_model=list[EvaluationModelRead])
+@router.get(
+    "/evaluation-models",
+    response_model=APIResponse[list[EvaluationModelRead]],
+)
 def list_evaluation_models(
     _: AdminUser, session: SessionDependency
-) -> list[EvaluationModelRead]:
+) -> APIResponse[list[EvaluationModelRead]]:
     models = session.exec(select(EvaluationModel).order_by(EvaluationModel.created_at.desc())).all()
-    return [EvaluationModelRead.model_validate(model) for model in models]
+    return APIResponse.success(
+        [EvaluationModelRead.model_validate(model) for model in models]
+    )
 
 
 @router.post(
     "/evaluation-models",
-    response_model=EvaluationModelRead,
+    response_model=APIResponse[EvaluationModelRead],
     status_code=status.HTTP_201_CREATED,
 )
 def create_evaluation_model(
     payload: EvaluationModelCreate, _: AdminUser, session: SessionDependency
-) -> EvaluationModel:
+) -> APIResponse[EvaluationModel]:
     model = EvaluationModel(
         name=payload.name.strip(),
         base_url=payload.base_url.strip().rstrip("/"),
@@ -94,16 +100,19 @@ def create_evaluation_model(
     session.add(model)
     commit_or_conflict(session, "评测模型名称已存在")
     session.refresh(model)
-    return model
+    return APIResponse.success(model)
 
 
-@router.patch("/evaluation-models/{model_id}", response_model=EvaluationModelRead)
+@router.patch(
+    "/evaluation-models/{model_id}",
+    response_model=APIResponse[EvaluationModelRead],
+)
 def update_evaluation_model(
     model_id: UUID,
     payload: EvaluationModelUpdate,
     _: AdminUser,
     session: SessionDependency,
-) -> EvaluationModel:
+) -> APIResponse[EvaluationModel]:
     model = session.get(EvaluationModel, model_id)
     if model is None:
         raise HTTPException(status_code=404, detail="评测模型不存在")
@@ -120,20 +129,28 @@ def update_evaluation_model(
     session.add(model)
     commit_or_conflict(session, "评测模型名称已存在")
     session.refresh(model)
-    return model
+    return APIResponse.success(model)
 
 
-@router.get("/user-types", response_model=list[UserTypeRead])
-def list_user_types(_: AdminUser, session: SessionDependency) -> list[UserType]:
-    return list(session.exec(select(UserType).order_by(UserType.created_at)).all())
+@router.get("/user-types", response_model=APIResponse[list[UserTypeRead]])
+def list_user_types(
+    _: AdminUser, session: SessionDependency
+) -> APIResponse[list[UserType]]:
+    return APIResponse.success(
+        list(session.exec(select(UserType).order_by(UserType.created_at)).all())
+    )
 
 
-@router.post("/user-types", response_model=UserTypeRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/user-types",
+    response_model=APIResponse[UserTypeRead],
+    status_code=status.HTTP_201_CREATED,
+)
 def create_user_type(
     payload: UserTypeCreate,
     _: AdminUser,
     session: SessionDependency,
-) -> UserType:
+) -> APIResponse[UserType]:
     user_type = UserType(
         code=payload.code,
         name=payload.name.strip(),
@@ -144,16 +161,16 @@ def create_user_type(
     session.add(user_type)
     commit_or_conflict(session, "用户类型编码或名称已存在")
     session.refresh(user_type)
-    return user_type
+    return APIResponse.success(user_type)
 
 
-@router.patch("/user-types/{user_type_id}", response_model=UserTypeRead)
+@router.patch("/user-types/{user_type_id}", response_model=APIResponse[UserTypeRead])
 def update_user_type(
     user_type_id: UUID,
     payload: UserTypeUpdate,
     _: AdminUser,
     session: SessionDependency,
-) -> UserType:
+) -> APIResponse[UserType]:
     user_type = session.get(UserType, user_type_id)
     if user_type is None:
         raise HTTPException(status_code=404, detail="用户类型不存在")
@@ -168,17 +185,23 @@ def update_user_type(
     session.add(user_type)
     commit_or_conflict(session, "用户类型名称已存在")
     session.refresh(user_type)
-    return user_type
+    return APIResponse.success(user_type)
 
 
-@router.get("/users", response_model=list[UserRead])
-def list_users(_: AdminUser, session: SessionDependency) -> list[UserRead]:
+@router.get("/users", response_model=APIResponse[list[UserRead]])
+def list_users(_: AdminUser, session: SessionDependency) -> APIResponse[list[UserRead]]:
     users = session.exec(select(User).order_by(User.created_at.desc())).all()
-    return [user_to_read(session, user) for user in users]
+    return APIResponse.success([user_to_read(session, user) for user in users])
 
 
-@router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def create_user(payload: UserCreate, _: AdminUser, session: SessionDependency) -> UserRead:
+@router.post(
+    "/users",
+    response_model=APIResponse[UserRead],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_user(
+    payload: UserCreate, _: AdminUser, session: SessionDependency
+) -> APIResponse[UserRead]:
     if payload.system_role == SystemRole.USER:
         if payload.user_type_id is None:
             raise HTTPException(status_code=422, detail="普通用户必须选择用户类型")
@@ -195,16 +218,16 @@ def create_user(payload: UserCreate, _: AdminUser, session: SessionDependency) -
     commit_or_conflict(session, "用户名或邮箱已存在")
     session.refresh(user)
     assign_default_project(session, user)
-    return user_to_read(session, user)
+    return APIResponse.success(user_to_read(session, user))
 
 
-@router.patch("/users/{user_id}", response_model=UserRead)
+@router.patch("/users/{user_id}", response_model=APIResponse[UserRead])
 def update_user(
     user_id: UUID,
     payload: UserUpdate,
     admin: AdminUser,
     session: SessionDependency,
-) -> UserRead:
+) -> APIResponse[UserRead]:
     user = session.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -226,4 +249,4 @@ def update_user(
     session.add(user)
     commit_or_conflict(session, "邮箱已被其他用户使用")
     session.refresh(user)
-    return user_to_read(session, user)
+    return APIResponse.success(user_to_read(session, user))

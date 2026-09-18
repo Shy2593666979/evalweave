@@ -1,11 +1,11 @@
-from io import BytesIO
+﻿from io import BytesIO
 
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
 
 def register_and_login(client: TestClient, username: str, user_type_code: str) -> dict:
-    options = client.get("/api/auth/registration-options").json()
+    options = client.get("/api/auth/registration-options").json()["data"]
     user_type = next(item for item in options if item["code"] == user_type_code)
     registered = client.post(
         "/api/auth/register",
@@ -22,16 +22,16 @@ def register_and_login(client: TestClient, username: str, user_type_code: str) -
         json={"username": username, "password": "review-password"},
     )
     assert login.status_code == 200
-    return registered.json()
+    return registered.json()["data"]
 
 
 def test_human_review_assignment_is_private_and_aggregates(client: TestClient) -> None:
     initiator = register_and_login(client, "review_initiator", "development")
-    project = client.get("/api/projects").json()[0]
+    project = client.get("/api/projects").json()["data"][0]
     job = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
         json={"title": "Blind review source", "goal": "Compare response quality"},
-    ).json()
+    ).json()["data"]
 
     reviewer = register_and_login(client, "assigned_reviewer", "research")
     client.post(
@@ -60,7 +60,7 @@ def test_human_review_assignment_is_private_and_aggregates(client: TestClient) -
         },
     )
     assert created.status_code == 200
-    assert created.json()["total_assignments"] == 1
+    assert created.json()["data"]["total_assignments"] == 1
 
     client.post(
         "/api/auth/login",
@@ -68,7 +68,7 @@ def test_human_review_assignment_is_private_and_aggregates(client: TestClient) -
     )
     assignments = client.get("/api/human-reviews/assignments/mine")
     assert assignments.status_code == 200
-    assignment = assignments.json()[0]
+    assignment = assignments.json()["data"][0]
     assert assignment["metadata"] == {"scene": "售后"}
     assert "secret-model" not in str(assignment)
 
@@ -83,7 +83,7 @@ def test_human_review_assignment_is_private_and_aggregates(client: TestClient) -
         },
     )
     assert submitted.status_code == 200
-    assert submitted.json()["overall_score"] == 8.5
+    assert submitted.json()["data"]["overall_score"] == 8.5
     assert (
         client.post(
             f"/api/human-reviews/assignments/{assignment['id']}/submit",
@@ -96,7 +96,7 @@ def test_human_review_assignment_is_private_and_aggregates(client: TestClient) -
         "/api/auth/login",
         json={"username": initiator["username"], "password": "review-password"},
     )
-    campaigns = client.get("/api/human-reviews/campaigns/mine").json()
+    campaigns = client.get("/api/human-reviews/campaigns/mine").json()["data"]
     assert campaigns[0]["status"] == "completed"
     assert campaigns[0]["completed_assignments"] == 1
     assert campaigns[0]["summary"]["average_overall_score"] == 8.5
@@ -110,7 +110,7 @@ def test_create_human_review_from_excel_for_groups_and_named_user(
         lambda *_args, **_kwargs: None,
     )
     initiator = register_and_login(client, "file_review_owner", "development")
-    project = client.get("/api/projects").json()[0]
+    project = client.get("/api/projects").json()["data"][0]
 
     workbook = Workbook()
     sheet = workbook.active
@@ -129,7 +129,7 @@ def test_create_human_review_from_excel_for_groups_and_named_user(
             )
         },
         data={"category": "dataset_source"},
-    ).json()
+    ).json()["data"]
     job = client.post(
         f"/api/projects/{project['id']}/agent-jobs",
         json={
@@ -137,7 +137,7 @@ def test_create_human_review_from_excel_for_groups_and_named_user(
             "goal": "评审 Excel 回复",
             "source_file_id": uploaded["id"],
         },
-    ).json()
+    ).json()["data"]
 
     register_and_login(client, "product_reviewer", "product")
     register_and_login(client, "research_reviewer", "research")
@@ -158,7 +158,7 @@ def test_create_human_review_from_excel_for_groups_and_named_user(
         },
     )
     assert created.status_code == 200
-    campaign = created.json()
+    campaign = created.json()["data"]
     assert campaign["item_count"] == 2
     assert campaign["total_assignments"] == 6
     assert campaign["deadline_at"] is not None
@@ -168,7 +168,7 @@ def test_create_human_review_from_excel_for_groups_and_named_user(
         "/api/auth/login",
         json={"username": named["username"], "password": "review-password"},
     )
-    assignments = client.get("/api/human-reviews/assignments/mine").json()
+    assignments = client.get("/api/human-reviews/assignments/mine").json()["data"]
     own = [item for item in assignments if item["campaign_id"] == campaign["id"]]
     assert len(own) == 2
     assert own[0]["metadata"]["回复耗时"] in {320, 860}

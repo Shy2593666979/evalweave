@@ -3,14 +3,13 @@ from types import SimpleNamespace
 import pytest
 
 from evalweave.agents.planner import (
-    ASSISTANT_PROMPT,
     derive_task_title,
     extract_partial_json_string,
     generate_eval_spec,
     generate_test_cases,
     request_json,
 )
-from evalweave.agents.react_runtime import REACT_SYSTEM_PROMPT
+from evalweave.agents.prompts import ASSISTANT_PROMPT, RUNTIME_SYSTEM_PROMPT
 from evalweave.core.config import AgentConfig
 
 
@@ -115,9 +114,9 @@ def test_extract_partial_reply_from_streamed_json() -> None:
 
 
 def test_assistant_owns_title_and_probes_target_response() -> None:
-    assert "任务名由你生成" in REACT_SYSTEM_PROMPT
+    assert "任务名由你生成" in RUNTIME_SYSTEM_PROMPT
     assert "selected by UI controls" in ASSISTANT_PROMPT
-    assert "probe_http_target" in REACT_SYSTEM_PROMPT
+    assert "probe_http_target" in RUNTIME_SYSTEM_PROMPT
     assert derive_task_title("帮我评测客服对话接口的响应质量。") == "评测客服对话接口的响应质量"
 
 

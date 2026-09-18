@@ -6,108 +6,15 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 from evalweave.agents.model_client import AgentModelClient
+from evalweave.agents.prompts import (
+    ASSISTANT_PROMPT,
+    CASE_EVALUATION_PROMPT,
+    DATA_MODEL_MAP_PROMPT,
+    PLANNING_SYSTEM_PROMPT,
+    PYTHON_REPAIR_PROMPT,
+    TEST_CASE_PROMPT,
+)
 from evalweave.core.config import AgentConfig
-
-SYSTEM_PROMPT = """You design auditable, executable evaluation and data-processing plans.
-Return one JSON object only. Adapt the plan to the user's actual goal and uploaded data. A target
-HTTP API is optional: do not invent target_call, conversation metrics, or tool metrics for a local
-spreadsheet analysis. For tabular files, infer header_row, data_start_row, and clear field mappings.
-Always return a non-empty operations array, source description, and for uploaded tabular data a
-data_program object with a steps array. data_program is a safe declarative script. Every step must
-store its primitive name in a `type` field (never `primitive`, `operation`, `action`, or `tool`).
-Only these executable generic primitives are allowed in data_program.steps:
-- convert: preserve rows while changing the delivery format;
-- model_map: apply an arbitrary semantic instruction to every row and add dynamic columns. Include
-  instruction, input_fields, and output_columns, where each output column has name and type
-  (string, number, boolean, or array). Use this for scoring, reasons, classification, generation,
-  extraction, rewriting, or enrichment;
-- http_map: call one configured input_config.targets entry for every row. Include target_index,
-  answer_column, latency_column, and ttfb_column.
-- aggregate: calculate deterministic numeric averages and success counts after row processing.
-Do not add summarize, format_convert, normalize, data_analysis, or any operations-array label to
-data_program.steps; final summarization and file delivery happen outside this program. Multiple
-model_map and http_map steps may be composed in any order. Never include credentials or
-raw executable code. Use operations from this allowlist: normalize, data_analysis, data_transform,
-format_convert, ranking, aggregate, target_call, multi_target_call, conversation_eval, tool_eval,
-latency_eval, safety_eval, human_review, summarize."""
-
-TEST_CASE_PROMPT = """You generate test inputs for an HTTP evaluation target.
-Return one JSON object with a single key named cases. cases must be a list containing exactly the
-requested number of objects. Every case must have an input object containing only values sent to the
-target, an expected object describing the expected behavior, and a metadata object containing a
-category. input must match the target body template: when the template is {{row}}, input is the
-complete JSON request body; otherwise input provides the fields referenced by {{field}}
-placeholders. Cover normal behavior, boundaries, ambiguous requests, malformed or unusual input,
-and the risks named in the evaluation goal. Keep every case concise. Do not include credentials,
-headers, comments, numbering outside the objects, or executable code."""
-
-CASE_EVALUATION_PROMPT = """You are a strict evaluator for AI API responses.
-Return one JSON object with an evaluations array. Produce exactly one evaluation for every supplied
-case_index. Each evaluation must contain: case_index, dimensions, overall_score, passed, and reason.
-dimensions is an array of objects with key, label, score, and reason. Dynamically derive only the
-dimensions required by the user's evaluation goal, evaluation plan, and each case's expected
-behavior; never force a fixed set of dimensions. Every dimension score and overall_score must be
-from 1 to 10. Examples of possible dimensions include speed, rationality, relevance, safety,
-format_compliance, factuality, or task_completion, but these are not mandatory. When speed or
-latency is requested, score it from the measured ttfb_ms and total latency_ms and any thresholds in
-expected; do not infer speed from writing quality. Judge only against supplied evidence. Do not
-reward fluent but irrelevant answers. HTTP or business-level success alone is not sufficient: set
-passed to false for empty, placeholder, error-like, irrelevant, or semantically incorrect output,
-even when its status code is 200. Give concise Chinese reasons and do not omit any case."""
-
-DATA_MODEL_MAP_PROMPT = """You perform one generic semantic transformation over tabular rows.
-Return one JSON object with a results array. Produce exactly one result for each supplied row_index.
-Each result must contain row_index and a values object. values must contain exactly the requested
-output columns and follow their declared types. Follow the user's instruction using only the row
-data supplied. Arrays must contain directly usable cell values. Do not omit rows, add commentary,
-or return executable code."""
-
-PYTHON_REPAIR_PROMPT = """You repair a Python data-processing or evaluation script after a real
-execution failure. Return one JSON object with a single string field named code. Preserve the
-original task, inputs, outputs, requested file name, concurrency, and result schema. Fix the actual
-root cause shown in the error instead of hiding it. The script runs with its current directory as
-the workspace and must use relative Path("inputs") and Path("outputs") paths; never invent or
-hard-code an absolute workspace path. For batch HTTP or model calls, a timeout, connection error,
-HTTP 429, rate limit, TPM limit, malformed response, or failure of one item must not terminate the
-whole batch: retry that item a small bounded number of times with backoff, then record its failed
-status and error and continue processing the remaining items. Always generate the requested result
-file even when some rows fail. Do not remove authentication, validations, measurements, or useful
-output columns. Return code only inside the JSON field, without Markdown fences."""
-
-ASSISTANT_PROMPT = """You help a Chinese-speaking user configure an AI evaluation task through
-conversation using a ReAct loop. Return one JSON object with keys reply, draft, and tool_call.
-tool_call must be null or one object with name and arguments. When a tool is needed, set reply to a
-short description of the action and call exactly one tool. After receiving its observation, reason
-again and choose the next tool or finish. Never claim that an action succeeded without its tool
-observation. Available tools are supplied in workspace.available_tools. draft may contain:
-task_mode, title, goal, source_file_id, target_url, target_body, response_path,
-expected_streaming, target_validated, source_inspected, auth_required, max_cases,
-output_format, target_auth_id, targets. targets is an array of HTTP target
-objects with name, url, body, response_path, answer_column, latency_column, and ttfb_column.
-task_mode must be local_analysis,
-dataset_target, or generated_target. Choose tools from intent: local files can be summarized,
-compared, ranked, or inspected without an HTTP target; target jobs can use uploaded cases or
-AI-generated cases. Always derive a short, specific task title from the user's goal; never ask the
-user to name the task. Output format is selected by UI controls, so never ask the user to type or
-confirm it.
-For a target job, derive a minimal probe request and target_body from the supplied URL, API
-description, curl command, or request example. Ask for the required request body or parameter
-schema only when it cannot be inferred. A successful response example, response_path, and whether
-the endpoint streams are optional: never ask for them merely to parse the result. Leave
-response_path empty and expected_streaming unset when unknown; runtime preflight will call the
-endpoint, inspect the real response, detect JSON or SSE, and react to HTTP errors before the full
-run. When a target URL and a usable request body are available but target_validated is not true,
-call probe_http_target with one representative concrete request body. If an uploaded source has not
-been inspected, call inspect_source. Never request or repeat API keys, authorization values,
-cookies, or other credentials; secret values are configured securely by an administrator. Preserve
-useful fields already in context.current_draft. Ask only about missing information relevant to the
-selected task_mode. Never
-ask a local-analysis user for API details, and never claim a target is reachable before a probe
-succeeds. output_format must be xlsx, jsonl, markdown, or text when already present in the current
-draft; "不需要文件" means text, "Markdown 文件" means markdown, "Excel 文件" means xlsx. When
-the task configuration and output_format are complete, do not ask for more configuration. Generate
-a task-specific confirmation summary from the actual draft, including the evaluation approach,
-case count or source, target when applicable, and delivery format, then ask whether to start."""
 
 
 def derive_task_title(goal: str) -> str:
@@ -339,7 +246,7 @@ def generate_eval_spec(
     request_options = {"on_delta": on_delta} if on_delta is not None else {}
     spec = request_json(
         config,
-        SYSTEM_PROMPT,
+        PLANNING_SYSTEM_PROMPT,
         {
             "goal": goal,
             "source_discovery": discovery,

@@ -1,49 +1,21 @@
 from __future__ import annotations
 
-from datetime import datetime
-from enum import StrEnum
-from pathlib import Path
 from typing import Annotated
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
 
+from evalweave.api.response import APIResponse
+from evalweave.api.schemas.files import FileCategory, FileRead
 from evalweave.auth.dependencies import SessionDependency, require_permission
 from evalweave.auth.permissions import Permission
 from evalweave.core.config import get_settings
-from evalweave.db.models import FileObject, SystemRole, User
-from evalweave.project_access import require_project_access
-from evalweave.storage import FileTooLargeError, LocalFileStorage
+from evalweave.db.models import FileObject, User
+from evalweave.services.files import FileService
+from evalweave.storage import LocalFileStorage
 
 router = APIRouter(tags=["files"])
-
-
-class FileCategory(StrEnum):
-    DATASET_SOURCE = "dataset_source"
-    GENERATED_SCRIPT = "generated_script"
-    EXECUTION_LOG = "execution_log"
-    CONVERSATION_TRACE = "conversation_trace"
-    EVALUATION_RESULT = "evaluation_result"
-    REPORT = "report"
-    SKILL_PACKAGE = "skill_package"
-
-
-class FileRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    project_id: UUID
-    created_by: UUID
-    category: str
-    original_name: str
-    content_type: str | None
-    size_bytes: int
-    sha256: str
-    created_at: datetime
 
 
 ProjectReader = Annotated[User, Depends(require_permission(Permission.PROJECT_READ))]
@@ -57,22 +29,12 @@ def get_file_storage() -> LocalFileStorage:
 
 
 def require_file(file_id: UUID, session: SessionDependency) -> FileObject:
-    file_object = session.get(FileObject, file_id)
-    if file_object is None:
-        raise HTTPException(status_code=404, detail="File not found")
-    return file_object
-
-
-def safe_filename(filename: str | None) -> str:
-    name = Path((filename or "upload").replace("\\", "/")).name.strip()
-    if not name or name in {".", ".."}:
-        return "upload"
-    return name[:255]
+    return FileService.require(session, file_id)
 
 
 @router.post(
     "/projects/{project_id}/files",
-    response_model=FileRead,
+    response_model=APIResponse[FileRead],
     status_code=status.HTTP_201_CREATED,
 )
 def upload_file(
@@ -81,100 +43,42 @@ def upload_file(
     session: SessionDependency,
     file: UploadedFile,
     category: FileCategoryForm = FileCategory.DATASET_SOURCE,
-) -> FileObject:
-    require_project_access(session, user, project_id)
-    settings = get_settings()
-    original_name = safe_filename(file.filename)
-    if category == FileCategory.DATASET_SOURCE:
-        extension = Path(original_name).suffix.lower().lstrip(".")
-        allowed = {item.lower().lstrip(".") for item in settings.evaluation.allowed_extensions}
-        if extension not in allowed:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Unsupported dataset file extension: {extension or '(none)'}",
-            )
-
-    file_id = uuid4()
-    storage_key = f"projects/{project_id}/{category.value}/{file_id.hex}"
-    storage = get_file_storage()
-    try:
-        stored = storage.put(
-            storage_key,
-            file.file,
-            max_bytes=settings.evaluation.max_file_size_mb * 1024 * 1024,
-        )
-    except FileTooLargeError as error:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds {settings.evaluation.max_file_size_mb} MB limit",
-        ) from error
-    finally:
-        file.file.close()
-
-    file_object = FileObject(
-        id=file_id,
-        project_id=project_id,
-        created_by=user.id,
-        category=category.value,
-        original_name=original_name,
-        storage_key=storage_key,
+) -> APIResponse[FileObject]:
+    return APIResponse.success(FileService.upload(
+        session,
+        get_file_storage(),
+        get_settings(),
+        project_id,
+        user,
+        file.file,
+        filename=file.filename,
         content_type=file.content_type,
-        size_bytes=stored.size_bytes,
-        sha256=stored.sha256,
-    )
-    session.add(file_object)
-    try:
-        session.commit()
-    except IntegrityError as error:
-        session.rollback()
-        storage.delete(storage_key)
-        raise HTTPException(status_code=409, detail="File metadata conflict") from error
-    except Exception:
-        session.rollback()
-        storage.delete(storage_key)
-        raise
-    session.refresh(file_object)
-    return file_object
+        category=category.value,
+    ))
 
 
-@router.get("/projects/{project_id}/files", response_model=list[FileRead])
+@router.get("/projects/{project_id}/files", response_model=APIResponse[list[FileRead]])
 def list_files(
     project_id: UUID,
     user: ProjectReader,
     session: SessionDependency,
     category: FileCategory | None = None,
-) -> list[FileObject]:
-    require_project_access(session, user, project_id)
-    statement = select(FileObject).where(FileObject.project_id == project_id)
-    if user.system_role != SystemRole.ADMIN:
-        statement = statement.where(
-            (FileObject.category == FileCategory.DATASET_SOURCE.value)
-            | (FileObject.created_by == user.id)
-        )
-    if category is not None:
-        statement = statement.where(FileObject.category == category.value)
-    return list(session.exec(statement.order_by(FileObject.created_at.desc())).all())
+) -> APIResponse[list[FileObject]]:
+    return APIResponse.success(FileService.list(
+        session,
+        project_id,
+        user,
+        category.value if category else None,
+    ))
 
 
-@router.get("/files/{file_id}", response_model=FileRead)
+@router.get("/files/{file_id}", response_model=APIResponse[FileRead])
 def get_file_metadata(
     file_id: UUID,
     user: ProjectReader,
     session: SessionDependency,
-) -> FileObject:
-    file_object = require_file(file_id, session)
-    require_project_access(session, user, file_object.project_id)
-    require_file_access(file_object, user)
-    return file_object
-
-
-def require_file_access(file_object: FileObject, user: User) -> None:
-    if (
-        user.system_role != SystemRole.ADMIN
-        and file_object.category != FileCategory.DATASET_SOURCE.value
-        and file_object.created_by != user.id
-    ):
-        raise HTTPException(status_code=404, detail="文件不存在")
+) -> APIResponse[FileObject]:
+    return APIResponse.success(FileService.get_for_user(session, file_id, user))
 
 
 @router.get("/files/{file_id}/content", response_class=FileResponse)
@@ -183,12 +87,12 @@ def download_file(
     user: ProjectReader,
     session: SessionDependency,
 ) -> FileResponse:
-    file_object = require_file(file_id, session)
-    require_project_access(session, user, file_object.project_id)
-    require_file_access(file_object, user)
-    path = get_file_storage().path_for(file_object.storage_key)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Stored file content not found")
+    file_object, path = FileService.content_path(
+        session,
+        get_file_storage(),
+        file_id,
+        user,
+    )
     return FileResponse(
         path=path,
         filename=file_object.original_name,
@@ -202,10 +106,5 @@ def delete_file(
     user: DatasetWriter,
     session: SessionDependency,
 ) -> Response:
-    file_object = require_file(file_id, session)
-    require_project_access(session, user, file_object.project_id)
-    require_file_access(file_object, user)
-    get_file_storage().delete(file_object.storage_key)
-    session.delete(file_object)
-    session.commit()
+    FileService.delete(session, get_file_storage(), file_id, user)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

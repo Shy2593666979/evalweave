@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from evalweave.api.exceptions import register_exception_handlers
 from evalweave.api.router import api_router
 from evalweave.auth.service import bootstrap_identity_data
 from evalweave.core.config import get_settings, set_config_path
@@ -45,6 +46,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    register_exception_handlers(app)
     app.include_router(api_router, prefix="/api")
     return app
 

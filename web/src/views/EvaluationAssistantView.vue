@@ -82,6 +82,10 @@ let runEventJobId = ''
 let assistantMessageEventSource: EventSource | null = null
 let assistantMessageConversationId = ''
 let conversationSelectionVersion = 0
+let assistantRenderFrame: number | null = null
+let assistantScrollFrame: number | null = null
+const pendingAssistantDeltas = new Map<AssistantMessage, { content: string; conversationId: string }>()
+const messageMarkdownCache = new WeakMap<AssistantMessage, { content: string; html: string }>()
 
 function runJobRenderKey(job: AgentJob | null) {
   if (!job) return ''
@@ -339,9 +343,58 @@ function isActiveOutputChoice(index: number) {
     && !outputChoiceSubmitted(index)
 }
 
+function renderMessageMarkdown(message: AssistantMessage) {
+  const cached = messageMarkdownCache.get(message)
+  if (cached?.content === message.content) return cached.html
+  const html = renderMarkdown(message.content)
+  messageMarkdownCache.set(message, { content: message.content, html })
+  return html
+}
+
 async function scrollToBottom() {
   await nextTick()
   if (messagePane.value) messagePane.value.scrollTop = messagePane.value.scrollHeight
+}
+
+function scheduleScrollToBottom() {
+  if (assistantScrollFrame !== null) return
+  assistantScrollFrame = window.requestAnimationFrame(() => {
+    assistantScrollFrame = null
+    void nextTick().then(() => {
+      if (messagePane.value) messagePane.value.scrollTop = messagePane.value.scrollHeight
+    })
+  })
+}
+
+function applyPendingAssistantDelta(message: AssistantMessage) {
+  const pending = pendingAssistantDeltas.get(message)
+  if (!pending) return
+  pendingAssistantDeltas.delete(message)
+  message.content = sanitizeAssistantDisplay(message.content + pending.content)
+  if (current.value?.id === pending.conversationId) scheduleScrollToBottom()
+}
+
+function flushPendingAssistantDeltas() {
+  assistantRenderFrame = null
+  for (const message of [...pendingAssistantDeltas.keys()]) {
+    applyPendingAssistantDelta(message)
+  }
+}
+
+function queueAssistantDelta(
+  message: AssistantMessage,
+  content: string,
+  conversationId: string,
+) {
+  if (!content) return
+  const pending = pendingAssistantDeltas.get(message)
+  pendingAssistantDeltas.set(message, {
+    content: (pending?.content ?? '') + content,
+    conversationId,
+  })
+  if (assistantRenderFrame === null) {
+    assistantRenderFrame = window.requestAnimationFrame(flushPendingAssistantDeltas)
+  }
 }
 
 async function copyMessage(content: string) {
@@ -804,8 +857,10 @@ function parseStreamEvent(
     ui_action?: AssistantMessage['ui_action']
   }
   if (event.type === 'delta') {
-    assistant.content = sanitizeAssistantDisplay(assistant.content + (event.content ?? ''))
+    queueAssistantDelta(assistant, event.content ?? '', conversation.id)
+    return false
   }
+  applyPendingAssistantDelta(assistant)
   if (event.type === 'round_end') {
     assistant.streaming = false
     return true
@@ -917,16 +972,21 @@ async function sendMessage(text = input.value) {
           conversationMessages.push(assistant)
         }
       }
-      if (current.value?.id === conversationId) await scrollToBottom()
+      if (current.value?.id === conversationId) scheduleScrollToBottom()
       if (done) break
     }
-    if (buffer.trim()) parseStreamEvent(buffer, assistant, conversation)
+    if (buffer.trim()) {
+      parseStreamEvent(buffer, assistant, conversation)
+      if (current.value?.id === conversationId) scheduleScrollToBottom()
+    }
     await loadConversations()
   } catch (error) {
+    applyPendingAssistantDelta(assistant)
     const last = conversationMessages[conversationMessages.length - 1]
     if (last === assistant && !last.content) conversationMessages.pop()
     ElMessage.error(errorMessage(error))
   } finally {
+    applyPendingAssistantDelta(assistant)
     setConversationStreaming(conversationId, false)
     assistant.streaming = false
     if (
@@ -1059,6 +1119,11 @@ onUnmounted(() => {
   stopAssistantMessageEventStream()
   for (const source of conversationTitleEventSources.values()) source.close()
   conversationTitleEventSources.clear()
+  if (assistantRenderFrame !== null) window.cancelAnimationFrame(assistantRenderFrame)
+  if (assistantScrollFrame !== null) window.cancelAnimationFrame(assistantScrollFrame)
+  assistantRenderFrame = null
+  assistantScrollFrame = null
+  pendingAssistantDeltas.clear()
 })
 
 watch(
@@ -1150,7 +1215,7 @@ watch(
                   <i></i><i></i><i></i>
                 </span>
                 <template v-else>
-                  <div class="message-content markdown-body chat-markdown" v-html="renderMarkdown(message.content)"></div>
+                  <div class="message-content markdown-body chat-markdown" v-html="renderMessageMarkdown(message)"></div>
                   <span v-if="message.streaming" class="message-thinking message-thinking-continuation" aria-hidden="true">
                     <i></i><i></i><i></i>
                   </span>

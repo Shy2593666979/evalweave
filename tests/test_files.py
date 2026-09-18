@@ -1,10 +1,10 @@
-import hashlib
+﻿import hashlib
 
 from fastapi.testclient import TestClient
 
 
 def login_as_developer(client: TestClient) -> None:
-    options = client.get("/api/auth/registration-options").json()
+    options = client.get("/api/auth/registration-options").json()["data"]
     development = next(item for item in options if item["code"] == "development")
     client.post(
         "/api/auth/register",
@@ -25,7 +25,7 @@ def login_as_developer(client: TestClient) -> None:
 def create_project(client: TestClient) -> str:
     response = client.get("/api/projects")
     assert response.status_code == 200
-    return response.json()[0]["id"]
+    return response.json()["data"][0]["id"]
 
 
 def test_upload_list_download_and_delete_file(client: TestClient) -> None:
@@ -39,7 +39,7 @@ def test_upload_list_download_and_delete_file(client: TestClient) -> None:
         data={"category": "dataset_source"},
     )
     assert upload.status_code == 201
-    metadata = upload.json()
+    metadata = upload.json()["data"]
     assert metadata["original_name"] == "cases.json"
     assert metadata["size_bytes"] == len(content)
     assert metadata["sha256"] == hashlib.sha256(content).hexdigest()
@@ -47,7 +47,7 @@ def test_upload_list_download_and_delete_file(client: TestClient) -> None:
 
     listing = client.get(f"/api/projects/{project_id}/files")
     assert listing.status_code == 200
-    assert [item["id"] for item in listing.json()] == [metadata["id"]]
+    assert [item["id"] for item in listing.json()["data"]] == [metadata["id"]]
 
     download = client.get(f"/api/files/{metadata['id']}/content")
     assert download.status_code == 200
