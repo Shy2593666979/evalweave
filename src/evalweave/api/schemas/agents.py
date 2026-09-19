@@ -41,6 +41,11 @@ class AgentJobRead(BaseModel):
     repair_attempts: int
     max_repair_attempts: int
     requires_approval: bool
+    scheduled_evaluation_id: UUID | None
+    snapshot_id: UUID | None
+    schedule_id: UUID | None
+    trigger_type: str
+    scheduled_for: datetime | None
     created_at: datetime
     updated_at: datetime
 

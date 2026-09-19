@@ -25,6 +25,10 @@ celery:
   task_time_limit: 600
   worker_concurrency: 4
 
+scheduler:
+  # Database-backed scheduler polling interval. No local beat state file is used.
+  poll_interval_seconds: 30
+
 storage:
   type: local
   local_directory: ./data/storage

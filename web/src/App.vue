@@ -85,6 +85,11 @@ watch(() => auth.user?.id, (userId) => {
           route="/evaluations"
         ><el-icon><NavFeatureIcon kind="evaluations" /></el-icon>评测任务</el-menu-item>
         <el-menu-item
+          v-if="auth.hasPermission('experiment:read')"
+          index="schedules"
+          route="/schedules"
+        ><el-icon><NavFeatureIcon kind="schedules" /></el-icon>定时任务</el-menu-item>
+        <el-menu-item
           v-if="auth.hasPermission('evaluation:review') || auth.hasPermission('experiment:run')"
           index="human-tasks"
           route="/human-tasks"

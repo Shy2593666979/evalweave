@@ -40,6 +40,7 @@ def create_db_and_tables() -> None:
     _ensure_project_context_columns(engine)
     _ensure_assistant_message_attachment_columns(engine)
     _ensure_human_review_campaign_columns(engine)
+    _ensure_experiment_schedule_columns(engine)
 
 
 def _ensure_project_context_columns(engine: Engine) -> None:
@@ -132,5 +133,59 @@ def _ensure_human_review_campaign_columns(engine: Engine) -> None:
                 connection.execute(
                     text(
                         f"ALTER TABLE human_review_campaigns ADD COLUMN {name} {definition}"
+                    )
+                )
+
+
+def _ensure_experiment_schedule_columns(engine: Engine) -> None:
+    """Add plan and schedule linkage columns for installations without Alembic."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "users" not in tables:
+        return
+    id_column = next(
+        (column for column in inspector.get_columns("users") if column["name"] == "id"),
+        None,
+    )
+    id_type = (
+        id_column["type"].compile(dialect=engine.dialect)
+        if id_column is not None
+        else "CHAR(32)"
+    )
+    if "experiments" in tables:
+        existing = {column["name"] for column in inspector.get_columns("experiments")}
+        additions = {
+            "created_by": f"{id_type} NULL",
+            "status": "VARCHAR(16) NOT NULL DEFAULT 'draft'",
+            "current_version_id": f"{id_type} NULL",
+        }
+        with engine.begin() as connection:
+            for name, definition in additions.items():
+                if name not in existing:
+                    connection.execute(
+                        text(f"ALTER TABLE experiments ADD COLUMN {name} {definition}")
+                    )
+    if "agent_jobs" in tables:
+        existing = {column["name"] for column in inspector.get_columns("agent_jobs")}
+        additions = {
+            "experiment_id": f"{id_type} NULL",
+            "experiment_version_id": f"{id_type} NULL",
+            "schedule_id": f"{id_type} NULL",
+            "trigger_type": "VARCHAR(16) NOT NULL DEFAULT 'manual'",
+            "scheduled_for": "DATETIME NULL",
+        }
+        with engine.begin() as connection:
+            for name, definition in additions.items():
+                if name not in existing:
+                    connection.execute(
+                        text(f"ALTER TABLE agent_jobs ADD COLUMN {name} {definition}")
+                    )
+        indexes = {index["name"] for index in inspect(engine).get_indexes("agent_jobs")}
+        if "uq_agent_jobs_schedule_time" not in indexes:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX uq_agent_jobs_schedule_time "
+                        "ON agent_jobs (schedule_id, scheduled_for)"
                     )
                 )

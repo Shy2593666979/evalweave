@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, Column, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Column, ForeignKey, String, Text, UniqueConstraint, Uuid
 from sqlmodel import Field, SQLModel
 
 
@@ -56,6 +56,19 @@ class DeliveryStatus(StrEnum):
     PENDING = "pending"
     SENT = "sent"
     FAILED = "failed"
+
+
+class ScheduledEvaluationStatus(StrEnum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    DISABLED = "disabled"
+    ARCHIVED = "archived"
+
+
+class ScheduleStatus(StrEnum):
+    ENABLED = "enabled"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
 
 
 class TimestampMixin(SQLModel):
@@ -126,6 +139,7 @@ class FileObject(TimestampMixin, table=True):
 
 class AgentJob(TimestampMixin, table=True):
     __tablename__ = "agent_jobs"
+    __table_args__ = (UniqueConstraint("schedule_id", "scheduled_for"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     project_id: UUID = Field(foreign_key="projects.id", index=True)
@@ -144,6 +158,16 @@ class AgentJob(TimestampMixin, table=True):
     repair_attempts: int = Field(default=0, ge=0)
     max_repair_attempts: int = Field(default=3, ge=0)
     requires_approval: bool = Field(default=False, nullable=False)
+    scheduled_evaluation_id: UUID | None = Field(
+        default=None,
+        sa_column=Column("experiment_id", Uuid, ForeignKey("experiments.id"), index=True),
+    )
+    snapshot_id: UUID | None = Field(
+        default=None, sa_column=Column("experiment_version_id", Uuid, index=True)
+    )
+    schedule_id: UUID | None = Field(default=None, index=True)
+    trigger_type: str = Field(default="manual", index=True, max_length=16)
+    scheduled_for: datetime | None = Field(default=None, index=True)
 
 
 class EvaluationModel(TimestampMixin, table=True):
@@ -177,14 +201,10 @@ class AssistantMessage(TimestampMixin, table=True):
     conversation_id: UUID = Field(foreign_key="assistant_conversations.id", index=True)
     role: str = Field(max_length=16)
     content: str = Field(sa_column=Column(Text, nullable=False))
-    ui_action: dict[str, Any] | None = Field(
-        default=None, sa_column=Column(JSON, nullable=True)
-    )
+    ui_action: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     include_in_context: bool = Field(default=True, nullable=False)
     is_streaming: bool = Field(default=False, nullable=False)
-    attachment_file_id: UUID | None = Field(
-        default=None, foreign_key="file_objects.id", index=True
-    )
+    attachment_file_id: UUID | None = Field(default=None, foreign_key="file_objects.id", index=True)
     attachment_name: str | None = Field(default=None, max_length=255)
     attachment_content_type: str | None = Field(default=None, max_length=255)
     attachment_size_bytes: int | None = Field(default=None, ge=0)
@@ -338,14 +358,77 @@ class TestCase(TimestampMixin, table=True):
     metadata_: dict[str, Any] = Field(default_factory=dict, sa_column=Column("metadata", JSON))
 
 
-class Experiment(TimestampMixin, table=True):
+class ScheduledEvaluation(TimestampMixin, table=True):
+    # Preserve the legacy table name so existing installations keep their data.
     __tablename__ = "experiments"
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     project_id: UUID = Field(foreign_key="projects.id", index=True)
+    created_by: UUID | None = Field(default=None, foreign_key="users.id", index=True)
     name: str = Field(index=True, max_length=128)
     description: str | None = Field(default=None, sa_column=Column(Text))
     configuration: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    status: ScheduledEvaluationStatus = Field(
+        default=ScheduledEvaluationStatus.DRAFT, index=True
+    )
+    current_snapshot_id: UUID | None = Field(
+        default=None, sa_column=Column("current_version_id", Uuid, index=True)
+    )
+
+
+class EvaluationSnapshot(TimestampMixin, table=True):
+    # Preserve legacy storage identifiers while exposing scheduling terminology.
+    __tablename__ = "experiment_versions"
+    __table_args__ = (UniqueConstraint("experiment_id", "version"),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    scheduled_evaluation_id: UUID = Field(
+        sa_column=Column(
+            "experiment_id", Uuid, ForeignKey("experiments.id"), nullable=False, index=True
+        )
+    )
+    version: int = Field(ge=1)
+    source_job_id: UUID = Field(foreign_key="agent_jobs.id", index=True)
+    preview_job_id: UUID = Field(foreign_key="agent_jobs.id", index=True)
+    source_file_id: UUID | None = Field(default=None, foreign_key="file_objects.id", index=True)
+    goal: str = Field(sa_column=Column(Text, nullable=False))
+    input_config: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    eval_spec: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    result_preview: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column(JSON, nullable=False)
+    )
+    published_at: datetime | None = None
+
+
+class EvaluationSchedule(TimestampMixin, table=True):
+    __tablename__ = "evaluation_schedules"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    scheduled_evaluation_id: UUID = Field(
+        sa_column=Column(
+            "experiment_id", Uuid, ForeignKey("experiments.id"), nullable=False, index=True
+        )
+    )
+    snapshot_id: UUID = Field(
+        sa_column=Column(
+            "experiment_version_id",
+            Uuid,
+            ForeignKey("experiment_versions.id"),
+            nullable=False,
+            index=True,
+        )
+    )
+    created_by: UUID = Field(foreign_key="users.id", index=True)
+    name: str = Field(max_length=128)
+    recurrence: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+    status: ScheduleStatus = Field(default=ScheduleStatus.ENABLED, index=True)
+    next_run_at: datetime = Field(index=True)
+    last_run_at: datetime | None = None
+    overlap_policy: str = Field(default="skip", max_length=16)
+    misfire_policy: str = Field(default="latest", max_length=16)
 
 
 class ExperimentRun(TimestampMixin, table=True):

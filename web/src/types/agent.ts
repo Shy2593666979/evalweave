@@ -44,8 +44,49 @@ export interface AgentJob {
   repair_attempts: number
   max_repair_attempts: number
   requires_approval: boolean
+  scheduled_evaluation_id?: string | null
+  snapshot_id?: string | null
+  schedule_id?: string | null
+  trigger_type?: 'manual' | 'scheduled'
+  scheduled_for?: string | null
   created_at: string
   updated_at: string
+}
+
+export interface EvaluationSchedule {
+  id: string
+  scheduled_evaluation_id: string
+  snapshot_id: string
+  name: string
+  recurrence: { type: 'daily' | 'weekly', time: string, weekdays: number[] }
+  timezone: string
+  status: 'enabled' | 'paused'
+  next_run_at: string
+  last_run_at: string | null
+  overlap_policy: 'skip' | 'parallel'
+  misfire_policy: 'latest' | 'skip'
+  created_at: string
+  updated_at: string
+}
+
+export interface ScheduledRun {
+  id: string
+  status: AgentJobStatus
+  scheduled_for: string | null
+  created_at: string
+  updated_at: string
+  error: string | null
+  result_file_id: string | null
+}
+
+export interface ScheduledEvaluation {
+  schedule: EvaluationSchedule
+  name: string
+  description: string | null
+  source_job_id: string
+  goal: string
+  output_format: string
+  recent_runs: ScheduledRun[]
 }
 
 export interface AgentStep {

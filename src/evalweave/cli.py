@@ -31,6 +31,19 @@ def child_commands(config: Path, loglevel: str) -> tuple[list[str], list[str]]:
     return api_command, worker_command
 
 
+def scheduler_command(config: Path, loglevel: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "evalweave.subprocess_runner",
+        "scheduler",
+        "--config",
+        str(config),
+        "--loglevel",
+        loglevel,
+    ]
+
+
 def stop_processes(processes: Sequence[subprocess.Popen[bytes]]) -> None:
     for process in processes:
         if process.poll() is None:
@@ -52,7 +65,10 @@ def main() -> None:
     parser.add_argument("--loglevel", default="INFO")
     args = parser.parse_args()
 
-    commands = child_commands(args.config, args.loglevel)
+    commands = (
+        *child_commands(args.config, args.loglevel),
+        scheduler_command(args.config, args.loglevel),
+    )
     processes: list[subprocess.Popen[bytes]] = []
     exit_code = 0
     try:

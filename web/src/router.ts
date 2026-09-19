@@ -14,6 +14,13 @@ const router = createRouter({
       meta: { permission: 'experiment:run' },
     },
     {
+      path: '/schedules/:scheduleId?',
+      alias: '/plans/:scheduleId?',
+      name: 'schedules',
+      component: () => import('./views/ScheduledEvaluationsView.vue'),
+      meta: { permission: 'experiment:read' },
+    },
+    {
       path: '/evaluations/:jobId?',
       name: 'evaluations',
       component: () => import('./views/AgentJobsView.vue'),

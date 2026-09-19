@@ -375,6 +375,14 @@ async function restartJob() {
   }
 }
 
+async function createScheduledTask() {
+  if (!selectedJob.value) return
+  await router.push({
+    name: 'schedules',
+    query: { sourceJobId: selectedJob.value.id },
+  })
+}
+
 async function refresh() {
   await Promise.all([loadProjectData(), loadRuntime()])
 }
@@ -451,7 +459,7 @@ onBeforeUnmount(() => {
       <template v-if="selectedJob">
         <div class="job-detail-head">
           <div><span class="job-id">任务 {{ selectedJob.id.slice(0, 8) }}</span><h2>{{ selectedJob.title }}</h2><p>{{ selectedJob.goal }}</p></div>
-          <div class="job-head-actions"><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
+          <div class="job-head-actions"><el-button v-if="canRun && selectedJob.status === 'completed' && Object.keys(selectedJob.eval_spec).length" size="small" type="primary" plain @click="createScheduledTask">创建定时任务</el-button><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
         </div>
 
         <div class="job-progress">

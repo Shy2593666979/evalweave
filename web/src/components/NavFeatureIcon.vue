@@ -4,6 +4,7 @@ defineProps<{
     | 'overview'
     | 'assistant'
     | 'evaluations'
+    | 'schedules'
     | 'human-tasks'
     | 'admin-projects'
     | 'admin-users'
@@ -27,6 +28,10 @@ defineProps<{
       <path d="M3.25 7.45h17.5v10.7a2.1 2.1 0 0 1-2.1 2.1H5.35a2.1 2.1 0 0 1-2.1-2.1V7.45Z"/>
       <path d="M3.65 7.45V5.8a2.05 2.05 0 0 1 2.05-2.05h4.15l2.05 2.1h6.75a2.1 2.1 0 0 1 2.1 1.6"/>
       <path d="M7.3 12.1h6.9"/>
+    </template>
+    <template v-else-if="kind === 'schedules'">
+      <circle cx="12" cy="12" r="8.35"/>
+      <path d="M12 7.35v5.05l3.5 2.05"/>
     </template>
     <template v-else-if="kind === 'human-tasks'">
       <circle cx="12" cy="7.25" r="3.35"/>

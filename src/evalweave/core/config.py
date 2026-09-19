@@ -44,6 +44,10 @@ class CeleryConfig(StrictModel):
     worker_concurrency: int = Field(default=4, ge=1)
 
 
+class SchedulerConfig(StrictModel):
+    poll_interval_seconds: int = Field(default=30, ge=1, le=3600)
+
+
 class StorageConfig(StrictModel):
     type: Literal["local"] = "local"
     local_directory: Path = Path("./data/uploads")
@@ -135,6 +139,7 @@ class Settings(StrictModel):
     database: DatabaseConfig
     redis: RedisConfig
     celery: CeleryConfig
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     storage: StorageConfig
     logging: LoggingConfig
     evaluation: EvaluationConfig

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -42,6 +43,39 @@ def finalize_human_review_task(campaign_id: str) -> None:
     from evalweave.human_reviews import finalize_campaign
 
     finalize_campaign(UUID(campaign_id))
+
+
+def dispatch_schedules_task() -> dict[str, int]:
+    from evalweave.db.models import AgentJob
+    from evalweave.services.scheduled_evaluations import (
+        dispatch_due_schedules,
+        mark_job_dispatch_failed,
+    )
+
+    with Session(get_engine()) as session:
+        job_ids = dispatch_due_schedules(session)
+        jobs = [session.get(AgentJob, job_id) for job_id in job_ids]
+    dispatched = 0
+    failed = 0
+    for job in jobs:
+        if job is None:
+            continue
+        task_name = (
+            "evalweave.python.run"
+            if job.input_config.get("job_type") == "python"
+            else "evalweave.agent.execute"
+        )
+        try:
+            create_celery_app().send_task(task_name, args=[str(job.id)])
+            dispatched += 1
+        except Exception as error:
+            failed += 1
+            logger.exception("Failed to dispatch scheduled evaluation %s", job.id)
+            with Session(get_engine()) as session:
+                stored = session.get(AgentJob, job.id)
+                if stored is not None:
+                    mark_job_dispatch_failed(session, stored, error)
+    return {"dispatched": dispatched, "failed": failed}
 
 
 celery_app = create_celery_app()
@@ -87,3 +121,32 @@ def worker_main() -> None:
     else:
         worker_args.append(f"--concurrency={settings.celery.worker_concurrency}")
     application.worker_main(worker_args)
+
+
+def scheduler_main() -> None:
+    parser = argparse.ArgumentParser(description="Run the EvalWeave schedule dispatcher")
+    parser.add_argument("--config", type=Path, default=Path("config/application.yaml"))
+    parser.add_argument("--loglevel", default="INFO")
+    args = parser.parse_args()
+    set_config_path(args.config)
+    settings = get_settings()
+    from evalweave.core.logging import configure_logging
+    from evalweave.db.session import create_db_and_tables
+
+    configure_logging(settings)
+    create_db_and_tables()
+    interval = settings.scheduler.poll_interval_seconds
+    logger.info("Database scheduler started (poll interval: %ss)", interval)
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                result = dispatch_schedules_task()
+                if result["dispatched"]:
+                    logger.info("Dispatched %s scheduled evaluation(s)", result["dispatched"])
+            except Exception:
+                logger.exception("Scheduled evaluation dispatch failed")
+            elapsed = time.monotonic() - started
+            time.sleep(max(1.0, interval - elapsed))
+    except KeyboardInterrupt:
+        logger.info("Database scheduler stopped")

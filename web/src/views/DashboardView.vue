@@ -44,6 +44,16 @@ const auth = useAuthStore()
       </router-link>
 
       <router-link
+        v-if="auth.hasPermission('experiment:read')"
+        to="/schedules"
+        class="action-card"
+      >
+        <span class="action-icon"><NavFeatureIcon kind="schedules" /></span>
+        <div><strong>定时任务</strong><p>设置每天或每周的自动评测时间，并查看历史运行结果。</p></div>
+        <el-icon class="action-arrow"><ArrowRight /></el-icon>
+      </router-link>
+
+      <router-link
         v-if="auth.hasPermission('evaluation:review') || auth.hasPermission('experiment:run')"
         to="/human-tasks"
         class="action-card"

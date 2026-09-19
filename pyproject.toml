@@ -32,6 +32,7 @@ dependencies = [
 evalweave = "evalweave.cli:main"
 evalweave-api = "evalweave.main:api_main"
 evalweave-worker = "evalweave.workers.app:worker_main"
+evalweave-scheduler = "evalweave.workers.app:scheduler_main"
 
 [dependency-groups]
 dev = [

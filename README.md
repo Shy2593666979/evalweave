@@ -32,7 +32,7 @@ EvalWeave 是一个面向 AI 应用的开源评测与执行追踪平台。它计
 
 ## 本地开发
 
-安装依赖、启动 MySQL/Redis，并启动 API、Celery 和前端：
+安装依赖、启动 MySQL/Redis，并启动 API、数据库调度器、Celery 和前端：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
@@ -60,7 +60,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
    docker compose -f deploy/docker-compose.yaml up -d
    ```
 
-4. 同时启动 API 和 Celery Worker（API 启动时会自动创建尚不存在的数据表）：
+4. 同时启动 API、数据库调度器和 Celery Worker（API 启动时会自动创建尚不存在的数据表）：
 
    ```powershell
    uv run evalweave --config config/application.yaml
@@ -68,10 +68,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
 
    按 `Ctrl+C` 会同时停止两个进程。OpenAPI 文档位于 <http://127.0.0.1:8000/docs>。
 
-   如需分别启动，也可以使用两个终端运行：
+   如需分别启动，也可以使用三个终端运行：
 
    ```powershell
    uv run evalweave-api --config config/application.yaml
+   uv run evalweave-scheduler --config config/application.yaml
    uv run evalweave-worker --config config/application.yaml
    ```
 
@@ -111,7 +112,7 @@ Agent 默认关闭。请在 `config/application.yaml` 中配置 OpenAI Python SD
 登录后可从“评测任务”完成项目选择、数据上传、任务启动、运行跟踪和结果下载。
 上传文件和脚本输出由本地文件服务统一管理，磁盘目录可通过 `storage.local_directory` 自定义；
 Python 脚本的隔离执行目录可通过 `storage.workspace_directory` 自定义。
-运行中的任务会自动刷新状态；API 服务之外还需要同时启动 Redis 和 Celery Worker。
+运行中的任务会自动刷新状态；API 服务之外还需要同时启动数据库调度器、Redis 和 Celery Worker。
 评测助手支持通过对话整理接口地址、返回示例和评测要求，任务结果可导出为 Excel、
 JSONL、Markdown 或纯文本。Admin 可在“评测模型”中维护可选模型，API Key 加密保存且不回显。
 
