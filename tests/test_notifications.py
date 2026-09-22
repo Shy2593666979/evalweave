@@ -6,11 +6,9 @@ from uuid import uuid4
 import pytest
 
 from evalweave.agents.tools import AssistantToolContext, SendWeComMessageTool
-from evalweave.notifications.service import (
-    notify_agent_job_completed,
-    send_wecom,
-    send_wecom_file,
-)
+from evalweave.notifications.email import send_email
+from evalweave.notifications.service import notify_agent_job_completed
+from evalweave.notifications.wecom import send_wecom, send_wecom_file
 
 
 class FakeResponse:
@@ -37,6 +35,51 @@ def _settings(tmp_path: Path | None = None) -> SimpleNamespace:
     )
 
 
+def test_send_email_uses_configured_smtp_channel(monkeypatch) -> None:
+    sent = []
+
+    class FakeSmtp:
+        def __init__(self, host, port, *, timeout):
+            assert (host, port, timeout) == ("smtp.example.com", 587, 10)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def starttls(self, *, context):
+            assert context is not None
+
+        def login(self, username, password):
+            assert (username, password) == ("sender", "secret")
+
+        def send_message(self, message):
+            sent.append(message)
+
+    settings = SimpleNamespace(
+        notifications=SimpleNamespace(
+            email=SimpleNamespace(
+                enabled=True,
+                host="smtp.example.com",
+                port=587,
+                from_address="sender@example.com",
+                timeout_seconds=10,
+                use_ssl=False,
+                starttls=True,
+                username="sender",
+                password="secret",
+            )
+        )
+    )
+    monkeypatch.setattr("evalweave.notifications.email.get_settings", lambda: settings)
+    monkeypatch.setattr("evalweave.notifications.email.smtplib.SMTP", FakeSmtp)
+
+    assert send_email("评测完成", "结果已经生成", "user@example.com") is None
+    assert sent[0]["Subject"] == "评测完成"
+    assert sent[0]["To"] == "user@example.com"
+
+
 @pytest.mark.parametrize("message_type", ["text", "markdown", "markdown_v2"])
 def test_send_wecom_text_messages(monkeypatch, message_type: str) -> None:
     requests: list[dict[str, object]] = []
@@ -45,8 +88,8 @@ def test_send_wecom_text_messages(monkeypatch, message_type: str) -> None:
         requests.append({"url": url, **kwargs})
         return FakeResponse({"errcode": 0, "errmsg": "ok", "msgid": "message-1"})
 
-    monkeypatch.setattr("evalweave.notifications.service.get_settings", lambda: _settings())
-    monkeypatch.setattr("evalweave.notifications.service.httpx.post", fake_post)
+    monkeypatch.setattr("evalweave.notifications.wecom.get_settings", lambda: _settings())
+    monkeypatch.setattr("evalweave.notifications.wecom.httpx.post", fake_post)
 
     recipient = "" if message_type == "markdown_v2" else "zhangsan"
     result = send_wecom("测试内容", recipient, message_type=message_type)
@@ -65,7 +108,7 @@ def test_send_wecom_text_messages(monkeypatch, message_type: str) -> None:
 
 
 def test_send_wecom_markdown_v2_rejects_recipient(monkeypatch) -> None:
-    monkeypatch.setattr("evalweave.notifications.service.get_settings", lambda: _settings())
+    monkeypatch.setattr("evalweave.notifications.wecom.get_settings", lambda: _settings())
 
     with pytest.raises(ValueError, match="markdown_v2 不支持 @成员"):
         send_wecom("测试内容", "zhangsan", message_type="markdown_v2")
@@ -82,8 +125,8 @@ def test_send_wecom_file_uploads_then_sends(monkeypatch, tmp_path: Path) -> None
             return FakeResponse({"errcode": 0, "errmsg": "ok", "media_id": "media-1"})
         return FakeResponse({"errcode": 0, "errmsg": "ok"})
 
-    monkeypatch.setattr("evalweave.notifications.service.get_settings", lambda: _settings(tmp_path))
-    monkeypatch.setattr("evalweave.notifications.service.httpx.post", fake_post)
+    monkeypatch.setattr("evalweave.notifications.wecom.get_settings", lambda: _settings(tmp_path))
+    monkeypatch.setattr("evalweave.notifications.wecom.httpx.post", fake_post)
 
     result = send_wecom_file(source, "评测结果.xlsx")
 
@@ -98,9 +141,9 @@ def test_send_wecom_file_uploads_then_sends(monkeypatch, tmp_path: Path) -> None
 
 
 def test_send_wecom_rejects_provider_error(monkeypatch) -> None:
-    monkeypatch.setattr("evalweave.notifications.service.get_settings", lambda: _settings())
+    monkeypatch.setattr("evalweave.notifications.wecom.get_settings", lambda: _settings())
     monkeypatch.setattr(
-        "evalweave.notifications.service.httpx.post",
+        "evalweave.notifications.wecom.httpx.post",
         lambda *_args, **_kwargs: FakeResponse({"errcode": 93000, "errmsg": "bad key"}),
     )
 
