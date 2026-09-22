@@ -51,6 +51,21 @@ StepCallable = Callable[[], dict[str, Any]]
 logger = logging.getLogger(__name__)
 
 
+class JobCancelledError(RuntimeError):
+    pass
+
+
+def job_was_cancelled(job_id: UUID) -> bool:
+    with Session(get_engine()) as check_session:
+        current = check_session.get(AgentJob, job_id)
+        return current is None or current.status == AgentJobStatus.CANCELLED
+
+
+def raise_if_job_cancelled(job_id: UUID) -> None:
+    if job_was_cancelled(job_id):
+        raise JobCancelledError("评测任务已取消")
+
+
 def run_streamed_model_output(
     job: AgentJob,
     phase: str,
@@ -100,6 +115,8 @@ def return_error_to_assistant(session: Session, job: AgentJob, error: Exception)
 
 
 def update_job(session: Session, job: AgentJob, status: AgentJobStatus) -> None:
+    if status != AgentJobStatus.CANCELLED:
+        raise_if_job_cancelled(job.id)
     job.status = status
     job.updated_at = datetime.now(UTC)
     session.add(job)
@@ -114,6 +131,7 @@ def run_step(
     input_data: dict[str, Any] | None = None,
     attempt: int = 1,
 ) -> dict[str, Any]:
+    raise_if_job_cancelled(job.id)
     step = session.exec(
         select(AgentStep)
         .where(
@@ -135,6 +153,15 @@ def run_step(
     session.commit()
     try:
         output = operation()
+        raise_if_job_cancelled(job.id)
+    except JobCancelledError:
+        step.status = StepStatus.CANCELLED
+        step.error = None
+        step.finished_at = datetime.now(UTC)
+        step.updated_at = datetime.now(UTC)
+        session.add(step)
+        session.commit()
+        raise
     except Exception as error:
         step.status = StepStatus.FAILED
         step.error = str(error)[:4000]
@@ -196,9 +223,7 @@ def run_step_with_retries(
 def recover_interrupted_python_jobs(session: Session) -> list[UUID]:
     """Reset Python jobs left running when the worker process exited."""
     recovered: list[UUID] = []
-    jobs = session.exec(
-        select(AgentJob).where(AgentJob.status == AgentJobStatus.RUNNING)
-    ).all()
+    jobs = session.exec(select(AgentJob).where(AgentJob.status == AgentJobStatus.RUNNING)).all()
     for job in jobs:
         if job.input_config.get("job_type") != "python":
             continue
@@ -246,9 +271,7 @@ def repair_python_job_with_react(
             conversation = None
     if conversation is None:
         conversation = session.exec(
-            select(AssistantConversation).where(
-                AssistantConversation.agent_job_id == job.id
-            )
+            select(AssistantConversation).where(AssistantConversation.agent_job_id == job.id)
         ).first()
     if (
         conversation is None
@@ -266,14 +289,12 @@ def repair_python_job_with_react(
         select(AssistantMessage)
         .where(
             AssistantMessage.conversation_id == conversation.id,
-            (AssistantMessage.role == "user")
-            | (AssistantMessage.include_in_context == True),  # noqa: E712
+            (AssistantMessage.role == "user") | (AssistantMessage.include_in_context == True),  # noqa: E712
         )
         .order_by(AssistantMessage.created_at)
     )
     messages = [
-        {"role": item.role, "content": item.content}
-        for item in session.exec(statement).all()
+        {"role": item.role, "content": item.content} for item in session.exec(statement).all()
     ]
     messages.append(
         {
@@ -377,6 +398,7 @@ def execute_python_job(job_id: UUID) -> None:
             observation: dict[str, Any] | None = None
             last_execution_error: Exception | None = None
             for attempt in range(1, job.max_repair_attempts + 2):
+                raise_if_job_cancelled(job.id)
                 try:
                     observation = run_step(
                         session,
@@ -394,10 +416,13 @@ def execute_python_job(job_id: UUID) -> None:
                             created_by=job.created_by,
                             timeout_seconds=None,
                             model_config=agent_config,
+                            cancellation_check=lambda: raise_if_job_cancelled(job.id),
                         )[0],
                         attempt=attempt,
                     )
                     break
+                except JobCancelledError:
+                    raise
                 except Exception as error:
                     last_execution_error = error
                     if attempt > job.max_repair_attempts:
@@ -431,6 +456,9 @@ def execute_python_job(job_id: UUID) -> None:
                             error,
                             attempt,
                         )
+                        raise_if_job_cancelled(job.id)
+                    except JobCancelledError:
+                        raise
                     except Exception:
                         logger.exception(
                             "Failed to repair Python job %s on attempt %s",
@@ -464,9 +492,9 @@ def execute_python_job(job_id: UUID) -> None:
                 if job.result_file_id:
                     result_file = session.get(FileObject, job.result_file_id)
                     if result_file is not None:
-                        path = LocalFileStorage(
-                            get_settings().storage.local_directory
-                        ).path_for(result_file.storage_key)
+                        path = LocalFileStorage(get_settings().storage.local_directory).path_for(
+                            result_file.storage_key
+                        )
                         extension = Path(result_file.original_name).suffix.lower()
                         preview: dict[str, Any] = {
                             "file_name": result_file.original_name,
@@ -480,9 +508,7 @@ def execute_python_job(job_id: UUID) -> None:
                                     100,
                                 )
                             elif extension in {".md", ".markdown", ".txt"}:
-                                preview["content"] = path.read_text(
-                                    encoding="utf-8-sig"
-                                )[:20000]
+                                preview["content"] = path.read_text(encoding="utf-8-sig")[:20000]
                         except Exception as error:
                             preview["preview_error"] = str(error)[:500]
                         execution["primary_result"] = preview
@@ -516,6 +542,8 @@ def execute_python_job(job_id: UUID) -> None:
                 notify_agent_job_completed(session, job)
             except Exception:
                 logger.exception("Failed to notify completed Python job %s", job.id)
+        except JobCancelledError:
+            return
         except Exception as error:
             session.rollback()
             job = session.get(AgentJob, job_id)
@@ -527,9 +555,7 @@ def execute_python_job(job_id: UUID) -> None:
                 session.commit()
 
 
-def _start_react_step(
-    session: Session, job: AgentJob, name: str, attempt: int
-) -> AgentStep:
+def _start_react_step(session: Session, job: AgentJob, name: str, attempt: int) -> AgentStep:
     step = AgentStep(
         job_id=job.id,
         name=name[:64],
@@ -576,9 +602,7 @@ def return_result_to_assistant(
     session.commit()
 
 
-def _finish_react_step(
-    session: Session, step: AgentStep, tool_result: dict[str, Any]
-) -> None:
+def _finish_react_step(session: Session, step: AgentStep, tool_result: dict[str, Any]) -> None:
     succeeded = bool(tool_result.get("status") == "completed")
     summary = tool_result.get("summary")
     step.status = StepStatus.COMPLETED if succeeded else StepStatus.FAILED
@@ -707,9 +731,7 @@ def validate_http_target_with_react(
             last_error = error
             if attempt > job.max_repair_attempts:
                 raise
-            if not repair_http_target_with_react(
-                session, job, agent_config, error, attempt
-            ):
+            if not repair_http_target_with_react(session, job, agent_config, error, attempt):
                 raise
     raise last_error or RuntimeError("Target validation failed")
 
@@ -886,10 +908,13 @@ def plan_agent_job(job_id: UUID) -> None:
                 job.updated_at = datetime.now(UTC)
                 session.add(job)
 
+            raise_if_job_cancelled(job.id)
             job.status = AgentJobStatus.RUNNING
             job.requires_approval = False
             should_execute = True
             session.commit()
+        except JobCancelledError:
+            return
         except Exception as error:
             session.rollback()
             job = session.get(AgentJob, job_id)
@@ -938,6 +963,7 @@ def execute_agent_job(job_id: UUID) -> None:
                         and evaluation_config.base_url
                         and evaluation_config.model
                     ):
+
                         def evaluate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             return run_streamed_model_output(
                                 job,
@@ -951,11 +977,13 @@ def execute_agent_job(job_id: UUID) -> None:
                                     on_delta=on_delta,
                                 ),
                             )
+
                     execution_result = execute_http_target(
                         session,
                         job,
                         preflight,
                         evaluate_records=evaluate_records,
+                        cancellation_check=lambda: raise_if_job_cancelled(job.id),
                     )
                 elif isinstance(job.eval_spec.get("data_program"), dict):
                     execution_mode = "data_program"
@@ -982,7 +1010,12 @@ def execute_agent_job(job_id: UUID) -> None:
                             ),
                         )
 
-                    execution_result = execute_data_program(session, job, map_rows)
+                    execution_result = execute_data_program(
+                        session,
+                        job,
+                        map_rows,
+                        cancellation_check=lambda: raise_if_job_cancelled(job.id),
+                    )
                 else:
                     execution_mode = "local_data"
                     execution_result = execute_local_source(session, job)
@@ -1030,6 +1063,8 @@ def execute_agent_job(job_id: UUID) -> None:
                 notify_agent_job_completed(session, job)
             except Exception:
                 logger.exception("Failed to send completion notification for agent job %s", job.id)
+        except JobCancelledError:
+            return
         except Exception as error:
             session.rollback()
             job = session.get(AgentJob, job_id)

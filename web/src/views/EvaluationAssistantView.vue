@@ -68,6 +68,7 @@ const conversationActionSubmitting = ref(false)
 const streamingConversationIds = ref<Set<string>>(new Set())
 const conversationMessageBuffers = new Map<string, AssistantMessage[]>()
 const conversationInputDrafts = new Map<string, string>()
+const conversationAttachmentDrafts = new Map<string, string>()
 const conversationTitleEventSources = new Map<string, EventSource>()
 const uploading = ref(false)
 const starting = ref(false)
@@ -493,6 +494,7 @@ async function submitConversationAction() {
       conversationTitleEventSources.delete(conversation.id)
       conversationMessageBuffers.delete(conversation.id)
       conversationInputDrafts.delete(conversation.id)
+      conversationAttachmentDrafts.delete(conversation.id)
       const wasCurrent = current.value?.id === conversation.id
       conversations.value = conversations.value.filter((item) => item.id !== conversation.id)
       if (wasCurrent) {
@@ -528,7 +530,11 @@ async function selectConversation(conversation: AssistantConversation) {
   const conversationId = conversation.id
   conversationSwitching.value = true
   try {
-  if (current.value) conversationInputDrafts.set(current.value.id, input.value)
+  if (current.value) {
+    conversationInputDrafts.set(current.value.id, input.value)
+    if (sourceFileId.value) conversationAttachmentDrafts.set(current.value.id, sourceFileId.value)
+    else conversationAttachmentDrafts.delete(current.value.id)
+  }
   stopRunEventStream()
   stopAssistantMessageEventStream()
   runJob.value = null
@@ -580,6 +586,9 @@ async function selectConversation(conversation: AssistantConversation) {
   // Commit the complete conversation in one render. Inserting the run timeline
   // after the messages were already visible caused a second layout and a jump.
   files.value = loadedFiles
+  const attachmentDraftId = conversationAttachmentDrafts.get(conversationId) ?? ''
+  sourceFileId.value = loadedFiles.some((file) => file.id === attachmentDraftId) ? attachmentDraftId : ''
+  if (attachmentDraftId && !sourceFileId.value) conversationAttachmentDrafts.delete(conversationId)
   messages.value = loadedMessages.map((message) => ({
     ...message,
     content: message.role === 'assistant' ? sanitizeAssistantDisplay(message.content) : message.content,
@@ -739,8 +748,19 @@ async function loadRun(jobId: string, isCurrent: () => boolean = () => true) {
   }
 }
 
+const supportedDatasetExtensions = new Set(['json', 'jsonl', 'csv', 'xlsx'])
+
+function isSupportedDataset(file: File) {
+  const extension = file.name.split('.').pop()?.toLowerCase() ?? ''
+  return supportedDatasetExtensions.has(extension)
+}
+
 async function attachDataset(fileToUpload: File) {
   if (!projectId.value || uploading.value) return false
+  if (!isSupportedDataset(fileToUpload)) {
+    ElMessage.warning('仅支持 JSON、JSONL、CSV、XLSX 文件')
+    return false
+  }
   uploading.value = true
   const form = new FormData()
   form.append('file', fileToUpload)
@@ -749,6 +769,7 @@ async function attachDataset(fileToUpload: File) {
     const file = (await api.post<FileObject>(`/projects/${projectId.value}/files`, form)).data
     await loadFiles()
     sourceFileId.value = file.id
+    if (current.value) conversationAttachmentDrafts.set(current.value.id, file.id)
     ElMessage.success('数据文件已加入当前对话')
     return true
   } catch (error) {
@@ -769,8 +790,19 @@ function dropDataset(event: DragEvent) {
   if (file) void attachDataset(file)
 }
 
+function pasteDataset(event: ClipboardEvent) {
+  if (streaming.value || uploading.value) return
+  const clipboard = event.clipboardData
+  const file = clipboard?.files.item(0)
+    ?? Array.from(clipboard?.items ?? []).find((item) => item.kind === 'file')?.getAsFile()
+  if (!file) return
+  event.preventDefault()
+  void attachDataset(file)
+}
+
 function removeAttachedFile() {
   sourceFileId.value = ''
+  if (current.value) conversationAttachmentDrafts.delete(current.value.id)
 }
 
 function attachmentExtension(name?: string | null) {
@@ -951,7 +983,10 @@ async function sendMessage(text = input.value) {
     if (conversation.title === '新的评测对话') {
       startConversationTitleEventStream(conversationId)
     }
-    if (sourceFileId.value === attachedSourceFileId) sourceFileId.value = ''
+    if (sourceFileId.value === attachedSourceFileId) {
+      sourceFileId.value = ''
+      conversationAttachmentDrafts.delete(conversationId)
+    }
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
@@ -998,9 +1033,16 @@ async function sendMessage(text = input.value) {
     }
     conversationMessageBuffers.delete(conversationId)
     await nextTick()
-    if (current.value?.id === conversationId && canStartTask.value) {
-      await startTask()
-    }
+    // 普通评测不再由前端创建 AgentJob 并派发旧 workflow；保留原代码便于后续兼容。
+    // if (current.value?.id === conversationId && canStartTask.value) {
+    //   await startTask()
+    // }
+    // 人工评审仍依赖原有任务和评审活动创建入口。
+    if (
+      current.value?.id === conversationId
+      && canStartTask.value
+      && hasCompleteHumanReviewConfig.value
+    ) await startTask()
   }
 }
 
@@ -1270,7 +1312,7 @@ watch(
                     <i></i>
                     <div class="react-node-body">
                       <strong>{{ stepLabels[item.step.name] ?? item.step.name }}</strong>
-                      <span>{{ item.step.status === 'running' ? '执行中' : item.step.status === 'completed' ? '已完成' : item.step.status === 'failed' ? '失败' : '等待' }}</span>
+                      <span>{{ item.step.status === 'running' ? '执行中' : item.step.status === 'completed' ? '已完成' : item.step.status === 'failed' ? '失败' : item.step.status === 'cancelled' ? '已取消' : '等待' }}</span>
                       <p v-if="item.stream?.content" class="react-node-output-text">
                         {{ modelOutputPreview(item.stream.content) }}
                         <span v-if="item.stream.status === 'running'" class="message-thinking message-thinking-continuation" aria-hidden="true">
@@ -1307,7 +1349,7 @@ watch(
           </div>
         </div>
 
-        <div class="assistant-composer" @dragenter.prevent @dragover.prevent @drop.prevent="dropDataset">
+        <div class="assistant-composer" @dragenter.prevent @dragover.prevent @drop.prevent="dropDataset" @paste="pasteDataset">
           <div v-if="selectedFile" class="composer-attachment">
             <span class="composer-file-icon" :class="attachmentTone(selectedFile.original_name)" aria-hidden="true"><i>{{ attachmentExtension(selectedFile.original_name) }}</i></span>
             <span class="composer-file-details">
@@ -1318,7 +1360,7 @@ watch(
           </div>
           <textarea v-model="input" :disabled="streaming" rows="1" placeholder="告诉评测助手你的需求，Shift + Enter 换行" @keydown.enter.exact.prevent="sendMessage()"></textarea>
           <div class="composer-actions">
-            <div><el-upload :show-file-list="false" :http-request="uploadDataset" accept=".json,.jsonl,.csv,.xlsx"><el-button text :icon="Paperclip" :loading="uploading" title="上传数据文件">上传文件</el-button></el-upload><span>支持 JSON、JSONL、CSV、XLSX</span></div>
+            <div><el-upload :show-file-list="false" :http-request="uploadDataset" accept=".json,.jsonl,.csv,.xlsx"><el-button text :icon="Paperclip" :loading="uploading" title="上传数据文件">上传文件</el-button></el-upload><span>支持 JSON、JSONL、CSV、XLSX · 可拖拽或粘贴</span></div>
             <el-button class="composer-send" type="primary" circle :icon="Promotion" :loading="streaming" :disabled="!input.trim() && !selectedFile" title="发送消息" aria-label="发送消息" @click="sendMessage()" />
           </div>
         </div>

@@ -346,6 +346,7 @@ button, input, textarea, select { font: inherit; }
 .step-row > .step-icon { display: grid; width: 31px; height: 31px; place-items: center; color: #567aad; border-radius: 9px; background: #eaf2fd; }
 .step-icon.completed { color: #2e8a66; background: #e8f7f1; }
 .step-icon.failed { color: #b44c57; background: #fdecef; }
+.step-icon.cancelled { color: #7d8798; background: #eef1f5; }
 .step-icon .el-icon { width: 18px; height: 18px; margin: 0; font-size: 18px; }
 .step-icon .el-icon svg { display: block; }
 .step-row > div > strong, .step-row > div > span { display: block; }

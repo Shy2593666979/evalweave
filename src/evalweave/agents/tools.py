@@ -32,8 +32,10 @@ from evalweave.db.models import (
     AgentStep,
     FileObject,
     StepStatus,
+    User,
 )
 from evalweave.notifications import send_wecom, send_wecom_file
+from evalweave.services.agent_jobs import AgentJobService
 from evalweave.storage import LocalFileStorage
 
 ASSISTANT_TOOLS = [
@@ -323,9 +325,7 @@ class InspectAgentJobTool(BaseAssistantTool):
                 raise ValueError("当前对话没有可查看的评测任务")
 
             steps = session.exec(
-                select(AgentStep)
-                .where(AgentStep.job_id == job.id)
-                .order_by(AgentStep.created_at)
+                select(AgentStep).where(AgentStep.job_id == job.id).order_by(AgentStep.created_at)
             ).all()
             step_labels = {
                 "generate_eval_spec": "生成评测方案",
@@ -385,6 +385,78 @@ class InspectAgentJobTool(BaseAssistantTool):
                     ),
                     "created_at": job.created_at.isoformat(),
                     "updated_at": job.updated_at.isoformat(),
+                },
+                ensure_ascii=False,
+            )
+
+
+class CancelAgentJobTool(BaseAssistantTool):
+    name = "cancel_agent_job"
+    description = (
+        "停止当前用户已经提交且尚未结束的后台评测任务。用户明确表达停止、取消、别跑了、"
+        "刚才说错了或不需要继续时，必须调用本工具真正取消任务，不能只口头答复。"
+        "省略 job_id 时取消当前对话最近提交的任务。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "可选任务 ID；省略时取消当前对话最近提交的后台任务。",
+            }
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
+        if context.project_id is None or context.actor_id is None:
+            raise ValueError("停止评测任务需要当前项目和用户")
+        raw_job_id = str(
+            kwargs.get("job_id") or context.draft.get("background_job_id") or ""
+        ).strip()
+        with Session(get_settings_engine()) as session:
+            job: AgentJob | None = None
+            if raw_job_id:
+                try:
+                    job = session.get(AgentJob, UUID(raw_job_id))
+                except ValueError as error:
+                    raise ValueError("评测任务 ID 无效") from error
+            elif context.conversation_id is not None:
+                candidates = session.exec(
+                    select(AgentJob)
+                    .where(
+                        AgentJob.project_id == context.project_id,
+                        AgentJob.created_by == context.actor_id,
+                    )
+                    .order_by(AgentJob.created_at.desc())
+                ).all()
+                job = next(
+                    (
+                        item
+                        for item in candidates
+                        if str(item.input_config.get("conversation_id") or "")
+                        == str(context.conversation_id)
+                    ),
+                    None,
+                )
+            if (
+                job is None
+                or job.project_id != context.project_id
+                or job.created_by != context.actor_id
+            ):
+                raise ValueError("当前对话没有可停止的评测任务")
+            actor = session.get(User, context.actor_id)
+            if actor is None:
+                raise ValueError("当前用户不存在")
+            cancelled = AgentJobService.cancel(session, job.id, actor)
+            context.draft["background_job_id"] = str(cancelled.id)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "job_id": str(cancelled.id),
+                    "title": cancelled.title,
+                    "status": cancelled.status.value,
+                    "message": "评测任务已停止，可在评测任务页面重新运行。",
                 },
                 ensure_ascii=False,
             )
@@ -834,6 +906,14 @@ class RequestConfirmationTool(BaseAssistantTool):
 
     def run(self, context: AssistantToolContext, **kwargs: Any) -> str:
         _ensure_human_review_defaults(context.draft)
+        if context.draft.get("task_mode") != "human_review":
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "普通评测已停用旧 workflow，请使用 submit_python_job 提交后台任务",
+                },
+                ensure_ascii=False,
+            )
         if not _draft_checked(context.draft) or not context.draft.get("output_format"):
             return json.dumps(
                 {"ok": False, "error": "任务尚未验证完成或未选择输出格式"},
@@ -892,6 +972,7 @@ ASSISTANT_TOOL_REGISTRY: list[BaseAssistantTool] = [
     InspectSourceTool(),
     RunPythonTool(),
     InspectAgentJobTool(),
+    CancelAgentJobTool(),
     SubmitPythonJobTool(),
     RepairPythonJobScriptTool(),
     ProbeHttpTargetTool(),
@@ -1133,6 +1214,7 @@ def tool_label(name: str) -> str:
         "inspect_source": "检查数据文件",
         "run_python": "运行 Python 文件处理",
         "inspect_agent_job": "查看评测任务状态",
+        "cancel_agent_job": "停止评测任务",
         "submit_python_job": "提交后台评测任务",
         "repair_python_job_script": "修复执行脚本",
         "probe_http_target": "验证目标接口",

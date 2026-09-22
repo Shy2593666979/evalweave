@@ -375,6 +375,17 @@ async function restartJob() {
   }
 }
 
+async function cancelJob() {
+  if (!selectedJob.value) return
+  try {
+    const response = await api.post<AgentJob>(`/agent-jobs/${selectedJob.value.id}/cancel`)
+    ElMessage.success('任务已停止')
+    await loadJobDetail(response.data.id)
+  } catch (error) {
+    ElMessage.error(errorMessage(error))
+  }
+}
+
 async function createScheduledTask() {
   if (!selectedJob.value) return
   await router.push({
@@ -459,7 +470,7 @@ onBeforeUnmount(() => {
       <template v-if="selectedJob">
         <div class="job-detail-head">
           <div><span class="job-id">任务 {{ selectedJob.id.slice(0, 8) }}</span><h2>{{ selectedJob.title }}</h2><p>{{ selectedJob.goal }}</p></div>
-          <div class="job-head-actions"><el-button v-if="canRun && selectedJob.status === 'completed' && Object.keys(selectedJob.eval_spec).length" size="small" type="primary" plain @click="createScheduledTask">创建定时任务</el-button><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
+          <div class="job-head-actions"><el-button v-if="canRun && selectedJob.status === 'completed' && Object.keys(selectedJob.eval_spec).length" size="small" type="primary" plain @click="createScheduledTask">创建定时任务</el-button><el-button v-if="canRun && ['pending', 'discovering', 'planning', 'waiting_human', 'running', 'analyzing'].includes(selectedJob.status)" size="small" type="danger" plain @click="cancelJob">停止任务</el-button><el-button v-if="canRun && ['completed', 'cancelled'].includes(selectedJob.status)" size="small" @click="restartJob">重新运行</el-button><el-tag size="large" :type="statusType(selectedJob.status)">{{ statusLabels[selectedJob.status] }}</el-tag></div>
         </div>
 
         <div class="job-progress">
@@ -497,9 +508,9 @@ onBeforeUnmount(() => {
           <div class="section-heading"><h2>运行步骤</h2><span>自动刷新</span></div>
           <div v-if="currentSteps.length" class="step-list">
             <div v-for="step in currentSteps" :key="step.id" class="step-row">
-              <span class="step-icon" :class="step.status"><el-icon><CircleCheck v-if="step.status === 'completed'" /><WarningFilled v-else-if="step.status === 'failed'" /><Clock v-else /></el-icon></span>
+              <span class="step-icon" :class="step.status"><el-icon><CircleCheck v-if="step.status === 'completed'" /><WarningFilled v-else-if="['failed', 'cancelled'].includes(step.status)" /><Clock v-else /></el-icon></span>
               <div><strong>{{ stepLabel(step) }}</strong><span>{{ stepMeta(step) }}</span><p v-if="step.error">{{ step.error }}</p></div>
-              <el-tag size="small" :type="step.status === 'completed' ? 'success' : step.status === 'failed' ? 'danger' : step.status === 'running' ? 'primary' : 'info'">{{ step.status === 'completed' ? '完成' : step.status === 'failed' ? '失败' : step.status === 'running' ? '进行中' : '未执行' }}</el-tag>
+              <el-tag size="small" :type="step.status === 'completed' ? 'success' : ['failed', 'cancelled'].includes(step.status) ? 'danger' : step.status === 'running' ? 'primary' : 'info'">{{ step.status === 'completed' ? '完成' : step.status === 'failed' ? '失败' : step.status === 'cancelled' ? '已取消' : step.status === 'running' ? '进行中' : '未执行' }}</el-tag>
             </div>
           </div>
           <p v-else class="section-empty">任务启动后，这里会显示每一步的执行状态。</p>

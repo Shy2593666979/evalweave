@@ -4,10 +4,14 @@ import json
 import mimetypes
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
+from collections.abc import Callable
+from contextlib import suppress
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -76,6 +80,26 @@ def _safe_name(name: str, used: set[str]) -> str:
     return candidate
 
 
+def _stop_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            check=False,
+        )
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def run_python_workspace(
     session: Session,
     project_id: UUID | None,
@@ -86,15 +110,14 @@ def run_python_workspace(
     created_by: UUID | None = None,
     timeout_seconds: float | None = PYTHON_DIALOG_TIMEOUT_SECONDS,
     model_config: AgentConfig | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if project_id is None:
         raise ValueError("Python 文件工具需要当前项目")
     if not code.strip():
         raise ValueError("Python 文件工具需要可执行脚本")
     requested_ids = (
-        source_file_ids
-        if source_file_ids is not None
-        else [str(draft.get("source_file_id") or "")]
+        source_file_ids if source_file_ids is not None else [str(draft.get("source_file_id") or "")]
     )
     requested_ids = [item for item in requested_ids if item]
     sources: list[FileObject] = []
@@ -155,28 +178,42 @@ def run_python_workspace(
             )
             if model_config.api_key:
                 injected_secrets.append(model_config.api_key)
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-I", "-X", "utf8", str(script)],
-                cwd=workspace,
-                env=environment,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_seconds,
-                creationflags=flags,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise ValueError(
-                f"Python 文件工具执行超过 {timeout_seconds:g} 秒"
-            ) from error
-        stdout = _redact_secrets(completed.stdout[-8000:].strip(), injected_secrets)
-        stderr = _redact_secrets(completed.stderr[-8000:].strip(), injected_secrets)
-        if completed.returncode != 0:
-            raw_detail = stderr or stdout or f"退出码 {completed.returncode}"
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-X", "utf8", str(script)],
+            cwd=workspace,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=flags,
+            start_new_session=os.name != "nt",
+        )
+        started_at = time.monotonic()
+        while True:
+            try:
+                raw_stdout, raw_stderr = process.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired as error:
+                if cancellation_check is not None:
+                    try:
+                        cancellation_check()
+                    except BaseException:
+                        _stop_process_tree(process)
+                        process.communicate()
+                        raise
+                if timeout_seconds is not None and time.monotonic() - started_at >= timeout_seconds:
+                    _stop_process_tree(process)
+                    process.communicate()
+                    raise ValueError(f"Python 文件工具执行超过 {timeout_seconds:g} 秒") from error
+        stdout = _redact_secrets(raw_stdout[-8000:].strip(), injected_secrets)
+        stderr = _redact_secrets(raw_stderr[-8000:].strip(), injected_secrets)
+        if process.returncode != 0:
+            raw_detail = stderr or stdout or f"退出码 {process.returncode}"
             detail_lines = raw_detail.splitlines()
             detail = "\n".join(detail_lines[-24:])
             raise ValueError(f"Python 文件工具执行失败：{detail}")

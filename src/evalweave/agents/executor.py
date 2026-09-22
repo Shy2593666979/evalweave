@@ -250,9 +250,7 @@ def _markdown_value(value: Any, limit: int = 180) -> str:
     return text if len(text) <= limit else f"{text[:limit].rstrip()}…"
 
 
-def _evaluation_markdown_report(
-    records: list[dict[str, Any]], title: str, goal: str
-) -> str:
+def _evaluation_markdown_report(records: list[dict[str, Any]], title: str, goal: str) -> str:
     total = len(records)
     succeeded = sum(record.get("status") == "completed" for record in records)
     failed = total - succeeded
@@ -299,10 +297,14 @@ def _evaluation_markdown_report(
         if isinstance(evaluation, dict):
             score = evaluation.get("overall_score")
             reason = evaluation.get("reason")
-            score_reason = " / ".join(
-                part for part in (f"{score}/10" if score is not None else "", str(reason or ""))
-                if part
-            ) or "—"
+            score_reason = (
+                " / ".join(
+                    part
+                    for part in (f"{score}/10" if score is not None else "", str(reason or ""))
+                    if part
+                )
+                or "—"
+            )
         output = record.get("output", record.get("error"))
         sample_lines.append(
             "| "
@@ -449,10 +451,7 @@ def serialize_results(
                         record.get("status"),
                         record.get("latency_ms"),
                         record.get("ttfb_ms"),
-                        *[
-                            (dimensions.get(key) or {}).get("score")
-                            for key in dimension_keys
-                        ],
+                        *[(dimensions.get(key) or {}).get("score") for key in dimension_keys],
                         evaluation.get("overall_score"),
                         evaluation.get("passed"),
                         evaluation.get("reason"),
@@ -550,17 +549,23 @@ def _tabular_markdown_report(
 ) -> str:
     headers = list(dict.fromkeys(str(key) for row in rows for key in row))
     preferred_terms = (
-        "query", "问题", "answer", "回复", "score", "评分",
-        "reason", "原因", "latency", "耗时", "status", "状态",
+        "query",
+        "问题",
+        "answer",
+        "回复",
+        "score",
+        "评分",
+        "reason",
+        "原因",
+        "latency",
+        "耗时",
+        "status",
+        "状态",
     )
     preview_headers = [
-        header
-        for header in headers
-        if any(term in header.lower() for term in preferred_terms)
+        header for header in headers if any(term in header.lower() for term in preferred_terms)
     ][:6]
-    preview_headers.extend(
-        header for header in headers if header not in preview_headers
-    )
+    preview_headers.extend(header for header in headers if header not in preview_headers)
     preview_headers = preview_headers[:6]
 
     summary_parts = [
@@ -570,9 +575,7 @@ def _tabular_markdown_report(
     if target_summaries:
         succeeded = sum(int(item.get("succeeded") or 0) for item in target_summaries)
         total = sum(int(item.get("total") or 0) for item in target_summaries)
-        summary_parts.append(
-            f"接口调用累计成功 **{succeeded}/{total}** 次。"
-        )
+        summary_parts.append(f"接口调用累计成功 **{succeeded}/{total}** 次。")
 
     metric_lines = [
         "| 对象 | 成功/总数 | 平均耗时 | P95 耗时 |",
@@ -615,24 +618,15 @@ def _tabular_markdown_report(
                 f"**速度表现：** {fastest.get('target')} 的平均耗时最低，"
                 f"为 {fastest.get('average_latency_ms')} ms；仍应结合 P95 判断长尾波动。"
             )
-        failed = sum(
-            int(item.get("failed") or 0) for item in target_summaries
-        )
+        failed = sum(int(item.get("failed") or 0) for item in target_summaries)
         interpretation.append(
             "**调用质量：** 所有接口调用均成功完成。"
             if failed == 0
             else f"**调用质量：** 共发现 {failed} 次失败调用，应结合错误列逐条排查。"
         )
-    aggregate_summaries = [
-        item for item in summaries if item.get("type") == "aggregate"
-    ]
+    aggregate_summaries = [item for item in summaries if item.get("type") == "aggregate"]
     if aggregate_summaries:
-        fields = [
-            key
-            for item in aggregate_summaries
-            for key in item
-            if key.endswith("_average")
-        ]
+        fields = [key for item in aggregate_summaries for key in item if key.endswith("_average")]
         if fields:
             interpretation.append(
                 "**汇总计算：** 已对数值字段生成平均值，关键结果可结合数据预览和原始字段理解。"
@@ -708,9 +702,7 @@ def store_tabular_result(
             sheet.column_dimensions[get_column_letter(index)].width = width
         if summaries:
             summary_sheet = workbook.create_sheet("汇总")
-            summary_headers = list(
-                dict.fromkeys(str(key) for item in summaries for key in item)
-            )
+            summary_headers = list(dict.fromkeys(str(key) for item in summaries for key in item))
             summary_sheet.append(summary_headers)
             for item in summaries:
                 summary_sheet.append(
@@ -726,9 +718,7 @@ def store_tabular_result(
         extension = "xlsx"
         content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     elif output_format == "markdown":
-        content = _tabular_markdown_report(
-            rows, summaries, job.title, job.goal
-        ).encode()
+        content = _tabular_markdown_report(rows, summaries, job.title, job.goal).encode()
         extension = "md"
         content_type = "text/markdown; charset=utf-8"
     else:
@@ -763,6 +753,7 @@ def execute_data_program(
     model_mapper: Callable[
         [str, list[dict[str, Any]], list[dict[str, Any]], int], list[dict[str, Any]]
     ],
+    cancellation_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if not job.source_file_id:
         raise ValueError("Data programs require an uploaded source file")
@@ -821,6 +812,8 @@ def execute_data_program(
         return resolved
 
     for step_index, step in enumerate(steps):
+        if cancellation_check is not None:
+            cancellation_check()
         if not isinstance(step, dict):
             raise ValueError(f"Invalid data program step {step_index + 1}")
         step_type = str(
@@ -875,9 +868,7 @@ def execute_data_program(
                 or f"latency{target_index + 1}_ms"
             )
             ttfb_column = str(
-                step.get("ttfb_column")
-                or target.get("ttfb_column")
-                or f"ttfb{target_index + 1}_ms"
+                step.get("ttfb_column") or target.get("ttfb_column") or f"ttfb{target_index + 1}_ms"
             )
             latencies: list[float] = []
             ttfbs: list[float] = []
@@ -885,6 +876,8 @@ def execute_data_program(
             with httpx.Client(timeout=timeout, follow_redirects=True) as client:
                 authenticate_target(client, url, headers, target.get("credentials"))
                 for row_index, row in enumerate(rows):
+                    if cancellation_check is not None:
+                        cancellation_check()
                     record = execute_target_case(client, url, headers, target, row, row_index)
                     if record["status"] == "completed":
                         row[answer_column] = record.get("output")
@@ -953,9 +946,7 @@ def execute_data_program(
                     for row in rows
                 )
                 aggregate["successful_rows"] = successful
-                aggregate["success_rate"] = (
-                    round(successful / len(rows), 4) if rows else 0
-                )
+                aggregate["success_rate"] = round(successful / len(rows), 4) if rows else 0
             summaries.append(aggregate)
             continue
         if step_type == "summarize":
@@ -1154,9 +1145,7 @@ def execute_target_case(
         response.raise_for_status()
         application_error = detect_application_error(response)
         if application_error:
-            raise TargetApplicationError(
-                f"目标接口返回业务错误：{application_error}", response
-            )
+            raise TargetApplicationError(f"目标接口返回业务错误：{application_error}", response)
         output, response_mode = parse_target_response(response, response_path)
         return {
             "case_index": index,
@@ -1233,6 +1222,7 @@ def execute_http_target(
     job: AgentJob,
     preflight: dict[str, Any] | None = None,
     evaluate_records: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     target, url, headers, rows, case_source, timeout = prepare_http_target(session, job)
     preflight_records = preflight.get("records", []) if isinstance(preflight, dict) else []
@@ -1240,14 +1230,18 @@ def execute_http_target(
     with httpx.Client(timeout=timeout) as client:
         authenticate_target(client, url, headers, target.get("credentials"))
         for index, row in enumerate(rows[len(records) :], start=len(records)):
+            if cancellation_check is not None:
+                cancellation_check()
             records.append(execute_target_case(client, url, headers, target, row, index))
+    if cancellation_check is not None:
+        cancellation_check()
     if evaluate_records is not None:
-        evaluations = {
-            item["case_index"]: item for item in evaluate_records(records)
-        }
+        evaluations = {item["case_index"]: item for item in evaluate_records(records)}
         for record in records:
             if record.get("case_index") in evaluations:
                 record["evaluation"] = evaluations[record["case_index"]]
+    if cancellation_check is not None:
+        cancellation_check()
     latencies = [float(record["latency_ms"]) for record in records]
     result_file_id = None
     if job.input_config.get("output_format") != "text":
@@ -1258,9 +1252,7 @@ def execute_http_target(
     session.commit()
     succeeded = sum(record["status"] == "completed" for record in records)
     scored = [
-        record["evaluation"]
-        for record in records
-        if isinstance(record.get("evaluation"), dict)
+        record["evaluation"] for record in records if isinstance(record.get("evaluation"), dict)
     ]
     dimension_scores: dict[str, dict[str, Any]] = {}
     for evaluation in scored:
@@ -1282,9 +1274,7 @@ def execute_http_target(
         if value["scores"]
     }
     ttfb_values = [
-        float(record["ttfb_ms"])
-        for record in records
-        if record.get("ttfb_ms") is not None
+        float(record["ttfb_ms"]) for record in records if record.get("ttfb_ms") is not None
     ]
     return {
         "executed": True,
@@ -1312,7 +1302,9 @@ def execute_http_target(
             "dimension_average_scores": average_dimension_scores,
             "average_overall_score": round(
                 sum(float(item["overall_score"]) for item in scored) / len(scored), 2
-            ) if scored else None,
+            )
+            if scored
+            else None,
         },
         "result_file_id": str(result_file_id) if result_file_id else None,
     }

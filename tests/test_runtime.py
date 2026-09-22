@@ -141,13 +141,20 @@ def test_responses_react_streams_terminal_tool_text(monkeypatch) -> None:
             [{"role": "user", "content": "开始评测"}],
             {
                 "current_draft": {
-                    "title": "接口评测",
-                    "goal": "评测接口质量",
-                    "target_url": "https://example.test/chat",
-                    "target_body": {"query": "hello"},
-                    "target_validated": True,
-                    "output_format": "xlsx",
-                }
+                    "task_mode": "human_review",
+                    "title": "人工评测",
+                    "goal": "人工评测回复质量",
+                    "source_file_id": "source-id",
+                    "source_inspected": True,
+                    "reviewer_usernames": ["reviewer"],
+                    "review_rubric": [
+                        {"key": "quality", "label": "质量", "min_score": 1, "max_score": 5}
+                    ],
+                    "deadline_hours": 24,
+                    "output_format": "text",
+                },
+                "reviewer_type_counts": {},
+                "available_reviewer_usernames": ["reviewer"],
             },
             None,
         )

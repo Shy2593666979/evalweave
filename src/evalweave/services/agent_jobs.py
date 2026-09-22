@@ -13,6 +13,11 @@ from evalweave.db.models import (
     AgentStep,
     EvaluationModel,
     FileObject,
+    HumanReviewAssignment,
+    HumanReviewCampaign,
+    HumanTask,
+    HumanTaskStatus,
+    StepStatus,
     SystemRole,
     User,
 )
@@ -21,12 +26,19 @@ from evalweave.services.projects import ProjectService
 
 
 class AgentJobService:
+    ACTIVE_STATUSES = {
+        AgentJobStatus.PENDING,
+        AgentJobStatus.DISCOVERING,
+        AgentJobStatus.PLANNING,
+        AgentJobStatus.WAITING_HUMAN,
+        AgentJobStatus.RUNNING,
+        AgentJobStatus.ANALYZING,
+    }
+
     @staticmethod
     def list_evaluation_models(session: Session) -> list[EvaluationModel]:
         statement = (
-            select(EvaluationModel)
-            .where(EvaluationModel.is_active)
-            .order_by(EvaluationModel.name)
+            select(EvaluationModel).where(EvaluationModel.is_active).order_by(EvaluationModel.name)
         )
         return list(session.exec(statement).all())
 
@@ -91,9 +103,7 @@ class AgentJobService:
     def list_steps(session: Session, job_id: UUID, user: User) -> list[AgentStep]:
         AgentJobService.require_for_user(session, job_id, user)
         statement = (
-            select(AgentStep)
-            .where(AgentStep.job_id == job_id)
-            .order_by(AgentStep.created_at)
+            select(AgentStep).where(AgentStep.job_id == job_id).order_by(AgentStep.created_at)
         )
         return list(session.exec(statement).all())
 
@@ -122,3 +132,62 @@ class AgentJobService:
         session.refresh(job)
         task_name = "evalweave.python.run" if is_python_job else "evalweave.agent.plan"
         return job, task_name
+
+    @staticmethod
+    def cancel(session: Session, job_id: UUID, user: User) -> AgentJob:
+        job = AgentJobService.require_for_user(session, job_id, user)
+        if job.status == AgentJobStatus.CANCELLED:
+            return job
+        if job.status not in AgentJobService.ACTIVE_STATUSES:
+            raise ConflictError("任务已经结束，无需停止")
+        now = datetime.now(UTC)
+        job.status = AgentJobStatus.CANCELLED
+        job.error = None
+        job.updated_at = now
+        steps = session.exec(
+            select(AgentStep).where(
+                AgentStep.job_id == job.id,
+                AgentStep.status.in_([StepStatus.PENDING, StepStatus.RUNNING]),
+            )
+        ).all()
+        for step in steps:
+            step.status = StepStatus.CANCELLED
+            step.finished_at = now
+            step.updated_at = now
+            session.add(step)
+        human_tasks = session.exec(
+            select(HumanTask).where(
+                HumanTask.job_id == job.id,
+                HumanTask.status == HumanTaskStatus.PENDING,
+            )
+        ).all()
+        for task in human_tasks:
+            task.status = HumanTaskStatus.CANCELLED
+            task.updated_at = now
+            session.add(task)
+        campaigns = session.exec(
+            select(HumanReviewCampaign).where(
+                HumanReviewCampaign.job_id == job.id,
+                HumanReviewCampaign.status.in_(["active", "summarizing"]),
+            )
+        ).all()
+        for campaign in campaigns:
+            campaign.status = "cancelled"
+            campaign.completion_reason = "job_cancelled"
+            campaign.completed_at = now
+            campaign.updated_at = now
+            session.add(campaign)
+            assignments = session.exec(
+                select(HumanReviewAssignment).where(
+                    HumanReviewAssignment.campaign_id == campaign.id,
+                    HumanReviewAssignment.status == "pending",
+                )
+            ).all()
+            for assignment in assignments:
+                assignment.status = "cancelled"
+                assignment.updated_at = now
+                session.add(assignment)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return job

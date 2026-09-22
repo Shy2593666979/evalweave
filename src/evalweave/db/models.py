@@ -43,6 +43,7 @@ class StepStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class HumanTaskStatus(StrEnum):
@@ -368,9 +369,7 @@ class ScheduledEvaluation(TimestampMixin, table=True):
     name: str = Field(index=True, max_length=128)
     description: str | None = Field(default=None, sa_column=Column(Text))
     configuration: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    status: ScheduledEvaluationStatus = Field(
-        default=ScheduledEvaluationStatus.DRAFT, index=True
-    )
+    status: ScheduledEvaluationStatus = Field(default=ScheduledEvaluationStatus.DRAFT, index=True)
     current_snapshot_id: UUID | None = Field(
         default=None, sa_column=Column("current_version_id", Uuid, index=True)
     )

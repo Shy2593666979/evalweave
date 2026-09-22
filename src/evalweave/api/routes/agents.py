@@ -768,6 +768,14 @@ def start_agent_job(
     return APIResponse.success(job)
 
 
+@router.post("/agent-jobs/{job_id}/cancel", response_model=APIResponse[AgentJobRead])
+def cancel_agent_job(
+    job_id: UUID, user: ExperimentRunner, session: SessionDependency
+) -> APIResponse[AgentJob]:
+    job = AgentJobService.cancel(session, job_id, user)
+    return APIResponse.success(job, message="评测任务已停止")
+
+
 @router.get("/human-tasks", response_model=APIResponse[list[HumanTaskRead]])
 def list_human_tasks(
     _: EvaluationReviewer,

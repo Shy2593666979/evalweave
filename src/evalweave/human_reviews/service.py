@@ -222,6 +222,19 @@ def finalize_campaign(campaign_id: UUID, *, force: bool = False) -> bool:
             markdown = _fallback_markdown(campaign, aggregate)
             aggregate["summary_error"] = str(error)[:1000]
             summary_mode = "fallback"
+        session.refresh(campaign)
+        if campaign.status == "cancelled":
+            return False
+        if job is not None:
+            session.refresh(job)
+            if job.status == AgentJobStatus.CANCELLED:
+                campaign.status = "cancelled"
+                campaign.completion_reason = "job_cancelled"
+                campaign.completed_at = datetime.now(UTC)
+                campaign.updated_at = datetime.now(UTC)
+                session.add(campaign)
+                session.commit()
+                return False
         aggregate.update({"markdown": markdown, "summary_mode": summary_mode})
         if campaign.completion_reason == "deadline_reached":
             for assignment in assignments:

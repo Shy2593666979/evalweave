@@ -1,4 +1,5 @@
 import json
+import time
 from io import BytesIO
 from uuid import UUID, uuid4
 
@@ -27,6 +28,7 @@ from evalweave.agents.planner import evaluate_target_records
 from evalweave.agents.python_workspace import run_python_workspace
 from evalweave.agents.tools import (
     AssistantToolContext,
+    CancelAgentJobTool,
     InspectAgentJobTool,
     RequestOutputFormatTool,
     RunPythonTool,
@@ -195,6 +197,44 @@ def test_agent_jobs_are_private_to_the_creator(client: TestClient) -> None:
         first_job_id,
         second_job.json()["data"]["id"],
     }
+
+
+def test_agent_job_can_be_cancelled_from_api_and_agent_tool(client: TestClient) -> None:
+    login_as_developer(client)
+    project = current_project(client)
+    creator = client.get("/api/auth/me").json()["data"]
+    created = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={"title": "需要停止的任务", "goal": "验证取消能力"},
+    ).json()["data"]
+    job_id = UUID(created["id"])
+    with Session(get_engine()) as session:
+        session.add(AgentStep(job_id=job_id, name="execute_eval_spec", status=StepStatus.RUNNING))
+        session.add(AgentStep(job_id=job_id, name="summarize", status=StepStatus.PENDING))
+        session.commit()
+
+    cancelled = client.post(f"/api/agent-jobs/{job_id}/cancel")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["data"]["status"] == "cancelled"
+    steps = client.get(f"/api/agent-jobs/{job_id}/steps").json()["data"]
+    assert [step["status"] for step in steps] == ["cancelled", "cancelled"]
+
+    another = client.post(
+        f"/api/projects/{project['id']}/agent-jobs",
+        json={"title": "对话中停止", "goal": "由 Agent 停止"},
+    ).json()["data"]
+    context = AssistantToolContext(
+        draft={"background_job_id": another["id"]},
+        project_id=UUID(str(project["id"])),
+        actor_id=UUID(creator["id"]),
+    )
+
+    result = json.loads(CancelAgentJobTool().run(context))
+
+    assert result["ok"] is True
+    assert result["status"] == "cancelled"
+    assert client.get(f"/api/agent-jobs/{another['id']}").json()["data"]["status"] == "cancelled"
 
 
 def test_agent_plans_and_executes_without_scheme_approval(client: TestClient) -> None:
@@ -693,6 +733,32 @@ Path("outputs/leaked.txt").write_text(
             source_file_ids=[],
             model_config=model_config,
         )
+
+
+def test_python_workspace_stops_running_process_when_cancelled(client: TestClient) -> None:
+    login_as_developer(client)
+    project = current_project(client)
+    checks = 0
+
+    def cancel_after_process_starts() -> None:
+        nonlocal checks
+        checks += 1
+        raise RuntimeError("评测任务已取消")
+
+    started = time.monotonic()
+    with Session(get_engine()) as session, pytest.raises(RuntimeError, match="评测任务已取消"):
+        run_python_workspace(
+            session,
+            UUID(project["id"]),
+            {},
+            "import time\ntime.sleep(30)\n",
+            source_file_ids=[],
+            timeout_seconds=None,
+            cancellation_check=cancel_after_process_starts,
+        )
+
+    assert checks >= 1
+    assert time.monotonic() - started < 5
 
 
 def test_long_python_tool_creates_and_executes_background_job(

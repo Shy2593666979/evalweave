@@ -92,7 +92,7 @@ export interface ScheduledEvaluation {
 export interface AgentStep {
   id: string
   name: string
-  status: 'pending' | 'running' | 'completed' | 'failed'
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
   attempt: number
   input_data: Record<string, unknown>
   output_data: Record<string, unknown>
